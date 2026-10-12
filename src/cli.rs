@@ -1,0 +1,201 @@
+//! Command-line interface.
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use crate::editor::Editor;
+
+const EXAMPLES: &str = "\
+Examples:
+  sand codex                                 Codex in the current directory
+  sand codex . ../lib:ro ../docs:rw          extra mounts, read-only or read-write
+  sand claude --mcp atlassian,gitlab         with MCP servers from `sbx mcp ls`
+  sand claude --resume                       attach to the existing sandbox as it is
+  sand claude --recreate                     rebuild the sandbox, keeping history
+  sand codex --scratch                       shared scratch space, no project
+  sand --acp                                 ACP agent on stdio (for editors)
+  sand codex --install-editor zed            register `sand codex --acp` in Zed
+  sand claude -- --continue                  pass arguments to the agent";
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "sand",
+    version,
+    about = "Run AI coding agents in Docker Sandboxes with one command",
+    after_help = EXAMPLES,
+    args_conflicts_with_subcommands = true
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Build, snapshot and list custom templates
+    Template {
+        #[command(subcommand)]
+        action: TemplateCommand,
+    },
+    /// Show a sandbox's mounts, agent API connectivity and MCP server status
+    Status(StatusArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TemplateCommand {
+    /// Build a Dockerfile template from config.toml and load it into the sandbox runtime
+    Build { name: String },
+    /// Snapshot an existing sandbox as a reusable template
+    Save { sandbox: String, name: String },
+    /// List templates
+    #[command(alias = "list")]
+    Ls,
+    /// Remove a built or saved template
+    Rm { name: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConflictChoice {
+    /// Make the sandbox match the command line exactly (recreates it if needed)
+    Replace,
+    /// Keep the sandbox's current mounts and MCP servers and add the new ones
+    Merge,
+    /// Stop without changing anything
+    Abort,
+}
+
+#[derive(Debug, Default, Args)]
+pub struct RunArgs {
+    /// Harness (claude, codex, opencode, …) followed by directories to mount.
+    /// Append :ro or :rw to a directory (default :rw). The first directory is
+    /// the primary workspace; with none given the current directory is used.
+    #[arg(value_name = "HARNESS] [MOUNT")]
+    pub targets: Vec<String>,
+
+    /// Arguments passed to the agent
+    #[arg(last = true, value_name = "AGENT_ARGS")]
+    pub agent_args: Vec<String>,
+
+    /// MCP servers to expose, comma-separated (names from `sbx mcp ls`)
+    #[arg(long, value_name = "SERVERS", value_delimiter = ',')]
+    pub mcp: Vec<String>,
+
+    /// Attach to the existing sandbox as it is; fail if there is none
+    #[arg(long, conflicts_with_all = ["recreate", "dedicated_scratch"])]
+    pub resume: bool,
+
+    /// Recreate the sandbox from scratch (conversation history is kept)
+    #[arg(long)]
+    pub recreate: bool,
+
+    /// With --recreate: also discard the conversation history
+    #[arg(long, requires = "recreate")]
+    pub no_preserve_history: bool,
+
+    /// Use the shared, persistent scratch workspace instead of a project
+    #[arg(long, conflicts_with = "dedicated_scratch")]
+    pub scratch: bool,
+
+    /// Use a throwaway sandbox with its own scratch space, removed on exit
+    #[arg(long)]
+    pub dedicated_scratch: bool,
+
+    /// Speak ACP on stdio instead of opening the agent's terminal UI
+    #[arg(long)]
+    pub acp: bool,
+
+    /// Sandbox name (default: <harness>-<directory>)
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Register sand as an ACP agent in an editor, then exit
+    #[arg(long, value_enum, value_name = "EDITOR")]
+    pub install_editor: Option<Editor>,
+
+    /// Template to create the sandbox from (name from config.toml or `sand template ls`, or an image)
+    #[arg(long, value_name = "TEMPLATE")]
+    pub template: Option<String>,
+
+    /// Answer for "the sandbox exists with a different setup" instead of asking
+    #[arg(long, value_enum, value_name = "CHOICE")]
+    pub on_conflict: Option<ConflictChoice>,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Harness and project directory identifying the sandbox (default: current directory)
+    #[arg(value_name = "HARNESS] [DIR")]
+    pub targets: Vec<String>,
+
+    /// Sandbox name
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Look at the shared scratch sandbox
+    #[arg(long)]
+    pub scratch: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn run(args: &[&str]) -> RunArgs {
+        let cli = Cli::try_parse_from(std::iter::once("sand").chain(args.iter().copied())).unwrap();
+        assert!(cli.command.is_none());
+        cli.run
+    }
+
+    #[test]
+    fn definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn harness_mounts_and_flags() {
+        let a = run(&["codex", ".", "../other:ro", "--mcp", "atlassian,gitlab", "--name", "x"]);
+        assert_eq!(a.targets, ["codex", ".", "../other:ro"]);
+        assert_eq!(a.mcp, ["atlassian", "gitlab"]);
+        assert_eq!(a.name.as_deref(), Some("x"));
+        assert!(run(&["--acp"]).acp && run(&["--acp"]).targets.is_empty());
+        assert_eq!(run(&["codex", "--install-editor", "zed"]).install_editor, Some(Editor::Zed));
+        assert_eq!(run(&["--install-editor", "jetbrains"]).install_editor, Some(Editor::Jetbrains));
+    }
+
+    #[test]
+    fn agent_args_follow_a_double_dash() {
+        let a = run(&["claude", ".", "--", "--continue", "fix it"]);
+        assert_eq!(a.targets, ["claude", "."]);
+        assert_eq!(a.agent_args, ["--continue", "fix it"]);
+    }
+
+    #[test]
+    fn incompatible_flags_are_rejected() {
+        let bad: &[&[&str]] = &[
+            &["codex", "--resume", "--recreate"],
+            &["codex", "--scratch", "--dedicated-scratch"],
+            &["codex", "--no-preserve-history"],
+            &["codex", "--install-editor", "vim"],
+            &["codex", "--resume", "--dedicated-scratch"],
+        ];
+        for args in bad {
+            assert!(Cli::try_parse_from(std::iter::once("sand").chain(args.iter().copied())).is_err(), "{args:?}");
+        }
+        assert!(run(&["codex", "--recreate", "--no-preserve-history"]).no_preserve_history);
+    }
+
+    #[test]
+    fn subcommands_parse() {
+        let cli = Cli::try_parse_from(["sand", "template", "build", "rust"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Template { action: TemplateCommand::Build { ref name } }) if name == "rust")
+        );
+        let cli = Cli::try_parse_from(["sand", "status", "codex", "--name", "x"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Status(ref s)) if s.targets == ["codex"] && s.name.as_deref() == Some("x"))
+        );
+    }
+}
