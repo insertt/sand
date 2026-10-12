@@ -14,6 +14,20 @@ use crate::sync::deep_merge;
 pub const SBX_AGENTS: &[&str] =
     &["claude", "codex", "copilot", "cursor", "devin", "docker-agent", "droid", "gemini", "kiro", "opencode", "shell"];
 
+/// Image of `agent` that is rebuilt every night with the latest release of the
+/// agent CLI, if one is published. Most agents have a daily `sbx/<agent>-image`
+/// (the image their sbx kit runs on); the rest only have a nightly tag of the
+/// sbx template.
+pub fn nightly_image(agent: &str) -> Option<String> {
+    match agent {
+        "claude" | "codex" | "copilot" | "cursor" | "devin" | "docker-agent" | "droid" | "kiro" | "opencode" => {
+            Some(format!("docker.io/sbx/{agent}-image:latest"))
+        }
+        "gemini" | "shell" => Some(format!("docker/sandbox-templates:{agent}-docker-nightly")),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub name: String,
@@ -49,6 +63,8 @@ pub struct Profile {
     pub api_check_url: Option<String>,
     /// Default template (name from config.toml or image reference).
     pub template: Option<String>,
+    /// Without a template, create the sandbox from the agent's nightly image.
+    pub nightly: bool,
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
@@ -80,6 +96,7 @@ impl Profile {
             acp_command: vec![],
             api_check_url: None,
             template: None,
+            nightly: false,
         }
     }
 
@@ -196,7 +213,8 @@ impl Profile {
             history,
             bypass_args,
             statusline,
-            acp_command
+            acp_command,
+            nightly
         );
         set_some!(host_config_dir, sandbox_config_dir, api_check_url, template);
         if let Some(exclude) = &o.exclude {
@@ -216,6 +234,7 @@ impl Profile {
 
     pub fn resolve(name: &str, config: &Config) -> Result<Self> {
         let mut profile = Self::builtin(name, config.sandbox_home()).unwrap_or_else(|| Self::generic(name));
+        profile.nightly = config.nightly.unwrap_or(false);
         if let Some(overrides) = config.harness.get(name) {
             profile.apply(overrides)?;
         }
@@ -282,6 +301,21 @@ mod tests {
 
         let gemini = Profile::resolve("gemini", &config).unwrap();
         assert!(gemini.is_basic() && gemini.agent == "gemini");
+    }
+
+    #[test]
+    fn nightly_is_global_with_a_harness_override() {
+        let config: Config = toml::from_str("nightly = true\n[harness.codex]\nnightly = false").unwrap();
+        assert!(Profile::resolve("claude", &config).unwrap().nightly);
+        assert!(!Profile::resolve("codex", &config).unwrap().nightly);
+        assert!(!Profile::resolve("claude", &Config::default()).unwrap().nightly);
+
+        assert_eq!(nightly_image("claude").as_deref(), Some("docker.io/sbx/claude-image:latest"));
+        assert_eq!(nightly_image("shell").as_deref(), Some("docker/sandbox-templates:shell-docker-nightly"));
+        for agent in SBX_AGENTS {
+            assert!(nightly_image(agent).is_some(), "{agent}");
+        }
+        assert_eq!(nightly_image("docker.io/sbx/pi-kit"), None);
     }
 
     #[test]

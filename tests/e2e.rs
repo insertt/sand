@@ -3,9 +3,13 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 struct Env {
@@ -50,7 +54,15 @@ impl Env {
             .env("SAND_CONFIG", self.root.join("config.toml"))
             .env("SAND_SBX", self.root.join("sbx"))
             .env("FAKE_SBX_DIR", &self.fake)
+            // Nothing listens here: tests never ask a real registry.
+            .env("SAND_REGISTRY", "http://127.0.0.1:9")
+            .env_remove("VISUAL")
+            .env_remove("EDITOR")
             .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
             .env_remove("CODEX_HOME")
             .stdin(Stdio::null());
         cmd
@@ -88,6 +100,11 @@ impl Env {
 
     fn config(&self, text: &str) {
         fs::write(self.root.join("config.toml"), text).unwrap();
+    }
+
+    /// What sand recorded about a sandbox.
+    fn state(&self, name: &str) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(self.sandbox_dir(name).join("state.json")).unwrap()).unwrap()
     }
 
     fn p(&self, path: &Path) -> String {
@@ -523,6 +540,151 @@ fn templates_from_config_and_snapshots() {
 
     env.ok(&["template", "rm", "tuned"]);
     assert!(has(&env.take_log(), "template rm sand-template-tuned:latest"));
+}
+
+#[test]
+fn nightly_images_are_pulled_on_create() {
+    let env = Env::new();
+    env.config(
+        "nightly = true\n\n[harness.codex]\nnightly = false\n\n[harness.pi]\nagent = \"docker.io/sbx/pi-kit\"\n",
+    );
+    env.ok(&["claude"]);
+    assert!(has(
+        &env.take_log(),
+        "create --name claude-proj --template docker.io/sbx/claude-image:latest --pull always claude"
+    ));
+
+    // Starting it again reuses the sandbox: the image is only chosen at creation.
+    env.ok(&["claude"]);
+    assert!(!env.take_log().iter().any(|line| line.starts_with("create ")));
+
+    // A harness can opt out, and an explicit template wins over the nightly image.
+    env.ok(&["codex"]);
+    assert!(has(&env.take_log(), "create --name codex-proj codex"));
+    env.ok(&["claude", "--name", "pinned", "--template", "ghcr.io/acme/agent:1"]);
+    assert!(has(&env.take_log(), "create --name pinned --template ghcr.io/acme/agent:1 claude"));
+
+    // Agents without a known nightly image fall back to the sbx default.
+    let out = env.ok(&["pi"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no nightly image is known"));
+    assert!(has(&env.take_log(), "create --name pi-proj docker.io/sbx/pi-kit"));
+}
+
+/// A registry that answers every manifest request with the digest it was given.
+struct Registry {
+    url: String,
+    digest: Arc<Mutex<String>>,
+}
+
+impl Registry {
+    fn start(digest: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let digest = Arc::new(Mutex::new(digest.to_string()));
+        let served = Arc::clone(&digest);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let digest = served.lock().unwrap().clone();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nDocker-Content-Digest: {digest}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        Self { url, digest }
+    }
+
+    fn publish(&self, digest: &str) {
+        *self.digest.lock().unwrap() = digest.to_string();
+    }
+}
+
+#[test]
+fn a_newer_nightly_image_offers_a_recreate() {
+    let env = Env::new();
+    env.config("nightly = true\n");
+    let registry = Registry::start("sha256:aaaa");
+    let run = |args: &[&str]| {
+        let out = env.command(args).env("SAND_REGISTRY", &registry.url).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "sand {args:?} failed:\n{err}");
+        err
+    };
+    let digest_of = |name: &str| env.state(name)["image_digest"].as_str().map(str::to_string);
+    let recreated = |log: &[String]| log.iter().any(|line| line.starts_with("rm ") || line.starts_with("create "));
+
+    run(&["claude"]);
+    assert!(has(&env.take_log(), "--template docker.io/sbx/claude-image:latest --pull always claude"));
+    assert_eq!(digest_of("claude-proj").as_deref(), Some("sha256:aaaa"));
+
+    let err = run(&["claude"]);
+    assert!(err.contains("nightly image is up to date"), "{err}");
+    assert!(!recreated(&env.take_log()));
+
+    // A newer build: without a terminal the sandbox is kept and sand says so.
+    registry.publish("sha256:bbbb");
+    let err = run(&["claude"]);
+    assert!(err.contains("a newer nightly image is available") && err.contains("--recreate"), "{err}");
+    assert!(!recreated(&env.take_log()));
+
+    // --resume attaches to the sandbox as it is and does not check.
+    let err = run(&["claude", "--resume"]);
+    assert!(!err.contains("nightly"), "{err}");
+
+    // Keeping it is remembered for that build; a later build is offered again.
+    run(&["claude", "--on-conflict", "merge"]);
+    assert_eq!(env.state("claude-proj")["declined_digest"], "sha256:bbbb");
+    let err = run(&["claude"]);
+    assert!(err.contains("you chose to keep the sandbox"), "{err}");
+    assert!(!recreated(&env.take_log()));
+
+    run(&["claude", "--on-conflict", "replace"]);
+    let log = env.take_log();
+    assert!(has(&log, "rm --force claude-proj") && has(&log, "create --name claude-proj --template"), "{log:?}");
+    assert_eq!(digest_of("claude-proj").as_deref(), Some("sha256:bbbb"));
+    assert!(env.state("claude-proj")["declined_digest"].is_null());
+
+    // A sandbox that predates `nightly = true` is offered the switch too.
+    env.config("");
+    run(&["codex"]);
+    env.take_log();
+    env.config("nightly = true\n");
+    let err = run(&["codex", "--on-conflict", "replace"]);
+    assert!(err.contains("was not created from the nightly image"), "{err}");
+    assert!(has(&env.take_log(), "create --name codex-proj --template docker.io/sbx/codex-image:latest --pull always"));
+
+    // An unreachable registry never blocks a launch.
+    let err = String::from_utf8_lossy(&env.ok(&["claude"]).stderr).into_owned();
+    assert!(err.contains("could not check for a newer nightly image"), "{err}");
+}
+
+#[test]
+fn open_config_creates_edits_and_validates() {
+    let env = Env::new();
+    let editor = env.root.join("editor.sh");
+    let config = env.root.join("config.toml");
+    let edit_with = |script: &str| {
+        fs::write(&editor, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+        env.command(&["--open-config"]).env("EDITOR", &editor).output().unwrap()
+    };
+
+    // No config yet: a commented starter is created, and it is valid as it is.
+    let out = edit_with("echo 'default_harness = \"codex\"' >> \"$1\"");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("# nightly = true") && text.ends_with("default_harness = \"codex\"\n"), "{text}");
+    assert!(env.take_log().is_empty(), "sbx is not involved");
+
+    // A mistake is reported, and the config can still be opened to fix it.
+    let out = edit_with("echo 'defualt_harness = 1' >> \"$1\"");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success() && err.contains("defualt_harness"), "{err}");
+    let out = edit_with("grep -v defualt \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]

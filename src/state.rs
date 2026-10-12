@@ -40,6 +40,12 @@ pub struct SandboxState {
     pub mcp: Vec<String>,
     #[serde(default)]
     pub template: Option<String>,
+    /// Digest of the nightly image the sandbox was created from.
+    #[serde(default)]
+    pub image_digest: Option<String>,
+    /// Newer nightly image the user chose not to switch to; not offered again.
+    #[serde(default)]
+    pub declined_digest: Option<String>,
     #[serde(default)]
     pub internal_mounts: Vec<InternalMount>,
     #[serde(default)]
@@ -171,6 +177,8 @@ mod tests {
             mounts: MountSet { primary: Some(Mount::rw(primary)), extras: vec![] },
             mcp: vec![],
             template: None,
+            image_digest: None,
+            declined_digest: None,
             internal_mounts: vec![],
             created_at: 0,
         }

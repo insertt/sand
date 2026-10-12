@@ -69,10 +69,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The TLS library has C and assembly parts, which need a musl C compiler.
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build
         run: cargo build --release --locked --target "$TARGET"
         env:
           TARGET: ${{ matrix.target }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
 
       # Asset names carry no version, so
       # releases/latest/download/<asset> always resolves to the newest one.

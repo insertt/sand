@@ -23,6 +23,7 @@ use crate::log;
 use crate::mcp;
 use crate::mounts::{self, Mode, Mount, MountSet, Plan, Strategy};
 use crate::paths::{Dirs, RUNTIME_DIR_NAME, container_path};
+use crate::registry;
 use crate::runtime::{self, Refresher};
 use crate::sbx::Sbx;
 use crate::state::{self, InternalMount, Kind, SandboxState};
@@ -255,6 +256,77 @@ fn reconcile(req: &Request, current: &SandboxState, args: &RunArgs) -> Result<De
     }
 }
 
+/// Checks whether a sandbox that should run the nightly image is still on an
+/// older build, and asks whether to recreate it. Returns the choice: `Replace`
+/// to recreate, `Merge` to keep the sandbox, `Abort` to stop.
+fn nightly_update(req: &Request, dirs: &Dirs, current: &mut SandboxState, args: &RunArgs) -> Result<ConflictChoice> {
+    let keep = Ok(ConflictChoice::Merge);
+    if !req.profile.nightly || req.template.is_some() {
+        return keep;
+    }
+    let Some(image) = harness::nightly_image(&req.profile.agent) else { return keep };
+    // A sandbox created from a template of its own stays on that template.
+    let on_nightly = current.template.as_deref() == Some(image.as_str());
+    if current.template.is_some() && !on_nightly {
+        return keep;
+    }
+    let latest = match registry::digest(&image) {
+        Ok(digest) => digest,
+        Err(err) => {
+            log::info(format!("could not check for a newer nightly image: {err:#}"));
+            return keep;
+        }
+    };
+    if on_nightly && current.image_digest.as_deref() == Some(latest.as_str()) {
+        log::ok(format!("nightly image is up to date ({})", registry::short(&latest)));
+        return keep;
+    }
+
+    let found = if on_nightly {
+        let build = current.image_digest.as_deref().map(registry::short).unwrap_or("an unknown build");
+        format!(
+            "a newer nightly image is available: {image} is now {}, the sandbox has {build}",
+            registry::short(&latest)
+        )
+    } else {
+        format!("the sandbox was not created from the nightly image {image}")
+    };
+    let hint = "use --recreate to switch";
+    let choice = if let Some(choice) = args.on_conflict {
+        log::info(format!("{found}; --on-conflict {}: not asking", format!("{choice:?}").to_lowercase()));
+        choice
+    } else if current.declined_digest.as_deref() == Some(latest.as_str()) {
+        log::info(format!("{found}; you chose to keep the sandbox ({hint})"));
+        return keep;
+    } else if args.acp || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        log::warn(format!("{found}; keeping the sandbox because there is no terminal to ask on ({hint})"));
+        return keep;
+    } else {
+        log::step(format!("Sandbox '{}' is not on the latest nightly image", req.name));
+        log::info(&found);
+        let items = [
+            (
+                ConflictChoice::Replace,
+                "Recreate — rebuild the sandbox from the new image (history is preserved, anything installed in it is lost)",
+            ),
+            (ConflictChoice::Merge, "Keep — stay on the current image and do not ask again for this build"),
+            (ConflictChoice::Abort, "Abort — leave everything as it is"),
+        ];
+        let labels: Vec<&str> = items.iter().map(|(_, label)| *label).collect();
+        let picked = Select::new()
+            .with_prompt("How do you want to continue?")
+            .items(&labels)
+            .default(0)
+            .interact_on_opt(&Term::stderr())?;
+        picked.map_or(ConflictChoice::Abort, |i| items[i].0)
+    };
+    if choice == ConflictChoice::Merge {
+        current.declined_digest = Some(latest);
+        state::save(dirs, current)?;
+    }
+    Ok(choice)
+}
+
 /// A sandbox with this name exists but sand has no record of it.
 fn reconcile_unmanaged(req: &Request, args: &RunArgs) -> Result<Decision> {
     log::step(format!("Sandbox '{}' exists but was not created by sand", req.name));
@@ -296,10 +368,34 @@ fn create_sandbox(sbx: &Sbx, dirs: &Dirs, config: &Config, req: &Request) -> Res
         log::info(line);
     }
     let mut cmd = args!["create", "--name", &req.name];
+    let mut template = req.template.clone();
+    let mut image_digest = None;
     if let Some(name) = &req.template {
         let resolved = template::resolve(sbx, dirs, config, name)?;
         log::info(format!("template: {name} ({})", resolved.image));
+        if req.profile.nightly {
+            log::info("nightly: not used, the template decides the image");
+        }
         cmd.extend(resolved.create_args());
+    } else if req.profile.nightly {
+        match harness::nightly_image(&req.profile.agent) {
+            Some(image) => {
+                image_digest = match registry::digest(&image) {
+                    Ok(digest) => Some(digest),
+                    Err(err) => {
+                        log::warn(format!("cannot tell which build of {image} this is: {err:#}"));
+                        None
+                    }
+                };
+                let build = image_digest.as_deref().map(|d| format!(" ({})", registry::short(d))).unwrap_or_default();
+                log::info(format!("nightly image: {image}{build}"));
+                cmd.extend(template::Resolved::nightly(image.clone()).create_args());
+                template = Some(image);
+            }
+            None => {
+                log::warn(format!("no nightly image is known for agent '{}'; using the sbx default", req.profile.agent))
+            }
+        }
     }
     if !req.mcp.is_empty() {
         cmd.extend(args!["--static-mcp", req.mcp.join(",")]);
@@ -321,7 +417,9 @@ fn create_sandbox(sbx: &Sbx, dirs: &Dirs, config: &Config, req: &Request) -> Res
         kind: req.kind,
         mounts,
         mcp: req.mcp.clone(),
-        template: req.template.clone(),
+        template,
+        image_digest,
+        declined_digest: None,
         internal_mounts: Vec::new(),
         created_at: state::now(),
     };
@@ -515,6 +613,21 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         state::forget(dirs, &req.name, false)?;
     }
 
+    if let (true, false, Some(state)) = (exists, args.resume, current.as_mut()) {
+        match nightly_update(&req, dirs, state, &args)? {
+            ConflictChoice::Merge => {}
+            ConflictChoice::Replace => {
+                remove_sandbox(&sbx, dirs, &req.name, true)?;
+                exists = false;
+                current = None;
+            }
+            ConflictChoice::Abort => {
+                log::info("aborted; nothing was changed");
+                return Ok(1);
+            }
+        }
+    }
+
     mcp::ensure_registered(&sbx, config, &req.mcp)?;
 
     // --- decide ---------------------------------------------------------------
@@ -564,6 +677,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
                 },
                 mcp: Vec::new(),
                 template: None,
+                image_digest: None,
+                declined_digest: None,
                 internal_mounts: Vec::new(),
                 created_at: state::now(),
             });

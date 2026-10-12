@@ -11,6 +11,7 @@ mod mcp;
 mod mounts;
 mod paths;
 mod policy;
+mod registry;
 mod runtime;
 mod sbx;
 mod session;
@@ -31,6 +32,11 @@ use sbx::Sbx;
 
 fn dispatch(cli: Cli) -> Result<i32> {
     let dirs = Dirs::discover()?;
+    // Before the config is loaded, so that a broken one can still be fixed.
+    if cli.command.is_none() && cli.run.open_config {
+        config::open_in_editor(&dirs)?;
+        return Ok(0);
+    }
     let config = Config::load(&dirs)?;
     match cli.command {
         None => session::run(cli.run, &dirs, &config),

@@ -66,6 +66,7 @@ the same.
 | `--template T` | Create the sandbox from a template (see [Templates](#templates)). |
 | `--acp` | Speak ACP on stdio instead of opening the terminal UI (see [Editors](#editors)). |
 | `--install-editor zed\|jetbrains` | Register `sand [HARNESS] --acp` in the editor, then exit. |
+| `--open-config` | Open the [config file](#configuration) in your editor, then exit. |
 | `--on-conflict replace\|merge\|abort` | Answer the "sandbox exists with a different setup" question up front. |
 
 Other commands: `sand status [HARNESS] [DIR]` prints a sandbox's mounts, agent
@@ -203,6 +204,34 @@ Base a Dockerfile on the harness's sbx image, for example
 been built yet is built on first use. Set `template = "rust"` under
 `[harness.<name>]` to make it that harness's default.
 
+### Nightly images
+
+`sbx` creates a sandbox from an image it already has, so the agent CLI inside
+can be weeks old. To start from the image that is rebuilt every night with the
+latest release of the harness instead:
+
+```toml
+# config.toml
+nightly = true          # every harness…
+
+[harness.codex]
+nightly = false         # …except this one
+```
+
+`sand` then creates the sandbox with `--template docker.io/sbx/<agent>-image:latest
+--pull always` (`docker/sandbox-templates:<agent>-docker-nightly` for `gemini`
+and `shell`, which have no such image). A template, from `--template` or the
+harness's `template`, takes precedence.
+
+The image is fixed when a sandbox is created, so on every launch `sand` asks
+the registry whether a newer build has been published since. If one has, it
+offers to recreate the sandbox from it: history is kept, anything you installed
+in the sandbox by hand is lost. Choosing to keep the sandbox is remembered
+until the next build. `--on-conflict replace` recreates without asking and
+`--on-conflict merge` keeps the sandbox; without a terminal, and in `--acp`
+mode, the sandbox is kept and the log says a newer image exists. `--resume`
+skips the check, and a registry that cannot be reached never blocks a launch.
+
 ## Editors
 
 ```console
@@ -227,9 +256,12 @@ The first start of a new sandbox takes a while. If the editor times out, run
 `sand` reads `config.toml` from the platform config directory
 (`~/.config/sand` on Linux, `~/Library/Application Support/sand` on macOS,
 `%APPDATA%\sand` on Windows), or from `$SAND_CONFIG`. Everything is optional.
+`sand --open-config` opens the file in `$VISUAL` or `$EDITOR` (creating it with
+commented examples if there is none) and checks it when the editor closes.
 
 ```toml
 default_harness = "codex"
+nightly = true                       # use nightly harness images (see Templates)
 
 # Change a built-in harness…
 [harness.claude]
@@ -255,9 +287,10 @@ url = "https://mcp.linear.app/mcp"
 All harness keys: `agent`, `host_config_dir`, `sandbox_config_dir`, `copy`,
 `extra_copy`, `exclude`, `settings_files`, `settings_format`, `strip_keys`,
 `overlay`, `history`, `bypass_args`, `statusline`, `acp_command`,
-`api_check_url`, `template`.
+`api_check_url`, `template`, `nightly`.
 
 State lives in the platform data directory (`~/.local/share/sand`,
 `~/Library/Application Support/sand`, `%LOCALAPPDATA%\sand`), or
 `$SAND_DATA_DIR`: per-sandbox state and history, the shared scratch directory,
-and session locks. `$SAND_SBX` overrides the `sbx` binary.
+and session locks. `$SAND_SBX` overrides the `sbx` binary, and `$SAND_REGISTRY`
+the registry asked about nightly images (a mirror's base URL).

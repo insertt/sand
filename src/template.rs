@@ -54,15 +54,32 @@ fn local_tag(name: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
     pub image: String,
+    pub pull: Pull,
+}
+
+/// When the sandbox runtime pulls the image from its registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pull {
+    /// Left to sbx: pulled when it is not in the image store yet.
+    Missing,
     /// Local images must not be pulled from a registry.
-    pub local: bool,
+    Never,
+    /// Moving tags (nightly images) are pulled every time a sandbox is created.
+    Always,
 }
 
 impl Resolved {
+    /// The image a harness is rebuilt into every night.
+    pub fn nightly(image: String) -> Self {
+        Self { image, pull: Pull::Always }
+    }
+
     pub fn create_args(&self) -> Vec<std::ffi::OsString> {
         let mut out = args!["--template", &self.image];
-        if self.local {
-            out.extend(args!["--pull", "never"]);
+        match self.pull {
+            Pull::Missing => {}
+            Pull::Never => out.extend(args!["--pull", "never"]),
+            Pull::Always => out.extend(args!["--pull", "always"]),
         }
         out
     }
@@ -77,19 +94,19 @@ pub fn resolve(sbx: &Sbx, dirs: &Dirs, config: &Config, name: &str) -> Result<Re
             if def.dockerfile.is_some() {
                 bail!("[templates.{name}] sets both `image` and `dockerfile`; use one");
             }
-            return Ok(Resolved { image: image.clone(), local: false });
+            return Ok(Resolved { image: image.clone(), pull: Pull::Missing });
         }
         if !registry.templates.contains_key(name) {
             log::info(format!("template '{name}' has not been built yet"));
             build(sbx, dirs, config, name)?;
         }
-        return Ok(Resolved { image: local_tag(name), local: true });
+        return Ok(Resolved { image: local_tag(name), pull: Pull::Never });
     }
     if let Some(entry) = registry.templates.get(name) {
-        return Ok(Resolved { image: entry.tag.clone(), local: true });
+        return Ok(Resolved { image: entry.tag.clone(), pull: Pull::Never });
     }
     // Anything else is taken as an image reference for sbx to pull.
-    Ok(Resolved { image: name.to_string(), local: false })
+    Ok(Resolved { image: name.to_string(), pull: Pull::Missing })
 }
 
 fn dockerfile_of(dirs: &Dirs, name: &str, def: &TemplateDef) -> Result<PathBuf> {

@@ -1,12 +1,84 @@
 //! User configuration (`config.toml`). Everything is optional.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
+use std::io::ErrorKind;
+use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::log;
 use crate::paths::Dirs;
+
+/// Written by `--open-config` when there is no config file yet.
+const STARTER: &str = r#"# sand configuration. Everything is optional; the README describes every key.
+
+# default_harness = "claude"
+# nightly = true                       # create sandboxes from nightly harness images
+
+# [harness.claude]
+# template = "rust"
+# overlay = { model = "opus" }         # merged over the built-in settings overlay
+
+# [templates.rust]
+# dockerfile = "~/sand/rust.Dockerfile"
+
+# [mcp.linear]
+# url = "https://mcp.linear.app/mcp"
+"#;
+
+/// Editor commands to try, in order: `$VISUAL`, `$EDITOR`, then what the platform has.
+fn editors() -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|var| env::var(var).ok())
+        .map(|value| value.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .filter(|command| !command.is_empty())
+        .collect();
+    let fallbacks: &[&[&str]] = if cfg!(windows) {
+        &[&["notepad"]]
+    } else if cfg!(target_os = "macos") {
+        &[&["open", "-W", "-t"]]
+    } else {
+        &[&["sensible-editor"], &["nano"], &["vi"]]
+    };
+    out.extend(fallbacks.iter().map(|command| command.iter().map(|s| s.to_string()).collect()));
+    out
+}
+
+/// `sand --open-config`: opens config.toml in an editor, then checks the result.
+pub fn open_in_editor(dirs: &Dirs) -> Result<()> {
+    let file = &dirs.config_file;
+    if !file.exists() {
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(file, STARTER).with_context(|| format!("writing {}", file.display()))?;
+        log::info(format!("created {} with commented examples", file.display()));
+    }
+    log::step(format!("Opening {}", file.display()));
+    let mut opened = false;
+    for command in editors() {
+        log::command(format!("{} {}", command.join(" "), file.display()));
+        match Command::new(&command[0]).args(&command[1..]).arg(file).status() {
+            Ok(status) if status.success() => {
+                opened = true;
+                break;
+            }
+            Ok(status) => bail!("{} exited with {status}", command[0]),
+            Err(e) if e.kind() == ErrorKind::NotFound => log::info(format!("{} is not installed", command[0])),
+            Err(e) => return Err(e).with_context(|| format!("running {}", command[0])),
+        }
+    }
+    if !opened {
+        bail!("no editor found; set $EDITOR, or edit {} yourself", file.display());
+    }
+    Config::load(dirs)?;
+    log::ok("the config is valid");
+    Ok(())
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +87,9 @@ pub struct Config {
     pub default_harness: Option<String>,
     /// Home directory of the agent user inside sandboxes (default: /home/agent).
     pub sandbox_home: Option<String>,
+    /// Create sandboxes from the harness's nightly image (default: false).
+    /// `[harness.<name>] nightly` overrides it for one harness.
+    pub nightly: Option<bool>,
     /// Overrides for built-in harnesses and definitions of additional ones.
     #[serde(default)]
     pub harness: BTreeMap<String, HarnessOverride>,
@@ -46,6 +121,7 @@ pub struct HarnessOverride {
     pub acp_command: Option<Vec<String>>,
     pub api_check_url: Option<String>,
     pub template: Option<String>,
+    pub nightly: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -126,9 +202,11 @@ mod tests {
         let config: Config = toml::from_str(
             r#"
             default_harness = "codex"
+            nightly = true
 
             [harness.claude]
             template = "rust"
+            nightly = false
             history = [".claude/projects"]
             overlay = { model = "opus" }
 
@@ -159,6 +237,7 @@ mod tests {
         assert_eq!(config.default_harness(), "codex");
         assert_eq!(config.sandbox_home(), "/home/agent");
         assert_eq!(config.harness["claude"].template.as_deref(), Some("rust"));
+        assert_eq!((config.nightly, config.harness["claude"].nightly), (Some(true), Some(false)));
         assert_eq!(config.harness["aider"].statusline, Some(StatuslineKind::None));
         assert_eq!(config.templates["rust"].build_args["RUST"], "1.90");
         assert_eq!(config.mcp["pw"].args, vec!["@playwright/mcp@latest"]);

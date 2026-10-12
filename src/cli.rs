@@ -14,6 +14,7 @@ Examples:
   sand codex --scratch                       shared scratch space, no project
   sand --acp                                 ACP agent on stdio (for editors)
   sand codex --install-editor zed            register `sand codex --acp` in Zed
+  sand --open-config                         edit sand's config file
   sand claude -- --continue                  pass arguments to the agent";
 
 #[derive(Debug, Parser)]
@@ -116,6 +117,10 @@ pub struct RunArgs {
     #[arg(long, value_enum, value_name = "EDITOR")]
     pub install_editor: Option<Editor>,
 
+    /// Open the config file in $VISUAL or $EDITOR (created if missing), then exit
+    #[arg(long)]
+    pub open_config: bool,
+
     /// Template to create the sandbox from (name from config.toml or `sand template ls`, or an image)
     #[arg(long, value_name = "TEMPLATE")]
     pub template: Option<String>,
@@ -192,6 +197,7 @@ mod tests {
         assert!(run(&["--acp"]).acp && run(&["--acp"]).targets.is_empty());
         assert_eq!(run(&["codex", "--install-editor", "zed"]).install_editor, Some(Editor::Zed));
         assert_eq!(run(&["--install-editor", "jetbrains"]).install_editor, Some(Editor::Jetbrains));
+        assert!(run(&["--open-config"]).open_config && !run(&["codex"]).open_config);
     }
 
     #[test]
