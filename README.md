@@ -11,7 +11,29 @@ $ sand codex . ../shared-lib:ro ../docs:rw
 
 ## Install
 
-Requires the `sbx` CLI (signed in with `sbx login`) and Rust 1.89 or later.
+Requires the `sbx` CLI (signed in with `sbx login`).
+
+Prebuilt executables for Linux, macOS and Windows are attached to every
+[release](https://github.com/insertt/sand/releases). The install scripts
+download the one for your platform and verify its checksum.
+
+Linux and macOS (installs to `~/.local/bin`):
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/insertt/sand/main/install.sh | sh
+```
+
+Windows (installs to `%LOCALAPPDATA%\Programs\sand` and adds it to your `PATH`):
+
+```console
+PS> irm https://raw.githubusercontent.com/insertt/sand/main/install.ps1 | iex
+```
+
+Set `SAND_VERSION` (for example `v0.1.0`) to install a specific release instead
+of the latest, and `SAND_INSTALL_DIR` to install somewhere else. Run the script
+again to upgrade.
+
+To build from source instead, with Rust 1.89 or later:
 
 ```console
 $ cargo install --path .

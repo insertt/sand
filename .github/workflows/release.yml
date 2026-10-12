@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  # Publishing a release (not just pushing a tag) builds the executables and
+  # attaches them to it. Draft releases build once they are published.
+  release:
+    types: [published]
+  # Rebuild the assets of an existing release, e.g. after a failed run.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of an existing release to (re)build assets for
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+  # Never interpolated into a script: tag names are user-controlled.
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # upload release assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl, so the Linux executables are static and run on any distro.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      # The install scripts and `sand --version` both rely on the tag being
+      # the crate version, so refuse to publish a mismatch.
+      - name: Check tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+
+      # Asset names carry no version, so
+      # releases/latest/download/<asset> always resolves to the newest one.
+      - name: Package
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir dist
+          cd "target/$TARGET/release"
+          if [ "$RUNNER_OS" = Windows ]; then
+            asset="sand-$TARGET.zip"
+            7z a "$GITHUB_WORKSPACE/dist/$asset" sand.exe
+          else
+            asset="sand-$TARGET.tar.gz"
+            tar -czf "$GITHUB_WORKSPACE/dist/$asset" sand
+          fi
+          cd "$GITHUB_WORKSPACE/dist"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ steps.package.outputs.asset }}
+        run: gh release upload "$TAG" "dist/$ASSET" "dist/$ASSET.sha256" --clobber --repo "$GITHUB_REPOSITORY"
