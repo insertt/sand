@@ -9,6 +9,8 @@ across rebuilds, and logs every step and every `sbx` command it runs.
 $ sand codex . ../shared-lib:ro ../docs:rw
 ```
 
+![sand starting an agent in a sandbox](demo.webp)
+
 ## Install
 
 Requires the `sbx` CLI (signed in with `sbx login`).
