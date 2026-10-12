@@ -10,6 +10,7 @@ mod log;
 mod mcp;
 mod mounts;
 mod paths;
+mod policy;
 mod runtime;
 mod sbx;
 mod session;
@@ -34,6 +35,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
         None => session::run(cli.run, &dirs, &config),
         Some(Command::Status(args)) => session::status(args, &dirs, &config),
+        Some(Command::Allow(args)) => policy::allow(args, &dirs, &config),
         Some(Command::Template { action }) => {
             let sbx = Sbx::new(true);
             match action {

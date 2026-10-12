@@ -594,6 +594,57 @@ fn status_shows_the_banner_for_an_existing_sandbox() {
 }
 
 #[test]
+fn allow_lists_blocked_hosts_and_adds_sandbox_scoped_rules() {
+    let env = Env::new();
+    assert!(env.fails(&["allow", "codex"]).contains("no sandbox named 'codex-proj'"));
+    env.ok(&["codex"]);
+    env.take_log();
+    assert!(stderr(&env.ok(&["allow", "codex"])).contains("nothing is blocked"));
+    env.take_log();
+
+    fs::write(
+        env.fake.join("policy.json"),
+        r#"{"blocked_hosts": [
+              {"host": "zed.dev:443", "vm_name": "codex-proj", "rule": "no applicable policies for op(x)",
+               "last_seen": "2026-10-12T12:51:22.4219199+02:00", "count_since": 1, "reason": "No matching allow rule (default deny)"},
+              {"host": "gw.internal", "vm_name": "codex-proj", "rule": "<dns proxy policy>",
+               "last_seen": "2026-10-12T12:51:16.790945+02:00", "count_since": 2, "reason": "DNS lookup blocked by proxy policy"},
+              {"host": "other.dev:443", "vm_name": "claude-proj", "rule": "no applicable policies for op(x)",
+               "last_seen": "2026-10-12T12:51:22+02:00", "count_since": 1, "reason": "No matching allow rule (default deny)"}],
+            "allowed_hosts": []}"#,
+    )
+    .unwrap();
+    let out = env.ok(&["allow", "codex", "--list"]);
+    let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(listed.contains("zed.dev:443  (1 request, last 2026-10-12 12:51:22)"), "{listed}");
+    assert!(listed.contains("gw.internal") && listed.contains("[DNS lookup blocked by proxy policy]"), "{listed}");
+    assert!(!listed.contains("other.dev"), "{listed}");
+    assert_eq!(starting(&env.take_log(), "policy"), ["policy log codex-proj --json"]);
+
+    // Choosing needs a terminal; the tests have none.
+    let err = env.fails(&["allow", "codex"]);
+    assert!(err.contains("not offered: gw.internal") && err.contains("pass --host"), "{err}");
+    assert!(!has(&env.take_log(), "policy allow"));
+
+    let err = stderr(&env.ok(&["allow", "codex", "--host", "zed.dev:443,*.example.com"]));
+    assert!(err.contains("$ sbx policy allow network --sandbox codex-proj zed.dev:443,*.example.com"), "{err}");
+    assert_eq!(
+        starting(&env.take_log(), "policy"),
+        ["policy allow network --sandbox codex-proj zed.dev:443,*.example.com"]
+    );
+
+    env.ok(&["allow", "--name", "codex-proj", "--host", "zed.dev", "--global"]);
+    assert_eq!(starting(&env.take_log(), "policy"), ["policy allow network zed.dev"]);
+
+    assert!(env.fails(&["allow", "codex", "--host", "--sandbox"]).contains("error"));
+    let out = env.command(&["allow", "codex", "--host", "zed.dev"]).env("FAKE_SBX_ALLOW_FAIL", "1").output().unwrap();
+    assert!(
+        !out.status.success()
+            && stderr(&out).contains("`sbx policy allow network --sandbox codex-proj zed.dev` failed")
+    );
+}
+
+#[test]
 fn apply_script_installs_the_staged_config_and_prunes_stale_files() {
     let env = Env::new();
     // Point the "sandbox home" at a real directory so the generated script can run here.

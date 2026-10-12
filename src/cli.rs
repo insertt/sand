@@ -41,6 +41,8 @@ pub enum Command {
     },
     /// Show a sandbox's mounts, agent API connectivity and MCP server status
     Status(StatusArgs),
+    /// Allow a sandbox network access to hosts its policy blocked
+    Allow(AllowArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +140,33 @@ pub struct StatusArgs {
     pub scratch: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct AllowArgs {
+    /// Harness and project directory identifying the sandbox (default: current directory)
+    #[arg(value_name = "HARNESS] [DIR")]
+    pub targets: Vec<String>,
+
+    /// Hosts to allow without asking, comma-separated (example.com, example.com:443, *.example.com)
+    #[arg(long, value_name = "HOSTS", value_delimiter = ',')]
+    pub host: Vec<String>,
+
+    /// Only print the blocked hosts
+    #[arg(long, conflicts_with_all = ["host", "global"])]
+    pub list: bool,
+
+    /// Allow the hosts for every sandbox instead of only this one
+    #[arg(long)]
+    pub global: bool,
+
+    /// Sandbox name
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Look at the shared scratch sandbox
+    #[arg(long)]
+    pub scratch: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +226,10 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Command::Status(ref s)) if s.targets == ["codex"] && s.name.as_deref() == Some("x"))
         );
+        let cli = Cli::try_parse_from(["sand", "allow", "codex", "--host", "a.com,b.com:443", "--global"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Allow(ref a)) if a.targets == ["codex"] && a.host == ["a.com", "b.com:443"] && a.global)
+        );
+        assert!(Cli::try_parse_from(["sand", "allow", "--list", "--host", "a.com"]).is_err());
     }
 }

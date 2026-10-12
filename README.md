@@ -45,8 +45,10 @@ the same.
 | `--on-conflict replace\|merge\|abort` | Answer the "sandbox exists with a different setup" question up front. |
 
 Other commands: `sand status [HARNESS] [DIR]` prints a sandbox's mounts, agent
-API connectivity and MCP server status. `sand template build|save|ls|rm`
-manages templates.
+API connectivity and MCP server status. `sand allow [HARNESS] [DIR]` opens the
+network for hosts the sandbox was blocked from reaching (see
+[Blocked network access](#blocked-network-access)). `sand template
+build|save|ls|rm` manages templates.
 
 ### When the sandbox already exists
 
@@ -123,6 +125,26 @@ status line, so `sand` prints them as a banner before the agent starts, and
 | `codex` | `~/.codex`, `~/.agents/skills` | `sessions` | built-in + banner | `npx -y @agentclientprotocol/codex-acp` |
 | `opencode` | `~/.config/opencode` | `~/.local/share/opencode` | banner | `opencode acp` |
 | anything else | nothing | nothing | banner | set `acp_command` |
+
+## Blocked network access
+
+The sandbox's network policy rejects hosts that are not on an allow list.
+`sand allow`, run in another terminal while the agent works, lists the hosts
+the sandbox was blocked from reaching and lets you tick the ones to allow:
+
+```console
+$ sand allow claude                      # choose from the blocked hosts
+$ sand allow claude --list               # only print them
+$ sand allow claude --host zed.dev:443   # allow a host without asking
+```
+
+It reads `sbx policy log` and adds the rules with `sbx policy allow network
+--sandbox <name>`, so they apply to that sandbox only; `--global` allows the
+hosts for every sandbox. Hosts are allowed exactly as they were logged,
+including the port. Requests that were blocked have already failed, so ask the
+agent to try again. Blocks that an allow rule does not lift, such as an
+explicit deny rule, are shown but not offered. A host you allowed stays in the
+list until the sandbox reaches it.
 
 ## MCP servers
 

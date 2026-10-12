@@ -675,24 +675,38 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-/// `sand status`: the banner for an existing sandbox.
-pub fn status(args: StatusArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
+/// Resolves `[HARNESS] [DIR]`, `--name` or `--scratch` to an existing sandbox
+/// and the harness that was named or defaulted to.
+pub fn find_sandbox(
+    sbx: &Sbx,
+    targets: &[String],
+    name: Option<&str>,
+    scratch: bool,
+    dirs: &Dirs,
+    config: &Config,
+) -> Result<(String, String)> {
     let cwd = env::current_dir().context("determining the current directory")?;
-    let (harness, specs) = split_targets(&args.targets, config, &cwd, &dirs.home);
+    let (harness, specs) = split_targets(targets, config, &cwd, &dirs.home);
     let harness = harness.unwrap_or_else(|| config.default_harness().to_string());
-    let name = match &args.name {
-        Some(name) => name.clone(),
-        None if args.scratch => state::sanitize_name(&format!("scratch-{harness}")),
+    let name = match name {
+        Some(name) => name.to_string(),
+        None if scratch => state::sanitize_name(&format!("scratch-{harness}")),
         None => {
             let dir = specs.first().map(String::as_str).unwrap_or(".");
             let primary: PathBuf = Mount::parse(dir, &cwd, &dirs.home)?.path;
             state::default_name(dirs, &state::sanitize_name(&harness), &primary)?
         }
     };
-    let sbx = Sbx::new(true);
     if !sbx.exists(&name)? {
         bail!("there is no sandbox named '{name}' (see `sbx ls`)");
     }
+    Ok((name, harness))
+}
+
+/// `sand status`: the banner for an existing sandbox.
+pub fn status(args: StatusArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
+    let sbx = Sbx::new(true);
+    let (name, harness) = find_sandbox(&sbx, &args.targets, args.name.as_deref(), args.scratch, dirs, config)?;
     let (profile, mounts, servers) = match state::load(dirs, &name)? {
         Some(state) => (Profile::resolve(&state.harness, config)?, state.mounts, state.mcp),
         None => {

@@ -94,6 +94,12 @@ case "$cmd" in
     fi
     exit "${FAKE_SBX_RUN_EXIT:-0}"
     ;;
+  policy)
+    case "${1:-}" in
+      log) cat "$root/policy.json" 2>/dev/null || echo '{}' ;;
+      allow) [ -z "${FAKE_SBX_ALLOW_FAIL:-}" ] || { echo "fake sbx: allow refused" >&2; exit 1; } ;;
+    esac
+    ;;
   template)
     ;;
   *)
