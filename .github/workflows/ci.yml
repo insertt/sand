@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # PRs are built only after a maintainer approves them (see `pr-approved`).
+  # Using pull_request_review (not pull_request) keeps unreviewed code from
+  # running CI, and fork PRs still get a read-only token and no secrets.
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Reviews that don't qualify for a build (comments, change requests, approvals
+# from non-maintainers) get a group of their own, so they can't cancel the
+# build that a maintainer's approval started.
+concurrency:
+  group: >-
+    ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{
+      github.event_name == 'pull_request_review' &&
+      !(github.event.review.state == 'approved' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) &&
+      github.run_id || 'build' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  ci:
+    # Push / manual runs always build. Review events build only when the review
+    # is an approval from a maintainer (owner, org member, or collaborator).
+    if: >-
+      github.event_name != 'pull_request_review' ||
+      (github.event.review.state == 'approved' &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                github.event.review.author_association))
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # For approvals, build exactly the commit that was approved rather
+          # than whatever the PR head has moved to since.
+          ref: ${{ github.event.review.commit_id || github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
