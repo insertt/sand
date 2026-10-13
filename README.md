@@ -263,6 +263,13 @@ first time you ask for it. A sandbox created with `--mcp` gets exactly those
 servers (sbx static mode). A sandbox created without it lets the agent discover
 registered servers through the gateway.
 
+Before a sandbox starts, `sand` checks the servers it uses and runs
+`sbx mcp auth <name>` for each one whose credentials are missing or expired.
+`sbx` refreshes the credential on its own when it can and asks you to sign in
+only when that needs your consent. A server that cannot be authorized is
+reported and the launch continues without it. Without a terminal (and in
+`--acp` mode) nothing is authorized; `sand` names the command to run instead.
+
 ## Templates
 
 A template is an image with your tooling already installed. Three ways to get one:

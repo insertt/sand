@@ -102,6 +102,13 @@ impl Sbx {
         Ok(output.status)
     }
 
+    /// Runs a command that may talk to the user: it gets the terminal, with its
+    /// stdout on stderr like every other setup command.
+    pub fn interact(&self, args: Vec<OsString>) -> Result<ExitStatus> {
+        log::command(format!("sbx {}", display(&args)));
+        self.command(&args).stdout(io::stderr()).status().map_err(|e| self.spawn_error(e))
+    }
+
     /// Runs a command silently and returns its stdout when it succeeds.
     pub fn capture(&self, args: Vec<OsString>) -> Result<Option<String>> {
         let output =

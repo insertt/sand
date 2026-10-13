@@ -694,6 +694,15 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         }
     };
 
+    // Before the sandbox is created or started, so that its gateway finds the credentials.
+    let used_mcp: Vec<String> = match &decision {
+        Decision::Abort => Vec::new(),
+        Decision::Create => req.mcp.clone(),
+        Decision::Reuse { load_mcp, .. } => current.iter().flat_map(|s| &s.mcp).chain(load_mcp).cloned().collect(),
+    };
+    let can_prompt = !args.acp && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    mcp::ensure_authorized(&sbx, &used_mcp, can_prompt)?;
+
     let (mut state, plan, load_mcp) = match decision {
         Decision::Abort => {
             log::info("aborted; nothing was changed");
