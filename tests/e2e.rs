@@ -270,6 +270,25 @@ fn resume_attaches_without_needing_the_mounts() {
 }
 
 #[test]
+fn no_attach_sets_the_sandbox_up_without_running_the_agent() {
+    let env = Env::new();
+    let out = env.ok(&["codex", ".", "../other:ro", "--no-attach"]);
+    let log = env.take_log();
+    let create = format!("create --name codex-proj codex {} {}:ro", env.p(&env.proj), env.p(&env.other));
+    assert_eq!(starting(&log, "create"), vec![create]);
+    assert!(has(&log, "exec codex-proj sh /home/agent/.sand/apply.sh"));
+    assert!(starting(&log, "run").is_empty());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("AGENT-STARTED"));
+    assert!(stderr(&out).contains("sandbox 'codex-proj' is ready"));
+
+    // The sandbox it left behind is a normal one: the same command attaches.
+    env.ok(&["codex", ".", "../other:ro"]);
+    let log = env.take_log();
+    assert!(starting(&log, "create").is_empty() && starting(&log, "mount").is_empty());
+    assert_eq!(log.last().unwrap(), "run --name codex-proj");
+}
+
+#[test]
 fn recreate_preserves_history_unless_told_otherwise() {
     let env = Env::new();
     env.ok(&["codex"]);

@@ -735,6 +735,10 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     runtime::write_mcp_status(&runtime_dir, &mcp_status)?;
     let api = runtime::check_api(&sbx, &state.name, profile);
     runtime::banner(&state.name, profile, &state.mounts, api, &mcp_status);
+    if args.no_attach {
+        log::ok(format!("sandbox '{}' is ready; `sand {} --resume` attaches to it", state.name, profile.name));
+        return Ok(0);
+    }
     if profile.statusline != StatuslineKind::Claude && !args.acp {
         let shows = match profile.statusline {
             StatuslineKind::Codex => "status line shows model, branch, context and limits, but not the sandbox",

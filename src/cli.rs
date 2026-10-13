@@ -11,6 +11,7 @@ Examples:
   sand claude --mcp atlassian,gitlab         with MCP servers from `sbx mcp ls`
   sand claude --resume                       attach to the existing sandbox as it is
   sand claude --recreate                     rebuild the sandbox, keeping history
+  sand codex --no-attach                     set the sandbox up without opening the agent
   sand codex --scratch                       shared scratch space, no project
   sand --acp                                 ACP agent on stdio (for editors)
   sand codex --install-editor zed            register `sand codex --acp` in Zed
@@ -108,6 +109,10 @@ pub struct RunArgs {
     /// Speak ACP on stdio instead of opening the agent's terminal UI
     #[arg(long)]
     pub acp: bool,
+
+    /// Create or update the sandbox and start it, but do not open the agent
+    #[arg(long, conflicts_with_all = ["acp", "dedicated_scratch", "agent_args"])]
+    pub no_attach: bool,
 
     /// Sandbox name (default: <harness>-<directory>)
     #[arg(long, value_name = "NAME")]
@@ -215,6 +220,9 @@ mod tests {
             &["codex", "--no-preserve-history"],
             &["codex", "--install-editor", "vim"],
             &["codex", "--resume", "--dedicated-scratch"],
+            &["codex", "--no-attach", "--acp"],
+            &["codex", "--no-attach", "--dedicated-scratch"],
+            &["codex", "--no-attach", "--", "--continue"],
         ];
         for args in bad {
             assert!(Cli::try_parse_from(std::iter::once("sand").chain(args.iter().copied())).is_err(), "{args:?}");

@@ -58,6 +58,7 @@ the same.
 | --- | --- |
 | `--mcp a,b` | Expose these MCP servers (names from `sbx mcp ls`). |
 | `--resume` | Attach to the existing sandbox as it is, ignoring mounts on the command line. Fails if there is none. |
+| `--no-attach` | Create or update the sandbox and start it, then exit without opening the agent. `sand [HARNESS] --resume` attaches later. |
 | `--recreate` | Remove the sandbox and create it again. Conversation history is kept. |
 | `--no-preserve-history` | With `--recreate`: discard the history too. |
 | `--scratch` | No project: use the shared scratch directory, which persists and is shared by all harnesses. |
