@@ -83,6 +83,13 @@ case "$cmd" in
         esac
         ;;
       add) echo "$1" >> "$root/mcp" ;;
+      auth)
+        # Signing in marks the server as ready; a server named in mcp-auth-fail refuses.
+        grep -qx "$1" "$root/mcp-auth-fail" 2>/dev/null && { echo "fake sbx: authorization failed" >&2; exit 1; }
+        echo "Open https://auth.example/$1 to sign in"
+        sed "s/{\"name\": \"$1\"[^}]*}/{\"name\": \"$1\", \"status\": \"ready\"}/" "$root/mcp.json" > "$root/mcp.json.tmp" &&
+          mv "$root/mcp.json.tmp" "$root/mcp.json"
+        ;;
       load) ;;
     esac
     ;;

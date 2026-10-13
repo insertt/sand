@@ -374,6 +374,33 @@ fn mcp_status_reaches_the_banner_and_the_status_line_file() {
 }
 
 #[test]
+fn mcp_servers_needing_auth_are_not_authorized_without_a_terminal() {
+    let env = Env::new();
+    env.register_mcp(&["atlassian", "gitlab", "notion"]);
+    fs::write(
+        env.fake.join("mcp.json"),
+        r#"[{"name": "atlassian", "status": "ready"}, {"name": "gitlab", "auth_status": "needs authorization"}, {"name": "notion", "auth_status": "expired"}]"#,
+    )
+    .unwrap();
+    // notion needs it too, but this sandbox does not use it.
+    let out = env.ok(&["claude", "--mcp", "atlassian,gitlab"]);
+    let (log, err) = (env.take_log(), stderr(&out));
+    assert!(starting(&log, "mcp auth").is_empty(), "{log:#?}");
+    assert!(err.contains("Authorizing MCP servers: gitlab\n"), "{err}");
+    assert!(err.contains("no terminal") && err.contains("run `sbx mcp auth gitlab` yourself"), "{err}");
+    assert_eq!(log.last().unwrap(), "run --name claude-proj");
+
+    // Nothing to do, nothing said.
+    fs::write(
+        env.fake.join("mcp.json"),
+        r#"[{"name": "atlassian", "status": "ready"}, {"name": "gitlab", "status": "ready"}]"#,
+    )
+    .unwrap();
+    let out = env.ok(&["claude", "--mcp", "atlassian,gitlab"]);
+    assert!(!stderr(&out).contains("Authorizing MCP servers"));
+}
+
+#[test]
 fn scratch_is_shared_and_dedicated_scratch_is_disposable() {
     let env = Env::new();
     env.ok(&["codex", "--scratch"]);

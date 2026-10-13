@@ -127,6 +127,11 @@ fn truthy(value: &Value) -> Option<bool> {
 /// not documented, so this looks for the obvious signals and otherwise reports
 /// the server as unknown rather than guessing.
 fn interpret(entry: &serde_json::Map<String, Value>) -> McpState {
+    // sbx names the command to run next; for a server that needs authorization
+    // it is `sbx mcp auth <name>`, whatever the status is called.
+    if entry.get("next_step").and_then(Value::as_str).is_some_and(|step| step.contains("sbx mcp auth")) {
+        return McpState::NeedsAuth;
+    }
     let mut state = McpState::Unknown;
     for (key, value) in entry {
         let key = key.to_ascii_lowercase();
@@ -212,6 +217,37 @@ pub fn status(sbx: &Sbx, names: &[String]) -> Vec<McpStatus> {
         .collect()
 }
 
+/// Reauthorizes the servers a sandbox uses whose credentials sbx reports as
+/// missing or expired. `sbx mcp auth` refreshes a credential on its own when
+/// it can and only starts the OAuth sign-in when that needs the user, so it
+/// gets the terminal. A server that stays unauthorized does not stop the launch.
+pub fn ensure_authorized(sbx: &Sbx, names: &[String], interactive: bool) -> Result<()> {
+    let pending: Vec<String> =
+        status(sbx, names).into_iter().filter(|s| s.state == McpState::NeedsAuth).map(|s| s.name).collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    log::step(format!("Authorizing MCP servers: {}", pending.join(", ")));
+    if !interactive {
+        log::warn(format!(
+            "these need authorization, which may open a sign-in, and there is no terminal to do that on; run `sbx mcp auth {}` yourself",
+            pending.join("`, `sbx mcp auth ")
+        ));
+        return Ok(());
+    }
+    for name in &pending {
+        log::info(format!("{name}: refreshing the credential; sbx asks you to sign in if that needs your consent"));
+        if sbx.interact(args!["mcp", "auth", name])?.success() {
+            log::ok(format!("{name} is authorized"));
+        } else {
+            log::warn(format!(
+                "could not authorize '{name}'; continuing without it (retry with `sbx mcp auth {name}`)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,8 +274,10 @@ mod tests {
             {"name": "d", "type": "local"},
             {"name": "e", "authorized": false},
             {"name": "f", "needs_auth": true},
-            {"name": "g", "needs_auth": false, "usable": true}
+            {"name": "g", "needs_auth": false, "usable": true},
+            {"name": "h", "status": "expired", "next_step": "sbx mcp auth h"}
         ]"#;
+        assert_eq!(states(flat, &["h"]), vec![McpState::NeedsAuth]);
         assert_eq!(
             states(flat, &["a", "b", "c", "d", "e", "f", "g", "zz"]),
             vec![
@@ -256,5 +294,13 @@ mod tests {
         let nested = r#"{"gateways": [{"gateway": "local", "servers": [{"name": "a", "state": "error: boom"}]}]}"#;
         assert_eq!(states(nested, &["a"]), vec![McpState::Error]);
         assert_eq!(states("not json", &["a"]), vec![McpState::Unknown]);
+        // What sbx prints for a server waiting for `sbx mcp auth`.
+        let real = r#"{
+            "gateway": {"name": "LOCAL", "local": true, "operator": "managed by you", "decision": "local", "signed_in_as": "insertt"},
+            "servers": [
+                {"name": "notion", "transport": "remote http", "status": "needs-auth", "type": "remote", "next_step": "sbx mcp auth notion"}
+            ]
+        }"#;
+        assert_eq!(states(real, &["notion", "gitlab"]), vec![McpState::NeedsAuth, McpState::Error]);
     }
 }
