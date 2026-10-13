@@ -103,6 +103,9 @@ case "$cmd" in
   skills)
     [ -z "${FAKE_SBX_SKILLS_FAIL:-}" ] || { echo "fake sbx: unknown command skills" >&2; exit 1; }
     ;;
+  secret)
+    [ -z "${FAKE_SBX_SECRET_FAIL:-}" ] || { echo "fake sbx: secret source could not be resolved" >&2; exit 1; }
+    ;;
   template)
     ;;
   *)
