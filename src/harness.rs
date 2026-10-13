@@ -65,6 +65,10 @@ pub struct Profile {
     pub template: Option<String>,
     /// Without a template, create the sandbox from the agent's nightly image.
     pub nightly: bool,
+    /// sbx shares host skills with this agent through its own store (which it
+    /// mounts read-only over the skills directory), so sand runs
+    /// `sbx skills import` instead of copying them.
+    pub import_skills: bool,
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
@@ -97,6 +101,7 @@ impl Profile {
             api_check_url: None,
             template: None,
             nightly: false,
+            import_skills: false,
         }
     }
 
@@ -108,7 +113,6 @@ impl Profile {
                 sandbox_config_dir: Some(".claude".into()),
                 copy: strings(&[
                     "CLAUDE.md",
-                    "skills",
                     "commands",
                     "agents",
                     "plugins",
@@ -132,13 +136,13 @@ impl Profile {
                 statusline: StatuslineKind::Claude,
                 acp_command: strings(&["npx", "-y", "@agentclientprotocol/claude-agent-acp"]),
                 api_check_url: Some("https://api.anthropic.com/v1/models".into()),
+                import_skills: true,
                 ..base
             },
             "codex" => Self {
                 host_config_dir: Some(env::var("CODEX_HOME").unwrap_or_else(|_| "~/.codex".into())),
                 sandbox_config_dir: Some(".codex".into()),
-                copy: strings(&["AGENTS.md", "AGENTS.override.md", "prompts", "skills", "rules"]),
-                extra_copy: vec![CopyPair { from: "~/.agents/skills".into(), to: ".agents/skills".into() }],
+                copy: strings(&["AGENTS.md", "AGENTS.override.md", "prompts", "rules"]),
                 settings_files: strings(&["config.toml"]),
                 settings_format: SettingsFormat::Toml,
                 // Host MCP servers are replaced by the sandbox MCP gateway (--mcp).
@@ -161,6 +165,7 @@ impl Profile {
                 statusline: StatuslineKind::Codex,
                 acp_command: strings(&["npx", "-y", "@agentclientprotocol/codex-acp"]),
                 api_check_url: Some("https://api.openai.com/v1/models".into()),
+                import_skills: true,
                 ..base
             },
             "opencode" => Self {
@@ -214,7 +219,8 @@ impl Profile {
             bypass_args,
             statusline,
             acp_command,
-            nightly
+            nightly,
+            import_skills
         );
         set_some!(host_config_dir, sandbox_config_dir, api_check_url, template);
         if let Some(exclude) = &o.exclude {
@@ -265,6 +271,9 @@ mod tests {
             assert!(p.exclude.iter().any(|e| e == ".credentials.json") && p.exclude.iter().any(|e| e == "auth.json"));
             assert!(!p.acp_command.is_empty() && !p.history.is_empty(), "{name}");
             assert!(p.overlay.as_object().is_some_and(|o| !o.is_empty()), "{name}");
+            // Skills reach claude and codex through sbx's store, never through sand's copy.
+            assert_eq!(p.import_skills, name != "opencode", "{name}");
+            assert!(!p.import_skills || !p.copy.iter().any(|e| e == "skills"), "{name}");
         }
         let claude = Profile::resolve("claude", &config).unwrap();
         assert_eq!(claude.overlay["permissions"]["defaultMode"], "bypassPermissions");

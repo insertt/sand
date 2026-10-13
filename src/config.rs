@@ -122,6 +122,7 @@ pub struct HarnessOverride {
     pub api_check_url: Option<String>,
     pub template: Option<String>,
     pub nightly: Option<bool>,
+    pub import_skills: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]

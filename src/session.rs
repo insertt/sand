@@ -502,6 +502,18 @@ fn ensure_internal_mounts(
     Ok(())
 }
 
+/// Refreshes sbx's shared skills store from the host. sbx mounts the store
+/// where the agent reads skills each time the sandbox starts.
+fn import_skills(sbx: &Sbx) -> Result<()> {
+    log::step("Importing host skills into sbx's shared skills store");
+    if sbx.status(args!["skills", "import", "--force"])?.success() {
+        log::ok("skills imported");
+    } else {
+        log::warn("`sbx skills import` failed; host skills are not shared with the sandbox (is sbx up to date?)");
+    }
+    Ok(())
+}
+
 fn sync_config(sbx: &Sbx, dirs: &Dirs, config: &Config, profile: &Profile, name: &str) -> Result<()> {
     if profile.sandbox_config_dir.is_none() {
         log::info(format!("'{}' has no configuration profile; nothing is copied from the host", profile.name));
@@ -692,6 +704,9 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     // The host directories behind saved mounts must exist before sbx starts the sandbox.
     for mount in &state.internal_mounts {
         let _ = fs::create_dir_all(&mount.host);
+    }
+    if profile.import_skills {
+        import_skills(&sbx)?;
     }
     log::step("Starting the sandbox");
     let keep_alive = sbx.keep_alive(&state.name)?;

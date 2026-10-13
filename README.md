@@ -105,12 +105,20 @@ adds the flag by default; `sand` also enforces it in the copied settings and
 re-adds the flag when your agent arguments would replace sbx's defaults.
 
 **Host configuration.** On every launch, `sand` copies your user-level harness
-configuration into the sandbox: settings, global instructions, skills,
-commands, agents, plugins, hooks. Settings are merged in this order: what the
+configuration into the sandbox: settings, global instructions, commands,
+agents, plugins, hooks. Settings are merged in this order: what the
 sandbox was created with, then your host settings, then sand's overrides.
 Absolute paths that point into the copied directories (plugin install paths,
 for example) are rewritten to their sandbox location. Files you delete on the
 host are removed from the sandbox on the next launch.
+
+Skills are not copied: `sbx` shares them through its own
+[skills store](https://docs.docker.com/ai/sandboxes/workflows/agent-skills/),
+mounted read-only in the sandbox. For Claude Code and Codex, `sand` runs
+`sbx skills import --force` on every launch so the store matches the skills on
+your host (set `import_skills = false` under `[harness.<name>]` to manage the
+store yourself). A sandbox created before `sbx` had the store has to be
+recreated (`--recreate`) to see it.
 
 Not copied: credential files (`.credentials.json`, `auth.json`), `env` entries
 in settings whose names look like credentials (use `sbx secret set`), and MCP
@@ -147,7 +155,7 @@ status line, so `sand` prints them as a banner before the agent starts, and
 | Harness | Config copied from | History kept | Status line | ACP command |
 | --- | --- | --- | --- | --- |
 | `claude` | `~/.claude` | `projects`, `todos`, `file-history` | yes | `npx -y @agentclientprotocol/claude-agent-acp` |
-| `codex` | `~/.codex`, `~/.agents/skills` | `sessions` | built-in + banner | `npx -y @agentclientprotocol/codex-acp` |
+| `codex` | `~/.codex` | `sessions` | built-in + banner | `npx -y @agentclientprotocol/codex-acp` |
 | `opencode` | `~/.config/opencode` | `~/.local/share/opencode` | banner | `opencode acp` |
 | anything else | nothing | nothing | banner | set `acp_command` |
 
@@ -287,7 +295,7 @@ url = "https://mcp.linear.app/mcp"
 All harness keys: `agent`, `host_config_dir`, `sandbox_config_dir`, `copy`,
 `extra_copy`, `exclude`, `settings_files`, `settings_format`, `strip_keys`,
 `overlay`, `history`, `bypass_args`, `statusline`, `acp_command`,
-`api_check_url`, `template`, `nightly`.
+`api_check_url`, `template`, `nightly`, `import_skills`.
 
 State lives in the platform data directory (`~/.local/share/sand`,
 `~/Library/Application Support/sand`, `%LOCALAPPDATA%\sand`), or

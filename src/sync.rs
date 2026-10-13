@@ -1,4 +1,4 @@
-//! Copies the host's harness configuration (settings, skills, commands, plugins, …)
+//! Copies the host's harness configuration (settings, commands, plugins, …)
 //! into the sandbox. Files are staged in the sandbox's runtime directory, which is
 //! mounted read-only at `~/.sand`, and applied by a small script inside the sandbox.
 
@@ -504,15 +504,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let cfg = home.join(".claude");
-        fs::create_dir_all(cfg.join("skills/review")).unwrap();
+        fs::create_dir_all(cfg.join("commands/review")).unwrap();
         fs::create_dir_all(cfg.join("plugins")).unwrap();
         fs::create_dir_all(cfg.join("projects/x")).unwrap();
         fs::write(cfg.join("CLAUDE.md"), "be nice").unwrap();
-        fs::write(cfg.join("skills/review/SKILL.md"), "skill").unwrap();
-        fs::write(cfg.join("skills/review/auth.json"), "secret").unwrap();
+        fs::write(cfg.join("commands/review/go.md"), "command").unwrap();
+        fs::write(cfg.join("commands/review/auth.json"), "secret").unwrap();
         fs::write(cfg.join(".credentials.json"), "secret").unwrap();
         fs::write(cfg.join("projects/x/log.jsonl"), "history").unwrap();
         fs::write(cfg.join("settings.json"), "{}").unwrap();
+        // Skills are shared by sbx itself (`sbx skills import`), not copied.
+        fs::create_dir_all(cfg.join("skills/pdf")).unwrap();
+        fs::write(cfg.join("skills/pdf/SKILL.md"), "skill").unwrap();
         let installed = format!(r#"{{"path": "{}/plugins/p1"}}"#, cfg.display());
         fs::write(cfg.join("plugins/installed_plugins.json"), installed).unwrap();
 
@@ -536,16 +539,17 @@ mod tests {
             r#"{"path": "/home/agent/.claude/plugins/p1"}"#
         );
         assert!(!out.join(".credentials.json").exists());
-        assert!(!out.join("skills/review/auth.json").exists());
+        assert!(!out.join("commands/review/auth.json").exists());
         assert!(!out.join("projects").exists());
+        assert!(!out.join("skills").exists());
         let manifest = fs::read_to_string(sync.join("manifest")).unwrap();
         assert_eq!(
             manifest,
-            ".claude/CLAUDE.md\n.claude/plugins/installed_plugins.json\n.claude/settings.json\n.claude/skills/review/SKILL.md\n"
+            ".claude/CLAUDE.md\n.claude/commands/review/go.md\n.claude/plugins/installed_plugins.json\n.claude/settings.json\n"
         );
 
         // A second run copies nothing new and drops files that vanished on the host.
-        fs::remove_dir_all(cfg.join("skills")).unwrap();
+        fs::remove_dir_all(cfg.join("commands")).unwrap();
         let settings = SettingsFile {
             rel: ".claude/settings.json".into(),
             content: "{\"merged\":true}\n".into(),
@@ -553,7 +557,7 @@ mod tests {
         };
         let staged = stage(&p, &home, "/home/agent", &sync, Some(settings)).unwrap();
         assert_eq!((staged.total, staged.updated), (3, 0));
-        assert!(!out.join("skills").exists());
+        assert!(!out.join("commands").exists());
     }
 
     #[test]

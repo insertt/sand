@@ -100,6 +100,9 @@ case "$cmd" in
       allow) [ -z "${FAKE_SBX_ALLOW_FAIL:-}" ] || { echo "fake sbx: allow refused" >&2; exit 1; } ;;
     esac
     ;;
+  skills)
+    [ -z "${FAKE_SBX_SKILLS_FAIL:-}" ] || { echo "fake sbx: unknown command skills" >&2; exit 1; }
+    ;;
   template)
     ;;
   *)

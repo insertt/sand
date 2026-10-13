@@ -142,6 +142,9 @@ fn first_launch_creates_mounts_and_runs_with_every_step_logged() {
     let history = env.sandbox_dir("codex-proj").join("history/.codex_sessions");
     assert!(has(&log, &format!("mount codex-proj {}:/home/agent/.codex/sessions:rw", env.p(&history))), "{log:#?}");
     assert!(history.is_dir());
+    // Host skills are handed to sbx before the sandbox starts.
+    let at = |needle: &str| log.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}: {log:#?}"));
+    assert!(at("skills import --force") < at("exec codex-proj"));
     // Configuration is applied inside the sandbox, then the agent starts.
     assert!(has(&log, "exec codex-proj sh /home/agent/.sand/apply.sh"));
     assert_eq!(log.last().unwrap(), "run --name codex-proj");
@@ -470,7 +473,8 @@ fn host_configuration_is_copied_without_credentials() {
     let staged = env.sandbox_dir("codex-proj").join("runtime/sync/home");
     assert_eq!(fs::read_to_string(staged.join(".codex/AGENTS.md")).unwrap(), "global instructions");
     assert_eq!(fs::read_to_string(staged.join(".codex/prompts/review.md")).unwrap(), "review prompt");
-    assert_eq!(fs::read_to_string(staged.join(".agents/skills/pdf/SKILL.md")).unwrap(), "pdf skill");
+    // Skills go through sbx's shared store instead of sand's copy.
+    assert!(!staged.join(".agents").exists());
     assert!(!staged.join(".codex/auth.json").exists(), "credentials must stay on the host");
 
     let merged: toml::Table = toml::from_str(&fs::read_to_string(staged.join(".codex/config.toml")).unwrap()).unwrap();
@@ -483,11 +487,28 @@ fn host_configuration_is_copied_without_credentials() {
     assert!(servers.contains_key("gateway") && !servers.contains_key("local"));
 
     let log = env.take_log();
+    assert!(has(&log, "skills import --force"));
     assert!(has(&log, "exec codex-proj cat /home/agent/.codex/config.toml"));
     assert!(has(&log, "exec codex-proj sh /home/agent/.sand/apply.sh"));
     assert!(stderr(&out).contains("credentials are never copied"));
     let apply = fs::read_to_string(env.sandbox_dir("codex-proj").join("runtime/apply.sh")).unwrap();
     assert!(apply.contains("cp -RL \"$SRC/home/.\" \"$DEST/\""));
+}
+
+#[test]
+fn skills_are_imported_by_sbx_unless_it_cannot_or_the_harness_opts_out() {
+    let env = Env::new();
+    // An sbx without the skills store must not stop the launch.
+    let out = env.command(&["claude"]).env("FAKE_SBX_SKILLS_FAIL", "1").output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("`sbx skills import` failed"), "{}", stderr(&out));
+    assert_eq!(env.take_log().last().unwrap(), "run --name claude-proj");
+
+    env.ok(&["opencode"]);
+    assert!(starting(&env.take_log(), "skills").is_empty(), "sbx has no skills mount for opencode");
+    env.config("[harness.claude]\nimport_skills = false\n");
+    env.ok(&["claude"]);
+    assert!(starting(&env.take_log(), "skills").is_empty());
 }
 
 #[test]
@@ -814,9 +835,9 @@ fn apply_script_installs_the_staged_config_and_prunes_stale_files() {
     fs::create_dir_all(&sandbox_home).unwrap();
     env.config(&format!("sandbox_home = \"{}\"\n", env.p(&sandbox_home)));
     let claude = env.home.join(".claude");
-    fs::create_dir_all(claude.join("skills/review")).unwrap();
+    fs::create_dir_all(claude.join("commands/review")).unwrap();
     fs::write(claude.join("CLAUDE.md"), "v1").unwrap();
-    fs::write(claude.join("skills/review/SKILL.md"), "review").unwrap();
+    fs::write(claude.join("commands/review/go.md"), "review").unwrap();
 
     let runtime = env.sandbox_dir("claude-proj").join("runtime");
     let apply = |env: &Env| {
@@ -833,19 +854,19 @@ fn apply_script_installs_the_staged_config_and_prunes_stale_files() {
     apply(&env);
     let installed = sandbox_home.join(".claude");
     assert_eq!(fs::read_to_string(installed.join("CLAUDE.md")).unwrap(), "v1");
-    assert_eq!(fs::read_to_string(installed.join("skills/review/SKILL.md")).unwrap(), "review");
+    assert_eq!(fs::read_to_string(installed.join("commands/review/go.md")).unwrap(), "review");
     let settings: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(installed.join("settings.json")).unwrap()).unwrap();
     assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
     assert_eq!(settings["statusLine"]["command"], format!("sh {}/.sand/statusline.sh", env.p(&sandbox_home)));
     // Something the agent created itself inside the sandbox must survive later syncs.
-    fs::write(installed.join("skills/own.md"), "made in the sandbox").unwrap();
+    fs::write(installed.join("commands/own.md"), "made in the sandbox").unwrap();
 
-    // The host changes: one file updated, one skill deleted.
+    // The host changes: one file updated, one command deleted.
     fs::write(claude.join("CLAUDE.md"), "v2 with more text").unwrap();
-    fs::remove_dir_all(claude.join("skills/review")).unwrap();
+    fs::remove_dir_all(claude.join("commands/review")).unwrap();
     apply(&env);
     assert_eq!(fs::read_to_string(installed.join("CLAUDE.md")).unwrap(), "v2 with more text");
-    assert!(!installed.join("skills/review/SKILL.md").exists(), "deleted on the host, so removed in the sandbox");
-    assert_eq!(fs::read_to_string(installed.join("skills/own.md")).unwrap(), "made in the sandbox");
+    assert!(!installed.join("commands/review/go.md").exists(), "deleted on the host, so removed in the sandbox");
+    assert_eq!(fs::read_to_string(installed.join("commands/own.md")).unwrap(), "made in the sandbox");
 }
