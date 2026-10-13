@@ -84,8 +84,22 @@ impl Sbx {
         Ok(())
     }
 
+    /// Like [`Sbx::run`], for a command that can take minutes: a spinner with
+    /// `waiting` and the elapsed time shows that sand is not stuck.
+    pub fn run_slow(&self, args: Vec<OsString>, waiting: &str) -> Result<()> {
+        let status = self.status_while(args.clone(), Some(waiting))?;
+        if !status.success() {
+            bail!("`sbx {}` failed ({status})", display(&args));
+        }
+        Ok(())
+    }
+
     /// Like [`Sbx::run`] but hands back the exit status instead of failing.
     pub fn status(&self, args: Vec<OsString>) -> Result<ExitStatus> {
+        self.status_while(args, None)
+    }
+
+    fn status_while(&self, args: Vec<OsString>, waiting: Option<&str>) -> Result<ExitStatus> {
         log::command(format!("sbx {}", display(&args)));
         let mut cmd = self.command(&args);
         if log::verbose() {
@@ -94,7 +108,11 @@ impl Sbx {
             return cmd.status().map_err(|e| self.spawn_error(e));
         }
         // No terminal on stdin: a prompt nobody can see would hang, this way it fails and is shown.
-        let output = cmd.stdin(Stdio::null()).output().map_err(|e| self.spawn_error(e))?;
+        let spinner = waiting.map(log::spinner);
+        let output = cmd.stdin(Stdio::null()).output();
+        // Gone before anything else is printed, so that it cannot garble the output of a failure.
+        drop(spinner);
+        let output = output.map_err(|e| self.spawn_error(e))?;
         if !output.status.success() {
             let mut err = io::stderr().lock();
             let _ = err.write_all(&output.stdout).and_then(|_| err.write_all(&output.stderr));

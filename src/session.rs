@@ -441,7 +441,7 @@ fn create_sandbox(sbx: &Sbx, dirs: &Dirs, config: &Config, req: &Request) -> Res
         cmd.extend(req.mounts.extras.iter().map(Mount::create_arg));
         mounts.extras = req.mounts.extras.clone();
     }
-    sbx.run(cmd)?;
+    sbx.run_slow(cmd, "waiting for sbx (downloading a new image can take a few minutes)")?;
     let state = SandboxState {
         name: req.name.clone(),
         harness: req.profile.name.clone(),
