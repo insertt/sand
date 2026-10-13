@@ -32,6 +32,10 @@ pub struct Cli {
 
     #[command(flatten)]
     pub run: RunArgs,
+
+    /// Echo every sbx command sand runs and show its output
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,6 +195,14 @@ mod tests {
     #[test]
     fn definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn verbose_is_accepted_everywhere() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args.iter().copied()).unwrap().verbose;
+        assert!(parse(&["sand", "-v", "codex"]) && parse(&["sand", "codex", "--verbose"]));
+        assert!(parse(&["sand", "status", "-v"]) && parse(&["sand", "template", "ls", "--verbose"]));
+        assert!(!parse(&["sand", "codex"]) && !parse(&["sand", "codex", "--", "-v"]));
     }
 
     #[test]

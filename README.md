@@ -69,6 +69,7 @@ the same.
 | `--install-editor zed\|jetbrains` | Register `sand [HARNESS] --acp` in the editor, then exit. |
 | `--open-config` | Open the [config file](#configuration) in your editor, then exit. |
 | `--on-conflict replace\|merge\|abort` | Answer the "sandbox exists with a different setup" question up front. |
+| `-v`, `--verbose` | Echo every `sbx` command sand runs and show its output (otherwise shown only when a command fails). Works with the subcommands too. |
 
 Other commands: `sand status [HARNESS] [DIR]` prints a sandbox's mounts, agent
 API connectivity and MCP server status. `sand allow [HARNESS] [DIR]` opens the

@@ -1,4 +1,5 @@
-//! Thin wrapper around the `sbx` CLI. Every invocation is logged.
+//! Thin wrapper around the `sbx` CLI. With `--verbose` every invocation is
+//! echoed and its output shown; otherwise sbx is only heard when it fails.
 
 use std::env;
 use std::ffi::OsString;
@@ -73,7 +74,8 @@ impl Sbx {
         }
     }
 
-    /// Runs a setup command, echoing it and streaming its output to stderr.
+    /// Runs a setup command. Its output goes to stderr: as it comes with
+    /// `--verbose`, otherwise only when the command fails.
     pub fn run(&self, args: Vec<OsString>) -> Result<()> {
         let status = self.status(args.clone())?;
         if !status.success() {
@@ -86,9 +88,18 @@ impl Sbx {
     pub fn status(&self, args: Vec<OsString>) -> Result<ExitStatus> {
         log::command(format!("sbx {}", display(&args)));
         let mut cmd = self.command(&args);
-        cmd.stdin(if self.interactive { Stdio::inherit() } else { Stdio::null() });
-        cmd.stdout(io::stderr()).stderr(Stdio::inherit());
-        cmd.status().map_err(|e| self.spawn_error(e))
+        if log::verbose() {
+            cmd.stdin(if self.interactive { Stdio::inherit() } else { Stdio::null() });
+            cmd.stdout(io::stderr()).stderr(Stdio::inherit());
+            return cmd.status().map_err(|e| self.spawn_error(e));
+        }
+        // No terminal on stdin: a prompt nobody can see would hang, this way it fails and is shown.
+        let output = cmd.stdin(Stdio::null()).output().map_err(|e| self.spawn_error(e))?;
+        if !output.status.success() {
+            let mut err = io::stderr().lock();
+            let _ = err.write_all(&output.stdout).and_then(|_| err.write_all(&output.stderr));
+        }
+        Ok(output.status)
     }
 
     /// Runs a command silently and returns its stdout when it succeeds.
@@ -205,7 +216,7 @@ impl Drop for KeepAlive {
     }
 }
 
-/// Runs an arbitrary host command (docker, …) with the same logging conventions.
+/// Runs an arbitrary host command (docker, …), streaming its output to stderr.
 pub fn run_host(program: &str, args: Vec<OsString>) -> Result<()> {
     log::command(format!("{program} {}", display(&args)));
     let status = Command::new(program)

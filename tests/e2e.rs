@@ -161,7 +161,7 @@ fn first_launch_creates_mounts_and_runs_with_every_step_logged() {
     ] {
         assert!(err.contains(step), "missing step '{step}' in:\n{err}");
     }
-    assert!(err.contains("$ sbx create --name codex-proj"), "commands are echoed:\n{err}");
+    assert!(!err.contains("$ sbx") && !err.contains("created codex-proj"), "sbx is quiet by default:\n{err}");
     assert!(err.contains("api.openai.com reachable"), "{err}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("AGENT-STARTED"));
 }
@@ -828,7 +828,7 @@ fn allow_lists_blocked_hosts_and_adds_sandbox_scoped_rules() {
     assert!(err.contains("not offered: gw.internal") && err.contains("pass --host"), "{err}");
     assert!(!has(&env.take_log(), "policy allow"));
 
-    let err = stderr(&env.ok(&["allow", "codex", "--host", "zed.dev:443,*.example.com"]));
+    let err = stderr(&env.ok(&["allow", "codex", "--host", "zed.dev:443,*.example.com", "-v"]));
     assert!(err.contains("$ sbx policy allow network --sandbox codex-proj zed.dev:443,*.example.com"), "{err}");
     assert_eq!(
         starting(&env.take_log(), "policy"),
@@ -840,10 +840,22 @@ fn allow_lists_blocked_hosts_and_adds_sandbox_scoped_rules() {
 
     assert!(env.fails(&["allow", "codex", "--host", "--sandbox"]).contains("error"));
     let out = env.command(&["allow", "codex", "--host", "zed.dev"]).env("FAKE_SBX_ALLOW_FAIL", "1").output().unwrap();
+    let err = stderr(&out);
     assert!(
-        !out.status.success()
-            && stderr(&out).contains("`sbx policy allow network --sandbox codex-proj zed.dev` failed")
+        !out.status.success() && err.contains("`sbx policy allow network --sandbox codex-proj zed.dev` failed"),
+        "{err}"
     );
+    assert!(err.contains("fake sbx: allow refused"), "a failing command's output is shown:\n{err}");
+}
+
+#[test]
+fn verbose_echoes_sbx_commands_and_their_output() {
+    let env = Env::new();
+    for flag in ["--verbose", "-v"] {
+        let err = stderr(&env.ok(&["codex", flag, "--recreate"]));
+        assert!(err.contains("$ sbx create --name codex-proj"), "commands are echoed:\n{err}");
+        assert!(err.contains("created codex-proj"), "sbx output is shown:\n{err}");
+    }
 }
 
 #[test]

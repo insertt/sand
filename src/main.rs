@@ -57,6 +57,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    log::set_verbose(cli.verbose);
     // While the agent owns the terminal, Ctrl-C is the agent's to handle and
     // sand has to outlive it to release the sandbox cleanly.
     let _ = ctrlc::set_handler(|| {
