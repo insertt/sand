@@ -123,8 +123,9 @@ store yourself). A sandbox created before `sbx` had the store has to be
 recreated (`--recreate`) to see it.
 
 Not copied: credential files (`.credentials.json`, `auth.json`), `env` entries
-in settings whose names look like credentials (use `sbx secret set`), and MCP
-servers defined in the host configuration (use `--mcp`).
+in settings whose names look like credentials (use `sbx secret set`, or see
+[Authentication](#authentication)), and MCP servers defined in the host
+configuration (use `--mcp`).
 
 **History.** Conversation history directories are backed by host directories
 under sand's data directory and bind-mounted into the sandbox, so they survive
@@ -160,6 +161,79 @@ status line, so `sand` prints them as a banner before the agent starts, and
 | `codex` | `~/.codex` | `sessions` | built-in + banner | `npx -y @agentclientprotocol/codex-acp` |
 | `opencode` | `~/.config/opencode` | `~/.local/share/opencode` | banner | `opencode acp` |
 | anything else | nothing | nothing | banner | set `acp_command` |
+
+## Authentication
+
+By default the agent uses whatever credentials `sbx` has for it (`sbx secret
+set`, or the sign-in `sbx` offers). `auth` under `[harness.<name>]` selects
+another way.
+
+### Vertex AI
+
+```toml
+# config.toml
+[vertex]
+project = "my-gcp-project"
+region = "global"                    # default
+
+[harness.claude]
+auth = "vertex"
+```
+
+Claude Code then runs against Vertex AI with a Google Cloud access token it
+never sees. On every launch `sand`:
+
+- registers the token as an `sbx` custom secret of that sandbox: `sbx secret
+  set-custom --sandbox <name> --host <vertex hosts> --env ANTHROPIC_AUTH_TOKEN
+  --command 'gcloud auth print-access-token' --refresh 45m`. The `sbx` daemon
+  runs the command on the host and again once the cached token is 45 minutes
+  old (Google's tokens last an hour), so sessions of any length keep working,
+  including ones started with `--no-attach` or plain `sbx run`;
+- sets `CLAUDE_CODE_USE_VERTEX=1`, `CLAUDE_CODE_SKIP_VERTEX_AUTH=1`,
+  `ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION` and `ANTHROPIC_AUTH_TOKEN` in
+  the `env` of the sandbox's `settings.json`. `ANTHROPIC_AUTH_TOKEN` holds a
+  placeholder (`sand-vertex-<sandbox>`); the sandbox proxy replaces it with the
+  token on requests to the Vertex AI hosts;
+- probes the Vertex AI host instead of `api.anthropic.com` for the API status.
+
+`gcloud` has to be signed in on the host (`gcloud auth login`) and on the
+`PATH` of the `sbx` daemon, and the Vertex AI host has to be allowed by the
+sandbox's network policy (`sand allow claude --host aiplatform.googleapis.com:443`).
+Other `env` entries, such as model overrides, go in
+`overlay = { env = { ... } }`.
+
+All `[vertex]` keys:
+
+| Key | Default | |
+| --- | --- | --- |
+| `project` | required | Google Cloud project ID |
+| `region` | `global` | Vertex AI region |
+| `hosts` | from the region | hosts that receive the token: `<region>-aiplatform.googleapis.com` and `aiplatform.googleapis.com` |
+| `token_command` | `gcloud auth print-access-token` | host command that prints a token; `sbx` runs it through the host shell from a temporary directory, so name helpers by absolute path |
+| `refresh` | `45m` | how long `sbx` keeps a token: a duration, or `on-demand` to run the command for every request |
+
+Only Claude Code has built-in Vertex AI wiring. For another harness, describe
+it with `vertex_overlay` (settings merged in when `auth = "vertex"`; in
+strings, `{project}`, `{region}` and `{host}` come from `[vertex]` and
+`{token}` is the placeholder) and `vertex_token_env` (an environment variable
+the agent gets the placeholder in). This works for any agent that sends a
+bearer token it reads from its settings or environment, for example Gemini
+models through Vertex AI's OpenAI-compatible endpoint in OpenCode:
+
+```toml
+[harness.opencode]
+auth = "vertex"
+
+[harness.opencode.vertex_overlay.provider.vertex]
+npm = "@ai-sdk/openai-compatible"
+name = "Vertex AI"
+options = { baseURL = "https://{host}/v1/projects/{project}/locations/{region}/endpoints/openapi", apiKey = "{token}" }
+models = { "google/gemini-2.5-pro" = {} }
+```
+
+It does not work for agents that sign in to Google themselves (Gemini CLI,
+OpenCode's `google-vertex` providers): they exchange a credential file for
+tokens, and that would have to be in the sandbox.
 
 ## Blocked network access
 
@@ -297,7 +371,8 @@ url = "https://mcp.linear.app/mcp"
 All harness keys: `agent`, `host_config_dir`, `sandbox_config_dir`, `copy`,
 `extra_copy`, `exclude`, `settings_files`, `settings_format`, `strip_keys`,
 `overlay`, `history`, `bypass_args`, `statusline`, `acp_command`,
-`api_check_url`, `template`, `nightly`, `import_skills`.
+`api_check_url`, `template`, `nightly`, `import_skills`, `auth`,
+`vertex_overlay`, `vertex_token_env`.
 
 State lives in the platform data directory (`~/.local/share/sand`,
 `~/Library/Application Support/sand`, `%LOCALAPPDATA%\sand`), or

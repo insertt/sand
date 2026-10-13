@@ -29,6 +29,7 @@ use crate::sbx::Sbx;
 use crate::state::{self, InternalMount, Kind, SandboxState};
 use crate::sync;
 use crate::template;
+use crate::vertex;
 
 /// Set while the agent owns the terminal: Ctrl-C then belongs to the agent and
 /// sand must survive it to clean up afterwards.
@@ -96,7 +97,7 @@ fn build_request(
 ) -> Result<Request> {
     let cwd = env::current_dir().context("determining the current directory")?;
     let harness = harness.unwrap_or_else(|| config.default_harness().to_string());
-    let profile = Profile::resolve(&harness, config)?;
+    let mut profile = Profile::resolve(&harness, config)?;
     let explicit_mounts = !specs.is_empty();
     let parse =
         |specs: &[String]| -> Result<Vec<Mount>> { specs.iter().map(|s| Mount::parse(s, &cwd, &dirs.home)).collect() };
@@ -125,6 +126,7 @@ fn build_request(
         }
         None => default_name,
     };
+    profile.wire_vertex(&name);
     Ok(Request {
         template: args.template.clone().or_else(|| profile.template.clone()),
         mcp: mcp::normalize(&args.mcp)?,
@@ -360,6 +362,36 @@ fn remove_sandbox(sbx: &Sbx, dirs: &Dirs, name: &str, keep_history: bool) -> Res
         log::ok("removed, including its conversation history");
     }
     Ok(())
+}
+
+/// Registers the Vertex AI access token as a custom secret of the sandbox. sbx
+/// runs the token command on the host and keeps the token fresh; the sandbox
+/// only ever holds the placeholder.
+fn register_vertex_secret(sbx: &Sbx, profile: &Profile, name: &str) -> Result<()> {
+    let Some(vertex) = &profile.vertex else { return Ok(()) };
+    log::step("Registering the Vertex AI access token with sbx");
+    log::info(format!("project {}, region {}", vertex.project, vertex.region));
+    log::info(format!(
+        "token: `{}` on the host, refresh {}, sent to {}",
+        vertex.token_command,
+        vertex.refresh,
+        vertex.hosts.join(", ")
+    ));
+    sbx.run(vertex.secret_args(name, profile.vertex_token_env.as_deref())).with_context(|| {
+        format!(
+            "registering the token secret (does `{}` print a token on the host? \
+             `sbx secret set-custom --show-error` shows why sbx rejected it)",
+            vertex.token_command
+        )
+    })?;
+    log::ok("the sandbox proxy adds the token to Vertex AI requests; it never enters the sandbox");
+    Ok(())
+}
+
+/// `NAME=placeholder` for the agent's environment when the token is read from one.
+fn vertex_env(profile: &Profile, name: &str) -> Option<String> {
+    let env = profile.vertex.as_ref().and(profile.vertex_token_env.as_deref())?;
+    Some(format!("{env}={}", vertex::placeholder(name)))
 }
 
 fn create_sandbox(sbx: &Sbx, dirs: &Dirs, config: &Config, req: &Request) -> Result<SandboxState> {
@@ -671,6 +703,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
             if exists {
                 remove_sandbox(&sbx, dirs, &req.name, true)?;
             }
+            // Before the sandbox exists, so that sbx sets the token variable in it.
+            register_vertex_secret(&sbx, profile, &req.name)?;
             let state = create_sandbox(&sbx, dirs, config, &req)?;
             // Extra mounts of a mountless sandbox still have to be attached.
             let pending = mounts::plan(&state.mounts, &req.mounts, Strategy::Merge);
@@ -695,6 +729,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
                 created_at: state::now(),
             });
             log::step(format!("Using existing sandbox '{}'", req.name));
+            register_vertex_secret(&sbx, profile, &req.name)?;
             (state, plan, load_mcp)
         }
     };
@@ -765,11 +800,16 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         if let Some(primary) = &state.mounts.primary {
             cmd.extend(args!["--workdir", container_path(&primary.path.to_string_lossy())]);
         }
-        cmd.extend(args![&state.name, "bash", "-lc", format!("exec {command}")]);
+        let env = vertex_env(profile, &state.name).map(|pair| format!("{} ", shell_quote(&pair))).unwrap_or_default();
+        cmd.extend(args![&state.name, "bash", "-lc", format!("{env}exec {command}")]);
         cmd
     } else {
         log::step(format!("Starting {} (bypass permissions)", profile.name));
         let mut cmd = args!["run", "--name", &state.name];
+        // sbx only sets the variable itself in sandboxes created after the secret.
+        if let Some(pair) = vertex_env(profile, &state.name) {
+            cmd.extend(args!["-e", pair]);
+        }
         let extra = agent_args(profile, &args.agent_args);
         if !extra.is_empty() {
             if profile.bypass_args.is_empty() && !args.agent_args[0].starts_with('-') {

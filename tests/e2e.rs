@@ -558,6 +558,62 @@ fn claude_gets_a_status_line_and_bypass_flags() {
 }
 
 #[test]
+fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex() {
+    let env = Env::new();
+    fs::create_dir_all(env.home.join(".claude")).unwrap();
+    fs::write(env.home.join(".claude/settings.json"), r#"{"env": {"ANTHROPIC_AUTH_TOKEN": "real", "DEBUG": "1"}}"#)
+        .unwrap();
+    env.config("[vertex]\nproject = \"acme\"\nregion = \"us-east5\"\n\n[harness.claude]\nauth = \"vertex\"\n");
+
+    let out = env.ok(&["claude"]);
+    let log = env.take_log();
+    let secret = "secret set-custom --sandbox claude-proj --host us-east5-aiplatform.googleapis.com \
+                  --host aiplatform.googleapis.com --env ANTHROPIC_AUTH_TOKEN --placeholder sand-vertex-claude-proj \
+                  --command gcloud auth print-access-token --refresh 45m";
+    assert_eq!(starting(&log, "secret"), vec![secret]);
+    let at = |needle: &str| log.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}: {log:#?}"));
+    assert!(at("secret set-custom") < at("create --name claude-proj"), "{log:#?}");
+    assert_eq!(log.last().unwrap(), "run --name claude-proj -e ANTHROPIC_AUTH_TOKEN=sand-vertex-claude-proj");
+    assert!(has(&log, "curl -sS -m 6 -w '\\n%{http_code}' 'https://us-east5-aiplatform.googleapis.com/'"), "{log:#?}");
+
+    let staged = env.sandbox_dir("claude-proj").join("runtime/sync/home/.claude/settings.json");
+    let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(&staged).unwrap()).unwrap();
+    assert_eq!(
+        settings["env"],
+        serde_json::json!({
+            "DEBUG": "1",
+            "CLAUDE_CODE_USE_VERTEX": "1",
+            "CLAUDE_CODE_SKIP_VERTEX_AUTH": "1",
+            "ANTHROPIC_VERTEX_PROJECT_ID": "acme",
+            "CLOUD_ML_REGION": "us-east5",
+            "ANTHROPIC_AUTH_TOKEN": "sand-vertex-claude-proj",
+        })
+    );
+    let err = stderr(&out);
+    assert!(err.contains("Registering the Vertex AI access token") && err.contains("refresh 45m"), "{err}");
+
+    // An existing sandbox gets the secret again (the command or hosts may have changed), ACP sessions too.
+    env.ok(&["claude", "--acp"]);
+    let log = env.take_log();
+    assert_eq!(starting(&log, "secret"), vec![secret]);
+    assert!(has(&log, "bash -lc ANTHROPIC_AUTH_TOKEN=sand-vertex-claude-proj exec npx"), "{log:#?}");
+
+    // Without a working token source there is no point in starting the agent.
+    let out = env.command(&["claude"]).env("FAKE_SBX_SECRET_FAIL", "1").output().unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("gcloud auth print-access-token") && !has(&env.take_log(), "run --name"));
+
+    // Back to sbx's own credentials: no secret, and the Vertex settings are gone.
+    env.config("");
+    env.ok(&["claude"]);
+    let log = env.take_log();
+    assert!(starting(&log, "secret").is_empty());
+    assert_eq!(log.last().unwrap(), "run --name claude-proj");
+    let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(&staged).unwrap()).unwrap();
+    assert_eq!(settings["env"], serde_json::json!({"DEBUG": "1"}));
+}
+
+#[test]
 fn templates_from_config_and_snapshots() {
     let env = Env::new();
     env.config("[templates.corp]\nimage = \"ghcr.io/acme/agent:1\"\n\n[harness.claude]\ntemplate = \"corp\"\n");

@@ -22,6 +22,12 @@ const STARTER: &str = r#"# sand configuration. Everything is optional; the READM
 # template = "rust"
 # overlay = { model = "opus" }         # merged over the built-in settings overlay
 
+# auth = "vertex"                     # Claude on Vertex AI, with the [vertex] settings
+
+# [vertex]
+# project = "my-gcp-project"
+# region = "global"
+
 # [templates.rust]
 # dockerfile = "~/sand/rust.Dockerfile"
 
@@ -99,6 +105,8 @@ pub struct Config {
     /// one that is not registered yet.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpDef>,
+    #[serde(default)]
+    pub vertex: VertexDef,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -123,6 +131,42 @@ pub struct HarnessOverride {
     pub template: Option<String>,
     pub nightly: Option<bool>,
     pub import_skills: Option<bool>,
+    /// How the agent authenticates to its model API (default: sbx).
+    pub auth: Option<Auth>,
+    /// Settings merged over the overlay when `auth = "vertex"`. In strings,
+    /// `{project}`, `{region}` and `{host}` come from `[vertex]` and `{token}`
+    /// is the placeholder the sandbox proxy replaces with the access token.
+    pub vertex_overlay: Option<toml::Table>,
+    /// Environment variable that holds the token placeholder for the agent.
+    pub vertex_token_env: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Auth {
+    /// Whatever sbx has for the agent (`sbx secret set`, OAuth).
+    #[default]
+    Sbx,
+    /// Vertex AI with a Google Cloud access token (see `[vertex]`).
+    Vertex,
+}
+
+/// Vertex AI settings shared by every harness with `auth = "vertex"`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VertexDef {
+    /// Google Cloud project ID (required).
+    pub project: Option<String>,
+    /// Vertex AI region (default: global).
+    pub region: Option<String>,
+    /// Hosts that receive the token (default: the region's Vertex AI endpoints).
+    pub hosts: Option<Vec<String>>,
+    /// Host command that prints an access token (default: gcloud auth
+    /// print-access-token). sbx runs it through the host shell.
+    pub token_command: Option<String>,
+    /// How long sbx keeps a token before running the command again:
+    /// a duration or "on-demand" (default: 45m).
+    pub refresh: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -232,6 +276,10 @@ mod tests {
             [mcp.pw]
             command = "npx"
             args = ["@playwright/mcp@latest"]
+
+            [vertex]
+            project = "acme"
+            refresh = "30m"
             "#,
         )
         .unwrap();
@@ -242,11 +290,15 @@ mod tests {
         assert_eq!(config.harness["aider"].statusline, Some(StatuslineKind::None));
         assert_eq!(config.templates["rust"].build_args["RUST"], "1.90");
         assert_eq!(config.mcp["pw"].args, vec!["@playwright/mcp@latest"]);
+        assert_eq!((config.vertex.project.as_deref(), config.vertex.refresh.as_deref()), (Some("acme"), Some("30m")));
+        assert_eq!(config.harness["claude"].auth, None);
     }
 
     #[test]
     fn unknown_keys_are_rejected() {
         assert!(toml::from_str::<Config>("defualt_harness = \"x\"").is_err());
         assert!(toml::from_str::<Config>("[harness.claude]\nhistroy = []").is_err());
+        assert!(toml::from_str::<Config>("[harness.claude]\nauth = \"bedrock\"").is_err());
+        assert!(toml::from_str::<Config>("[vertex]\nprojct = \"x\"").is_err());
     }
 }

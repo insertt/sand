@@ -6,9 +6,10 @@ use std::env;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use crate::config::{Config, CopyPair, HarnessOverride, SettingsFormat, StatuslineKind};
+use crate::config::{Auth, Config, CopyPair, HarnessOverride, SettingsFormat, StatuslineKind};
 use crate::paths::RUNTIME_DIR_NAME;
 use crate::sync::deep_merge;
+use crate::vertex::{self, Vertex};
 
 /// Agents sbx ships; used to tell a harness name from a path on the command line.
 pub const SBX_AGENTS: &[&str] =
@@ -69,6 +70,13 @@ pub struct Profile {
     /// mounts read-only over the skills directory), so sand runs
     /// `sbx skills import` instead of copying them.
     pub import_skills: bool,
+    /// Settings that point the agent at Vertex AI, merged over the overlay when
+    /// `auth = "vertex"` (placeholders: `{project}`, `{region}`, `{host}`, `{token}`).
+    pub vertex_overlay: Option<Value>,
+    /// Environment variable that holds the token placeholder for the agent.
+    pub vertex_token_env: Option<String>,
+    /// Set when the harness authenticates through Vertex AI.
+    pub vertex: Option<Vertex>,
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
@@ -102,6 +110,9 @@ impl Profile {
             template: None,
             nightly: false,
             import_skills: false,
+            vertex_overlay: None,
+            vertex_token_env: None,
+            vertex: None,
         }
     }
 
@@ -137,6 +148,18 @@ impl Profile {
                 acp_command: strings(&["npx", "-y", "@agentclientprotocol/claude-agent-acp"]),
                 api_check_url: Some("https://api.anthropic.com/v1/models".into()),
                 import_skills: true,
+                // Claude Code leaves Google authentication alone and sends the
+                // token placeholder as its bearer token.
+                vertex_overlay: Some(json!({
+                    "env": {
+                        "CLAUDE_CODE_USE_VERTEX": "1",
+                        "CLAUDE_CODE_SKIP_VERTEX_AUTH": "1",
+                        "ANTHROPIC_VERTEX_PROJECT_ID": "{project}",
+                        "CLOUD_ML_REGION": "{region}",
+                        "ANTHROPIC_AUTH_TOKEN": "{token}",
+                    },
+                })),
+                vertex_token_env: Some("ANTHROPIC_AUTH_TOKEN".into()),
                 ..base
             },
             "codex" => Self {
@@ -222,7 +245,10 @@ impl Profile {
             nightly,
             import_skills
         );
-        set_some!(host_config_dir, sandbox_config_dir, api_check_url, template);
+        set_some!(host_config_dir, sandbox_config_dir, api_check_url, template, vertex_token_env);
+        if let Some(overlay) = &o.vertex_overlay {
+            self.vertex_overlay = Some(serde_json::to_value(overlay)?);
+        }
         if let Some(exclude) = &o.exclude {
             self.exclude = strings(ALWAYS_EXCLUDED);
             self.exclude.extend(exclude.iter().cloned());
@@ -241,10 +267,32 @@ impl Profile {
     pub fn resolve(name: &str, config: &Config) -> Result<Self> {
         let mut profile = Self::builtin(name, config.sandbox_home()).unwrap_or_else(|| Self::generic(name));
         profile.nightly = config.nightly.unwrap_or(false);
-        if let Some(overrides) = config.harness.get(name) {
+        let overrides = config.harness.get(name);
+        if let Some(overrides) = overrides {
             profile.apply(overrides)?;
         }
+        if overrides.and_then(|o| o.auth) == Some(Auth::Vertex) {
+            if profile.vertex_overlay.is_none() && profile.vertex_token_env.is_none() {
+                bail!(
+                    "sand does not know how to point '{name}' at Vertex AI; set harness.{name}.vertex_overlay \
+                     or harness.{name}.vertex_token_env in config.toml"
+                );
+            }
+            let vertex = Vertex::from_config(config)?;
+            if overrides.is_none_or(|o| o.api_check_url.is_none()) {
+                profile.api_check_url = Some(format!("https://{}/", vertex.host()));
+            }
+            profile.vertex = Some(vertex);
+        }
         Ok(profile)
+    }
+
+    /// Merges the Vertex AI settings into the overlay, with the token
+    /// placeholder of `sandbox` in place of `{token}`.
+    pub fn wire_vertex(&mut self, sandbox: &str) {
+        if let (Some(vertex), Some(overlay)) = (&self.vertex, &self.vertex_overlay) {
+            deep_merge(&mut self.overlay, vertex.render(overlay, &vertex::placeholder(sandbox)));
+        }
     }
 
     /// True when sand only knows how to launch this harness, nothing more.
@@ -325,6 +373,54 @@ mod tests {
             assert!(nightly_image(agent).is_some(), "{agent}");
         }
         assert_eq!(nightly_image("docker.io/sbx/pi-kit"), None);
+    }
+
+    #[test]
+    fn vertex_auth_is_opt_in_and_wired_through_the_overlay() {
+        let plain = Profile::resolve("claude", &Config::default()).unwrap();
+        assert!(plain.vertex.is_none() && plain.overlay.get("env").is_none());
+
+        let config: Config = toml::from_str(
+            r#"
+            [vertex]
+            project = "acme"
+            region = "us-east5"
+
+            [harness.claude]
+            auth = "vertex"
+            overlay = { env = { DEBUG = "1" } }
+
+            [harness.codex]
+            auth = "vertex"
+
+            [harness.opencode]
+            auth = "vertex"
+            api_check_url = "https://gw.corp/health"
+            vertex_overlay = { provider = { vertex = { options = { apiKey = "{token}" } } } }
+            "#,
+        )
+        .unwrap();
+        let mut claude = Profile::resolve("claude", &config).unwrap();
+        assert_eq!(claude.api_check_url.as_deref(), Some("https://us-east5-aiplatform.googleapis.com/"));
+        assert!(claude.overlay["env"].get("CLAUDE_CODE_USE_VERTEX").is_none(), "wired once the sandbox is known");
+        claude.wire_vertex("claude-proj");
+        let env = &claude.overlay["env"];
+        assert_eq!((&env["CLAUDE_CODE_USE_VERTEX"], &env["CLAUDE_CODE_SKIP_VERTEX_AUTH"]), (&json!("1"), &json!("1")));
+        assert_eq!(
+            (&env["ANTHROPIC_VERTEX_PROJECT_ID"], &env["CLOUD_ML_REGION"]),
+            (&json!("acme"), &json!("us-east5"))
+        );
+        assert_eq!((&env["ANTHROPIC_AUTH_TOKEN"], &env["DEBUG"]), (&json!("sand-vertex-claude-proj"), &json!("1")));
+
+        // No built-in wiring for codex; a harness that brings its own is accepted.
+        assert!(Profile::resolve("codex", &config).unwrap_err().to_string().contains("vertex_overlay"));
+        let mut opencode = Profile::resolve("opencode", &config).unwrap();
+        opencode.wire_vertex("oc");
+        assert_eq!(opencode.overlay["provider"]["vertex"]["options"]["apiKey"], "sand-vertex-oc");
+        assert_eq!(opencode.api_check_url.as_deref(), Some("https://gw.corp/health"));
+
+        let missing: Config = toml::from_str("[harness.claude]\nauth = \"vertex\"").unwrap();
+        assert!(Profile::resolve("claude", &missing).unwrap_err().to_string().contains("project"));
     }
 
     #[test]

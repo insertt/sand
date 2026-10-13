@@ -18,6 +18,7 @@ mod session;
 mod state;
 mod sync;
 mod template;
+mod vertex;
 
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
