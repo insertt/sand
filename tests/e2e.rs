@@ -427,6 +427,44 @@ fn scratch_is_shared_and_dedicated_scratch_is_disposable() {
 }
 
 #[test]
+fn dedicated_scratch_is_removed_when_setup_fails_or_is_interrupted() {
+    let env = Env::new();
+    let created = |log: &[String]| starting(log, "create")[0].split_whitespace().nth(2).unwrap().to_string();
+    let no_sandboxes = || fs::read_dir(env.fake.join("sandboxes")).unwrap().next().is_none();
+
+    let out = env.command(&["codex", "--dedicated-scratch"]).env("FAKE_SBX_MOUNT_FAIL", "1").output().unwrap();
+    assert!(!out.status.success());
+    let log = env.take_log();
+    let name = created(&log);
+    assert_eq!(log.last().unwrap(), &format!("rm --force {name}"), "{log:#?}");
+    assert!(no_sandboxes() && !env.sandbox_dir(&name).exists());
+
+    // Ctrl-C while sand is still setting the sandbox up.
+    let gate = env.root.join("gate");
+    let child = env
+        .command(&["codex", "--dedicated-scratch"])
+        .env("FAKE_SBX_MOUNT_WAIT", &gate)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = PathBuf::from(format!("{}.started", gate.display()));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started.exists() {
+        assert!(Instant::now() < deadline, "setup never reached the mount");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap().success());
+    let out = child.wait_with_output().unwrap();
+    fs::write(&gate, "").unwrap();
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    let log = env.take_log();
+    let name = created(&log);
+    assert!(has(&log, &format!("rm --force {name}")), "{log:#?}");
+    assert!(no_sandboxes() && !env.sandbox_dir(&name).exists());
+}
+
+#[test]
 fn name_flag_picks_the_sandbox() {
     let env = Env::new();
     env.ok(&["codex", "--name", "feature-x"]);
@@ -601,7 +639,7 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
     let at = |needle: &str| log.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}: {log:#?}"));
     assert!(at("secret set-custom") < at("create --name claude-proj"), "{log:#?}");
     assert_eq!(log.last().unwrap(), "run --name claude-proj -e ANTHROPIC_AUTH_TOKEN=sand-vertex-claude-proj");
-    assert!(has(&log, "curl -sS -m 6 -w '\\n%{http_code}' 'https://us-east5-aiplatform.googleapis.com/'"), "{log:#?}");
+    assert!(has(&log, "curl -sS -m 6 -w '\\n%{http_code}' https://us-east5-aiplatform.googleapis.com/"), "{log:#?}");
 
     let staged = env.sandbox_dir("claude-proj").join("runtime/sync/home/.claude/settings.json");
     let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(&staged).unwrap()).unwrap();
@@ -770,6 +808,19 @@ fn a_newer_nightly_image_offers_a_recreate() {
     assert_eq!(digest_of("claude-proj").as_deref(), Some("sha256:bbbb"));
     assert!(env.state("claude-proj")["declined_digest"].is_null());
 
+    // Recreating for a newer image keeps the mounts and MCP servers the sandbox had,
+    // even when this command does not name them.
+    env.register_mcp(&["gitlab"]);
+    run(&["claude", ".", "../other:ro", "--mcp", "gitlab", "--on-conflict", "merge"]);
+    env.take_log();
+    registry.publish("sha256:cccc");
+    let err = run(&["claude", "--on-conflict", "replace"]);
+    let log = env.take_log();
+    let expected = format!("--static-mcp gitlab claude {} {}:ro", env.p(&env.proj), env.p(&env.other));
+    assert!(has(&log, &expected), "{log:#?}");
+    assert!(!err.contains("different setup") && starting(&log, "umount").is_empty(), "{err}\n{log:#?}");
+    assert_eq!(env.state("claude-proj")["mcp"], serde_json::json!(["gitlab"]));
+
     // A sandbox that predates `nightly = true` is offered the switch too.
     env.config("");
     run(&["codex"]);
@@ -780,7 +831,7 @@ fn a_newer_nightly_image_offers_a_recreate() {
     assert!(has(&env.take_log(), "create --name codex-proj --template docker.io/sbx/codex-image:latest --pull always"));
 
     // An unreachable registry never blocks a launch.
-    let err = String::from_utf8_lossy(&env.ok(&["claude"]).stderr).into_owned();
+    let err = String::from_utf8_lossy(&env.ok(&["claude", "--on-conflict", "merge"]).stderr).into_owned();
     assert!(err.contains("could not check for a newer nightly image"), "{err}");
 }
 

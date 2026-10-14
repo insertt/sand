@@ -1,0 +1,4 @@
+* text=auto
+# Shell scripts must keep LF line endings even in a Windows checkout: a
+# CRLF shebang (`#!/bin/sh\r`) cannot be executed.
+*.sh text eol=lf

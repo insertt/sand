@@ -72,6 +72,11 @@ case "$cmd" in
     esac
     ;;
   mount|umount)
+    [ -z "${FAKE_SBX_MOUNT_FAIL:-}" ] || { echo "fake sbx: mount failed" >&2; exit 1; }
+    if [ -n "${FAKE_SBX_MOUNT_WAIT:-}" ]; then
+      : > "$FAKE_SBX_MOUNT_WAIT.started"
+      while [ ! -e "$FAKE_SBX_MOUNT_WAIT" ]; do sleep 0.05; done
+    fi
     ;;
   mcp)
     sub="$1"; shift

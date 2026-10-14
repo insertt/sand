@@ -65,6 +65,7 @@ fn main() -> ExitCode {
         if !session::IN_SESSION.load(Ordering::SeqCst) {
             eprintln!();
             log::error("interrupted");
+            session::dispose();
             std::process::exit(130);
         }
     });

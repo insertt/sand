@@ -7,6 +7,7 @@ use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -25,7 +26,7 @@ use crate::mounts::{self, Mode, Mount, MountSet, Plan, Strategy};
 use crate::paths::{Dirs, RUNTIME_DIR_NAME, container_path};
 use crate::registry;
 use crate::runtime::{self, Refresher};
-use crate::sbx::Sbx;
+use crate::sbx::{Sbx, shell_quote};
 use crate::state::{self, InternalMount, Kind, SandboxState};
 use crate::sync;
 use crate::template;
@@ -66,14 +67,6 @@ fn unique_suffix() -> String {
         .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
         .unwrap_or(0);
     format!("{:06x}", (nanos ^ (u64::from(std::process::id()) << 12)) & 0xff_ffff)
-}
-
-fn shell_quote(word: &str) -> String {
-    if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@=+".contains(c)) {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
 }
 
 /// What the command line asks for, before looking at any existing sandbox.
@@ -364,6 +357,51 @@ fn remove_sandbox(sbx: &Sbx, dirs: &Dirs, name: &str, keep_history: bool) -> Res
     Ok(())
 }
 
+/// The `--dedicated-scratch` sandbox of this run, while it still has to be removed.
+static DISPOSABLE: Mutex<Option<Disposable>> = Mutex::new(None);
+
+struct Disposable {
+    sbx: Sbx,
+    dirs: Dirs,
+    name: String,
+}
+
+/// Removes the dedicated scratch sandbox when dropped, however the run ends:
+/// after the session, or early with an error.
+struct DisposeGuard;
+
+impl DisposeGuard {
+    /// Armed before the sandbox is created, so that a create cut short is cleaned up too.
+    fn arm(sbx: &Sbx, dirs: &Dirs, name: &str) -> Self {
+        let disposable = Disposable { sbx: sbx.clone(), dirs: dirs.clone(), name: name.to_string() };
+        *DISPOSABLE.lock().unwrap_or_else(PoisonError::into_inner) = Some(disposable);
+        Self
+    }
+}
+
+impl Drop for DisposeGuard {
+    fn drop(&mut self) {
+        dispose();
+    }
+}
+
+/// Removes the dedicated scratch sandbox of this run, if there is one. Also
+/// called on Ctrl-C, where the process exits without running destructors. The
+/// lock is held while removing, so that the other caller waits for it.
+pub fn dispose() {
+    let mut pending = DISPOSABLE.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(Disposable { sbx, dirs, name }) = pending.take() else { return };
+    // sbx may not have got as far as creating it.
+    if !sbx.exists(&name).unwrap_or(true) {
+        let _ = state::forget(&dirs, &name, false);
+        return;
+    }
+    log::info("this was a dedicated scratch sandbox; cleaning it up");
+    if let Err(err) = remove_sandbox(&sbx, &dirs, &name, false) {
+        log::warn(format!("could not remove it: {err:#}. Remove it with `sbx rm {name}`."));
+    }
+}
+
 /// Registers the Vertex AI access token as a custom secret of the sandbox. sbx
 /// runs the token command on the host and keeps the token fresh; the sandbox
 /// only ever holds the placeholder.
@@ -608,7 +646,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         return Ok(0);
     }
 
-    let req = build_request(&args, dirs, config, harness, specs)?;
+    let mut req = build_request(&args, dirs, config, harness, specs)?;
     let profile = &req.profile;
     let sbx = Sbx::new(!args.acp);
 
@@ -661,6 +699,14 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         match nightly_update(&req, dirs, state, &args)? {
             ConflictChoice::Merge => {}
             ConflictChoice::Replace => {
+                // Only the image changes: the new sandbox keeps the mounts and MCP
+                // servers of the old one, plus anything this command adds.
+                req.mounts = mounts::plan(&state.mounts, &req.mounts, Strategy::Merge).result;
+                for server in &state.mcp {
+                    if !req.mcp.contains(server) {
+                        req.mcp.push(server.clone());
+                    }
+                }
                 remove_sandbox(&sbx, dirs, &req.name, true)?;
                 exists = false;
                 current = None;
@@ -703,6 +749,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let can_prompt = !args.acp && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     mcp::ensure_authorized(&sbx, &used_mcp, can_prompt)?;
 
+    let mut disposal = None;
     let (mut state, plan, load_mcp) = match decision {
         Decision::Abort => {
             log::info("aborted; nothing was changed");
@@ -711,6 +758,9 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         Decision::Create => {
             if exists {
                 remove_sandbox(&sbx, dirs, &req.name, true)?;
+            }
+            if req.kind == Kind::Dedicated {
+                disposal = Some(DisposeGuard::arm(&sbx, dirs, &req.name));
             }
             // Before the sandbox exists, so that sbx sets the token variable in it.
             register_vertex_secret(&sbx, profile, &req.name)?;
@@ -847,11 +897,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let status = status?;
 
     log::step(format!("Session ended ({status})"));
-    if state.kind == Kind::Dedicated {
-        log::info("this was a dedicated scratch sandbox; cleaning it up");
-        if let Err(err) = remove_sandbox(&sbx, dirs, &state.name, false) {
-            log::warn(format!("could not remove it: {err:#}. Remove it with `sbx rm {}`.", state.name));
-        }
+    if disposal.is_some() {
+        drop(disposal);
     } else {
         log::info(format!("sandbox '{}' is kept; `sand {} --resume` attaches to it again", state.name, profile.name));
     }
@@ -950,14 +997,5 @@ mod tests {
             agent_args(&claude, &s(&["fix the build"])),
             s(&["--dangerously-skip-permissions", "fix the build"])
         );
-    }
-
-    #[test]
-    fn shell_quoting() {
-        assert_eq!(shell_quote("npx"), "npx");
-        assert_eq!(shell_quote("@agentclientprotocol/claude-agent-acp"), "@agentclientprotocol/claude-agent-acp");
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
-        assert_eq!(shell_quote(""), "''");
     }
 }

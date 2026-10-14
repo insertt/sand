@@ -38,6 +38,15 @@ fn display(args: &[OsString]) -> String {
         .join(" ")
 }
 
+/// Quotes `word` for a POSIX shell, leaving plain words as they are.
+pub fn shell_quote(word: &str) -> String {
+    if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@=+".contains(c)) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 /// Copies lines from one stream to another through `filter`, until either end closes.
 fn pump(mut from: impl BufRead, mut to: impl Write, filter: impl Fn(&str) -> String) {
     let mut line = String::new();
@@ -264,5 +273,16 @@ mod tests {
         let mut out = Vec::new();
         pump(io::Cursor::new("one\r\ntwo\n\nlast"), &mut out, |line| line.to_uppercase());
         assert_eq!(String::from_utf8(out).unwrap(), "ONE\nTWO\n\nLAST\n");
+    }
+
+    #[test]
+    fn shell_quoting() {
+        assert_eq!(shell_quote("npx"), "npx");
+        assert_eq!(shell_quote("@agentclientprotocol/claude-agent-acp"), "@agentclientprotocol/claude-agent-acp");
+        assert_eq!(shell_quote("https://api.anthropic.com/v1/models"), "https://api.anthropic.com/v1/models");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("https://x/?a=1&b=$(id)"), "'https://x/?a=1&b=$(id)'");
+        assert_eq!(shell_quote(""), "''");
     }
 }

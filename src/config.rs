@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -35,12 +36,38 @@ const STARTER: &str = r#"# sand configuration. Everything is optional; the READM
 # url = "https://mcp.linear.app/mcp"
 "#;
 
+/// Splits an editor command into words: separated by whitespace, with `"…"` or
+/// `'…'` grouping words that contain spaces. A value that names an existing
+/// file is a single word, so an unquoted path with spaces works too. Backslashes
+/// are kept as they are, since they separate the parts of a Windows path.
+fn split_command(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if Path::new(value).is_file() {
+        return vec![value.to_string()];
+    }
+    let (mut words, mut word, mut quote) = (Vec::new(), None::<String>, None);
+    for c in value.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.get_or_insert_default().push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            None if c.is_whitespace() => words.extend(word.take()),
+            None => word.get_or_insert_default().push(c),
+        }
+    }
+    words.extend(word);
+    words
+}
+
 /// Editor commands to try, in order: `$VISUAL`, `$EDITOR`, then what the platform has.
 fn editors() -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = ["VISUAL", "EDITOR"]
         .iter()
         .filter_map(|var| env::var(var).ok())
-        .map(|value| value.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .map(|value| split_command(&value))
         .filter(|command| !command.is_empty())
         .collect();
     let fallbacks: &[&[&str]] = if cfg!(windows) {
@@ -292,6 +319,26 @@ mod tests {
         assert_eq!(config.mcp["pw"].args, vec!["@playwright/mcp@latest"]);
         assert_eq!((config.vertex.project.as_deref(), config.vertex.refresh.as_deref()), (Some("acme"), Some("30m")));
         assert_eq!(config.harness["claude"].auth, None);
+    }
+
+    #[test]
+    fn editor_commands_are_split_like_a_shell_would() {
+        assert_eq!(split_command("vim"), ["vim"]);
+        assert_eq!(split_command("  code --wait "), ["code", "--wait"]);
+        assert_eq!(
+            split_command(r#""C:\Program Files\Microsoft VS Code\bin\code.cmd" --wait"#),
+            [r"C:\Program Files\Microsoft VS Code\bin\code.cmd", "--wait"]
+        );
+        assert_eq!(split_command("'/opt/my editor/ed' -n 'a b'"), ["/opt/my editor/ed", "-n", "a b"]);
+        assert_eq!(split_command("ed ''"), ["ed", ""]);
+        assert!(split_command("  ").is_empty());
+
+        // An existing file is one word, quoted or not.
+        let tmp = tempfile::tempdir().unwrap();
+        let editor = tmp.path().join("my editor.exe");
+        fs::write(&editor, "").unwrap();
+        let path = editor.to_string_lossy().into_owned();
+        assert_eq!(split_command(&path), [path.as_str()]);
     }
 
     #[test]

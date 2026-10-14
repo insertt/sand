@@ -17,7 +17,7 @@ use crate::harness::Profile;
 use crate::mcp::{self, McpState, McpStatus};
 use crate::mounts::MountSet;
 use crate::paths::RUNTIME_DIR_NAME;
-use crate::sbx::Sbx;
+use crate::sbx::{Sbx, shell_quote};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApiState {
@@ -46,7 +46,7 @@ pub fn classify_api(output: &str) -> ApiState {
 
 pub fn check_api(sbx: &Sbx, sandbox: &str, profile: &Profile) -> ApiState {
     let Some(url) = &profile.api_check_url else { return ApiState::NotConfigured };
-    let script = format!("curl -sS -m 6 -w '\\n%{{http_code}}' '{url}' 2>/dev/null");
+    let script = format!("curl -sS -m 6 -w '\\n%{{http_code}}' {} 2>/dev/null", shell_quote(url));
     match sbx.capture(args!["exec", sandbox, "bash", "-lc", script]) {
         Ok(Some(out)) => classify_api(&out),
         // curl exits non-zero on transport errors.
