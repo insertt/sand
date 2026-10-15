@@ -401,6 +401,20 @@ fn mcp_servers_needing_auth_are_not_authorized_without_a_terminal() {
 }
 
 #[test]
+fn expired_sbx_login_is_reported_without_a_terminal() {
+    let env = Env::new();
+    fs::write(env.fake.join("logged-out"), "").unwrap();
+    let out = env.sand(&["claude"]);
+    assert!(!out.status.success());
+    let (log, err) = (env.take_log(), stderr(&out));
+    assert!(starting(&log, "login").is_empty(), "{log:#?}");
+    assert!(
+        err.contains("your Docker session has expired") && err.contains("no terminal to sign in on; run `sbx login`"),
+        "{err}"
+    );
+}
+
+#[test]
 fn scratch_is_shared_and_dedicated_scratch_is_disposable() {
     let env = Env::new();
     env.ok(&["codex", "--scratch"]);
@@ -634,7 +648,7 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
     let log = env.take_log();
     let secret = "secret set-custom --sandbox claude-proj --host us-east5-aiplatform.googleapis.com \
                   --host aiplatform.googleapis.com --env ANTHROPIC_AUTH_TOKEN --placeholder sand-vertex-claude-proj \
-                  --command gcloud auth print-access-token --refresh 45m";
+                  --command gcloud auth application-default print-access-token --refresh 45m";
     assert_eq!(starting(&log, "secret"), vec![secret]);
     let at = |needle: &str| log.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}: {log:#?}"));
     assert!(at("secret set-custom") < at("create --name claude-proj"), "{log:#?}");
@@ -666,7 +680,10 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
     // Without a working token source there is no point in starting the agent.
     let out = env.command(&["claude"]).env("FAKE_SBX_SECRET_FAIL", "1").output().unwrap();
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("gcloud auth print-access-token") && !has(&env.take_log(), "run --name"));
+    assert!(
+        stderr(&out).contains("gcloud auth application-default print-access-token")
+            && !has(&env.take_log(), "run --name")
+    );
 
     // Back to sbx's own credentials: no secret, and the Vertex settings are gone.
     env.config("");

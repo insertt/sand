@@ -13,7 +13,8 @@ $ sand codex . ../shared-lib:ro ../docs:rw
 
 ## Install
 
-Requires the `sbx` CLI (signed in with `sbx login`).
+Requires the `sbx` CLI (signed in with `sbx login`; when the login is missing or
+expired, `sand` runs `sbx login` for you if it has a terminal).
 
 Prebuilt executables for Linux, macOS and Windows are attached to every
 [release](https://github.com/insertt/sand/releases). The install scripts

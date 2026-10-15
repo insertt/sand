@@ -648,7 +648,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
 
     let mut req = build_request(&args, dirs, config, harness, specs)?;
     let profile = &req.profile;
-    let sbx = Sbx::new(!args.acp);
+    let sbx = Sbx::connect(!args.acp)?;
 
     log::step(format!("sand: {} in sandbox '{}'", profile.name, req.name));
     if profile.is_basic() {
@@ -935,7 +935,7 @@ pub fn find_sandbox(
 
 /// `sand status`: the banner for an existing sandbox.
 pub fn status(args: StatusArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
-    let sbx = Sbx::new(true);
+    let sbx = Sbx::connect(true)?;
     let (name, harness) = find_sandbox(&sbx, &args.targets, args.name.as_deref(), args.scratch, dirs, config)?;
     let (profile, mounts, servers) = match state::load(dirs, &name)? {
         Some(state) => (Profile::resolve(&state.harness, config)?, state.mounts, state.mcp),

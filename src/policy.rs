@@ -137,7 +137,7 @@ fn choose(sandbox: &str, blocked: &[Blocked]) -> Result<Vec<String>> {
 
 /// `sand allow`: show what the sandbox was blocked from reaching and add allow rules.
 pub fn allow(args: AllowArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
-    let sbx = Sbx::new(true);
+    let sbx = Sbx::connect(true)?;
     let (name, _) = session::find_sandbox(&sbx, &args.targets, args.name.as_deref(), args.scratch, dirs, config)?;
 
     let hosts = if args.host.is_empty() {

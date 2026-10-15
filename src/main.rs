@@ -44,12 +44,13 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Some(Command::Status(args)) => session::status(args, &dirs, &config),
         Some(Command::Allow(args)) => policy::allow(args, &dirs, &config),
         Some(Command::Template { action }) => {
-            let sbx = Sbx::new(true);
+            // `template ls` reads sand's own records and needs no sbx.
+            let sbx = || Sbx::connect(true);
             match action {
-                TemplateCommand::Build { name } => template::build(&sbx, &dirs, &config, &name)?,
-                TemplateCommand::Save { sandbox, name } => template::save(&sbx, &dirs, &config, &sandbox, &name)?,
+                TemplateCommand::Build { name } => template::build(&sbx()?, &dirs, &config, &name)?,
+                TemplateCommand::Save { sandbox, name } => template::save(&sbx()?, &dirs, &config, &sandbox, &name)?,
                 TemplateCommand::Ls => template::list(&dirs, &config)?,
-                TemplateCommand::Rm { name } => template::remove(&sbx, &dirs, &name)?,
+                TemplateCommand::Rm { name } => template::remove(&sbx()?, &dirs, &name)?,
             }
             Ok(0)
         }

@@ -3,8 +3,8 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -60,9 +60,50 @@ fn pump(mut from: impl BufRead, mut to: impl Write, filter: impl Fn(&str) -> Str
 }
 
 impl Sbx {
-    pub fn new(interactive: bool) -> Self {
+    fn new(interactive: bool) -> Self {
         let bin = env::var_os("SAND_SBX").unwrap_or_else(|| OsString::from("sbx"));
         Self { bin, interactive }
+    }
+
+    /// The wrapper every command starts from: it makes sure sbx is signed in
+    /// first, so that a missing or expired login is dealt with up front rather
+    /// than by whichever sbx call happens to run into it.
+    pub fn connect(interactive: bool) -> Result<Self> {
+        let sbx = Self::new(interactive);
+        sbx.ensure_signed_in()?;
+        Ok(sbx)
+    }
+
+    /// Runs `sbx login` when sbx reports that the user is not signed in or that
+    /// the login expired. `sbx ls` is the probe: cheap, and it needs a login.
+    /// Any other failure is left to the command that runs into it.
+    fn ensure_signed_in(&self) -> Result<()> {
+        let output = Command::new(&self.bin)
+            .args(["ls", "-q"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| self.spawn_error(e))?;
+        if output.status.success() || !needs_login(&output) {
+            return Ok(());
+        }
+        if !self.can_prompt() {
+            let mut err = io::stderr().lock();
+            let _ = err.write_all(&output.stderr);
+            drop(err);
+            bail!(
+                "sbx is not signed in (or the login expired) and there is no terminal to sign in on; run `sbx login`"
+            );
+        }
+        log::step("sbx is not signed in (or the login expired); running `sbx login`");
+        if !self.interact(args!["login"])?.success() {
+            bail!("`sbx login` failed; sign in with `sbx login` and try again");
+        }
+        Ok(())
+    }
+
+    /// Whether a command may prompt the user: sbx login opens a browser and waits on the terminal.
+    fn can_prompt(&self) -> bool {
+        self.interactive && io::stdin().is_terminal() && io::stderr().is_terminal()
     }
 
     fn command(&self, args: &[OsString]) -> Command {
@@ -250,6 +291,25 @@ impl Drop for KeepAlive {
     }
 }
 
+/// Whether a failed sbx command failed because the user is not signed in. sbx
+/// has no error code for it, so this matches its messages: "not signed in to
+/// Docker" (with "try: sbx login") and "your Docker session has expired; run
+/// `sbx login` and try again". A session that could not be refreshed because
+/// of the network is not one: signing in again would not help.
+fn needs_login(output: &Output) -> bool {
+    mentions_login(&format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)))
+}
+
+fn mentions_login(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    if text.contains("could not be refreshed due to a network issue") {
+        return false;
+    }
+    ["not signed in to docker", "docker session has expired", "docker session expired", "sbx login"]
+        .iter()
+        .any(|signal| text.contains(signal))
+}
+
 /// Runs an arbitrary host command (docker, …), streaming its output to stderr.
 pub fn run_host(program: &str, args: Vec<OsString>) -> Result<()> {
     log::command(format!("{program} {}", display(&args)));
@@ -273,6 +333,17 @@ mod tests {
         let mut out = Vec::new();
         pump(io::Cursor::new("one\r\ntwo\n\nlast"), &mut out, |line| line.to_uppercase());
         assert_eq!(String::from_utf8(out).unwrap(), "ONE\nTWO\n\nLAST\n");
+    }
+
+    #[test]
+    fn login_failures_are_recognized() {
+        // What sbx prints for each case.
+        assert!(mentions_login("error: not signed in to Docker\n  try: sbx login"));
+        assert!(mentions_login("your Docker session has expired; run `sbx login` and try again (401 Unauthorized)"));
+        assert!(!mentions_login(
+            "your Docker session could not be refreshed due to a network issue; this should resolve automatically, try again shortly"
+        ));
+        assert!(!mentions_login("pull failed due to an unauthenticated request"));
     }
 
     #[test]
