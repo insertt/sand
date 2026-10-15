@@ -12,7 +12,7 @@ use crate::args;
 use crate::config::Config;
 
 const DEFAULT_REGION: &str = "global";
-const DEFAULT_TOKEN_COMMAND: &str = "gcloud auth print-access-token";
+const DEFAULT_TOKEN_COMMAND: &str = "gcloud auth application-default print-access-token";
 /// Google access tokens live for an hour; sbx asks for a new one before that.
 const DEFAULT_REFRESH: &str = "45m";
 
