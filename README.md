@@ -38,7 +38,7 @@ again to upgrade.
 To build from source instead, with Rust 1.89 or later:
 
 ```console
-$ cargo install --path .
+$ cargo install --locked --path .
 ```
 
 ## Usage

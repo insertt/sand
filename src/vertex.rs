@@ -121,7 +121,10 @@ mod tests {
     fn defaults_cover_the_region_and_refresh_before_the_token_expires() {
         let v = vertex("[vertex]\nproject = \"acme\"").unwrap();
         assert_eq!((v.region.as_str(), v.host()), ("global", "aiplatform.googleapis.com"));
-        assert_eq!((v.token_command.as_str(), v.refresh.as_str()), ("gcloud auth print-access-token", "45m"));
+        assert_eq!(
+            (v.token_command.as_str(), v.refresh.as_str()),
+            ("gcloud auth application-default print-access-token", "45m")
+        );
 
         let v = vertex("[vertex]\nproject = \"acme\"\nregion = \"us-east5\"").unwrap();
         assert_eq!(v.hosts, ["us-east5-aiplatform.googleapis.com", "aiplatform.googleapis.com"]);
