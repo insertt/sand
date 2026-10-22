@@ -2,7 +2,7 @@
 //! automatically if sand crashes or is killed.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -36,9 +36,7 @@ pub fn acquire(dirs: &Dirs, sandbox: &str, description: &str) -> Result<SessionL
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
-            let holder = fs::read_to_string(&info).unwrap_or_default();
-            let holder =
-                if holder.trim().is_empty() { "another sand process".to_string() } else { holder.trim().to_string() };
+            let holder = read_holder(&info);
             bail!(
                 "sandbox '{sandbox}' already has a running session ({holder}).\n\
                  Close that session first, or start a separate sandbox with --name."
@@ -51,6 +49,21 @@ pub fn acquire(dirs: &Dirs, sandbox: &str, description: &str) -> Result<SessionL
     Ok(SessionLock { _file: file, info })
 }
 
+/// Who holds the session lock for `sandbox`, or `None` when no session is running.
+pub fn holder(dirs: &Dirs, sandbox: &str) -> Option<String> {
+    let dir = dirs.locks_dir();
+    let file = OpenOptions::new().write(true).open(dir.join(format!("{sandbox}.lock"))).ok()?;
+    match file.try_lock() {
+        Err(TryLockError::WouldBlock) => Some(read_holder(&dir.join(format!("{sandbox}.info")))),
+        _ => None,
+    }
+}
+
+fn read_holder(info: &Path) -> String {
+    let holder = fs::read_to_string(info).unwrap_or_default();
+    if holder.trim().is_empty() { "another sand process".to_string() } else { holder.trim().to_string() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,13 +73,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dirs =
             Dirs { home: tmp.path().into(), data: tmp.path().join("data"), config_file: tmp.path().join("c.toml") };
+        assert_eq!(holder(&dirs, "claude-proj"), None);
         let first = acquire(&dirs, "claude-proj", "in /x/proj").unwrap();
+        assert!(holder(&dirs, "claude-proj").is_some_and(|h| h.ends_with("in /x/proj")));
         let err = acquire(&dirs, "claude-proj", "elsewhere").err().expect("must be locked").to_string();
         assert!(err.contains("already has a running session"), "{err}");
         assert!(err.contains("in /x/proj"), "{err}");
         // A different sandbox is unaffected.
         let _other = acquire(&dirs, "codex-proj", "").unwrap();
         drop(first);
+        assert_eq!(holder(&dirs, "claude-proj"), None);
         acquire(&dirs, "claude-proj", "again").unwrap();
     }
 }

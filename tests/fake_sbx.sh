@@ -16,6 +16,10 @@ case "$cmd" in
   ls)
     # A test signs sbx out by creating $root/logged-out; `sbx login` signs it back in.
     [ ! -e "$root/logged-out" ] || { echo "your Docker session has expired; run \`sbx login\` and try again (401 Unauthorized)" >&2; exit 1; }
+    if [ "${1:-}" = "--json" ]; then
+      [ -f "$root/ls.json" ] && cat "$root/ls.json" && exit 0
+      exit 1
+    fi
     ls "$root/sandboxes"
     ;;
   login)

@@ -47,6 +47,8 @@ pub enum Command {
     },
     /// Show a sandbox's mounts, agent API connectivity and MCP server status
     Status(StatusArgs),
+    /// Describe a sandbox: what sand recorded about it and whether it is running
+    Describe(DescribeArgs),
     /// Allow a sandbox network access to hosts its policy blocked
     Allow(AllowArgs),
 }
@@ -155,6 +157,25 @@ pub struct StatusArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct DescribeArgs {
+    /// Harness and project directory identifying the sandbox (default: current directory)
+    #[arg(value_name = "HARNESS] [DIR")]
+    pub targets: Vec<String>,
+
+    /// Sandbox name
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Look at the shared scratch sandbox
+    #[arg(long)]
+    pub scratch: bool,
+
+    /// Print the description as JSON on stdout
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct AllowArgs {
     /// Harness and project directory identifying the sandbox (default: current directory)
     #[arg(value_name = "HARNESS] [DIR")]
@@ -252,6 +273,8 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Command::Status(ref s)) if s.targets == ["codex"] && s.name.as_deref() == Some("x"))
         );
+        let cli = Cli::try_parse_from(["sand", "describe", "claude", "--json"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Describe(ref d)) if d.targets == ["claude"] && d.json));
         let cli = Cli::try_parse_from(["sand", "allow", "codex", "--host", "a.com,b.com:443", "--global"]).unwrap();
         assert!(
             matches!(cli.command, Some(Command::Allow(ref a)) if a.targets == ["codex"] && a.host == ["a.com", "b.com:443"] && a.global)

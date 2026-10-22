@@ -947,6 +947,38 @@ fn status_shows_the_banner_for_an_existing_sandbox() {
 }
 
 #[test]
+fn describe_prints_the_record_and_the_sbx_state() {
+    let env = Env::new();
+    assert!(env.fails(&["describe", "codex"]).contains("no sandbox named 'codex-proj'"));
+    env.ok(&["codex", ".", "../other:ro", "--no-attach"]);
+    fs::write(env.fake.join("ls.json"), r#"[{"name": "codex-proj", "status": "running"}]"#).unwrap();
+    env.take_log();
+
+    let out = env.ok(&["describe", "codex"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("codex-proj") && text.contains("running") && text.contains("none attached"), "{text}");
+    assert!(text.contains("[primary workspace]") && text.contains(&format!("{} (ro)", env.p(&env.other))), "{text}");
+    assert!(text.contains("history/.codex_sessions → /home/agent/.codex/sessions (rw)"), "{text}");
+    // Nothing runs inside the sandbox.
+    assert!(!has(&env.take_log(), "exec"));
+
+    let out = env.ok(&["describe", "--name", "codex-proj", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["sbx_state"], "running");
+    assert_eq!(json["record"]["harness"], "codex");
+    assert_eq!(json["record"]["mounts"]["extras"][0]["mode"], "ro");
+
+    // A sandbox sand did not create is described from what sbx knows.
+    fs::write(env.fake.join("sandboxes/hand-made"), "").unwrap();
+    fs::remove_file(env.fake.join("ls.json")).unwrap();
+    let out = env.ok(&["describe", "--name", "hand-made"]);
+    assert!(stderr(&out).contains("was not created by sand"), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("unknown"));
+    let out = env.ok(&["describe", "--name", "hand-made", "--json"]);
+    assert!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["record"].is_null());
+}
+
+#[test]
 fn allow_lists_blocked_hosts_and_adds_sandbox_scoped_rules() {
     let env = Env::new();
     assert!(env.fails(&["allow", "codex"]).contains("no sandbox named 'codex-proj'"));

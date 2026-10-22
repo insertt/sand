@@ -3,6 +3,7 @@
 mod acp;
 mod cli;
 mod config;
+mod describe;
 mod editor;
 mod harness;
 mod lock;
@@ -42,6 +43,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
         None => session::run(cli.run, &dirs, &config),
         Some(Command::Status(args)) => session::status(args, &dirs, &config),
+        Some(Command::Describe(args)) => describe::describe(args, &dirs, &config),
         Some(Command::Allow(args)) => policy::allow(args, &dirs, &config),
         Some(Command::Template { action }) => {
             // `template ls` reads sand's own records and needs no sbx.

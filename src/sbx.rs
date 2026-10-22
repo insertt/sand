@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde_json::Value;
 
 use crate::log;
 
@@ -225,6 +226,12 @@ impl Sbx {
         Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
     }
 
+    /// What sbx reports a sandbox is doing (running, stopped, …); `None` when
+    /// `sbx ls --json` fails or does not say.
+    pub fn sandbox_state(&self, name: &str) -> Result<Option<String>> {
+        Ok(self.capture(args!["ls", "--json"])?.and_then(|json| parse_ls_state(&json, name)))
+    }
+
     pub fn exists(&self, name: &str) -> Result<bool> {
         Ok(self.list()?.iter().any(|n| n == name))
     }
@@ -310,6 +317,28 @@ fn mentions_login(message: &str) -> bool {
         .any(|signal| text.contains(signal))
 }
 
+/// Finds `name`'s entry in the output of `sbx ls --json` and returns its
+/// status. The schema is not documented, so this accepts an array or an object
+/// wrapping one, and a `status` or `state` field.
+fn parse_ls_state(json: &str, name: &str) -> Option<String> {
+    fn find<'a>(value: &'a Value, name: &str) -> Option<&'a serde_json::Map<String, Value>> {
+        match value {
+            Value::Array(items) => items.iter().find_map(|item| find(item, name)),
+            Value::Object(map) if map.get("name").and_then(Value::as_str) == Some(name) => Some(map),
+            Value::Object(map) => map.values().find_map(|v| find(v, name)),
+            _ => None,
+        }
+    }
+    let parsed: Value = serde_json::from_str(json).ok()?;
+    let entry = find(&parsed, name)?;
+    entry
+        .iter()
+        .find(|(key, _)| ["status", "state"].contains(&key.to_ascii_lowercase().as_str()))
+        .and_then(|(_, value)| value.as_str())
+        .map(|state| state.trim().to_ascii_lowercase())
+        .filter(|state| !state.is_empty())
+}
+
 /// Runs an arbitrary host command (docker, …), streaming its output to stderr.
 pub fn run_host(program: &str, args: Vec<OsString>) -> Result<()> {
     log::command(format!("{program} {}", display(&args)));
@@ -344,6 +373,20 @@ mod tests {
             "your Docker session could not be refreshed due to a network issue; this should resolve automatically, try again shortly"
         ));
         assert!(!mentions_login("pull failed due to an unauthenticated request"));
+    }
+
+    #[test]
+    fn sandbox_state_comes_from_the_matching_entry() {
+        let list = r#"[{"name": "codex-proj", "status": "stopped"}, {"name": "claude-proj", "Status": "Running"}]"#;
+        assert_eq!(parse_ls_state(list, "claude-proj").as_deref(), Some("running"));
+        assert_eq!(parse_ls_state(list, "codex-proj").as_deref(), Some("stopped"));
+        assert_eq!(
+            parse_ls_state(r#"{"sandboxes": [{"name": "x", "state": "running"}]}"#, "x").as_deref(),
+            Some("running")
+        );
+        assert_eq!(parse_ls_state(list, "other"), None);
+        assert_eq!(parse_ls_state(r#"[{"name": "x"}]"#, "x"), None);
+        assert_eq!(parse_ls_state("not json", "x"), None);
     }
 
     #[test]

@@ -73,7 +73,12 @@ the same.
 | `-v`, `--verbose` | Echo every `sbx` command sand runs and show its output (otherwise shown only when a command fails). Works with the subcommands too. |
 
 Other commands: `sand status [HARNESS] [DIR]` prints a sandbox's mounts, agent
-API connectivity and MCP server status. `sand allow [HARNESS] [DIR]` opens the
+API connectivity and MCP server status. `sand describe [HARNESS] [DIR]` prints
+everything sand recorded about a sandbox (harness, kind, creation time,
+template, nightly image, mounts including sand's own, MCP servers, data
+directory) along with whether sbx reports it running and whether a `sand`
+session is attached; it runs nothing inside the sandbox, and `--json` prints the
+same on stdout for scripts. `sand allow [HARNESS] [DIR]` opens the
 network for hosts the sandbox was blocked from reaching (see
 [Blocked network access](#blocked-network-access)). `sand template
 build|save|ls|rm` manages templates.
