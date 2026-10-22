@@ -989,14 +989,14 @@ fn allow_lists_blocked_hosts_and_adds_sandbox_scoped_rules() {
 
     fs::write(
         env.fake.join("policy.json"),
-        r#"{"blocked_hosts": [
-              {"host": "zed.dev:443", "vm_name": "codex-proj", "rule": "no applicable policies for op(x)",
-               "last_seen": "2026-10-12T12:51:22.4219199+02:00", "count_since": 1, "reason": "No matching allow rule (default deny)"},
-              {"host": "gw.internal", "vm_name": "codex-proj", "rule": "<dns proxy policy>",
-               "last_seen": "2026-10-12T12:51:16.790945+02:00", "count_since": 2, "reason": "DNS lookup blocked by proxy policy"},
-              {"host": "other.dev:443", "vm_name": "claude-proj", "rule": "no applicable policies for op(x)",
-               "last_seen": "2026-10-12T12:51:22+02:00", "count_since": 1, "reason": "No matching allow rule (default deny)"}],
-            "allowed_hosts": []}"#,
+        r#"{"blocked": [
+              {"host": "zed.dev:443", "sandbox_id": "codex-proj", "rule": "no applicable policies for op(x)",
+               "last_seen": "2026-10-12T12:51:22.4219199+02:00", "count": 1, "reason": "No matching allow rule (default deny)"},
+              {"host": "gw.internal", "sandbox_id": "codex-proj", "rule": "<dns proxy policy>",
+               "last_seen": "2026-10-12T12:51:16.790945+02:00", "count": 2, "reason": "DNS lookup blocked by proxy policy"},
+              {"host": "other.dev:443", "sandbox_id": "claude-proj", "rule": "no applicable policies for op(x)",
+               "last_seen": "2026-10-12T12:51:22+02:00", "count": 1, "reason": "No matching allow rule (default deny)"}],
+            "allowed": []}"#,
     )
     .unwrap();
     let out = env.ok(&["allow", "codex", "--list"]);
@@ -1008,7 +1008,7 @@ fn allow_lists_blocked_hosts_and_adds_sandbox_scoped_rules() {
 
     // Choosing needs a terminal; the tests have none.
     let err = env.fails(&["allow", "codex"]);
-    assert!(err.contains("not offered: gw.internal") && err.contains("pass --host"), "{err}");
+    assert!(err.contains("has 2 blocked host(s)") && err.contains("pass --host"), "{err}");
     assert!(!has(&env.take_log(), "policy allow"));
 
     let err = stderr(&env.ok(&["allow", "codex", "--host", "zed.dev:443,*.example.com", "-v"]));

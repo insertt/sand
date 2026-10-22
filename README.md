@@ -257,9 +257,11 @@ It reads `sbx policy log` and adds the rules with `sbx policy allow network
 --sandbox <name>`, so they apply to that sandbox only; `--global` allows the
 hosts for every sandbox. Hosts are allowed exactly as they were logged,
 including the port. Requests that were blocked have already failed, so ask the
-agent to try again. Blocks that an allow rule does not lift, such as an
-explicit deny rule, are shown but not offered. A host you allowed stays in the
-list until the sandbox reaches it.
+agent to try again. Every block is listed, oldest first, and can be allowed.
+A block with a reason other than default deny, such as an explicit deny rule,
+shows that reason: deny rules take precedence, so an allow may not lift it.
+A host the sandbox reached after it was last blocked is marked "reached
+since" rather than hidden.
 
 ## MCP servers
 
