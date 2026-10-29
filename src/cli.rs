@@ -10,6 +10,9 @@ Examples:
   sand codex . ../lib:ro ../docs:rw          extra mounts, read-only or read-write
   sand claude --mcp atlassian,gitlab         with MCP servers from `sbx mcp ls`
   sand claude --resume                       attach to the existing sandbox as it is
+  sand claude --resume . ../lib:ro           attach, adding ../lib to the sandbox
+  sand mount ../lib:ro                       add ../lib to this directory's sandbox, even mid-session
+  sand umount ../lib                         remove it again
   sand claude --recreate                     rebuild the sandbox, keeping history
   sand codex --no-attach                     set the sandbox up without opening the agent
   sand codex --scratch                       shared scratch space, no project
@@ -51,6 +54,10 @@ pub enum Command {
     Describe(DescribeArgs),
     /// Allow a sandbox network access to hosts its policy blocked
     Allow(AllowArgs),
+    /// Mount directories into an existing sandbox, also while a session runs
+    Mount(MountArgs),
+    /// Unmount directories from an existing sandbox, also while a session runs
+    Umount(MountArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,7 +99,7 @@ pub struct RunArgs {
     #[arg(long, value_name = "SERVERS", value_delimiter = ',')]
     pub mcp: Vec<String>,
 
-    /// Attach to the existing sandbox as it is; fail if there is none
+    /// Attach to the existing sandbox, adding any mounts and MCP servers given; fail if there is none
     #[arg(long, conflicts_with_all = ["recreate", "dedicated_scratch"])]
     pub resume: bool,
 
@@ -173,6 +180,22 @@ pub struct DescribeArgs {
     /// Print the description as JSON on stdout
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MountArgs {
+    /// Harness followed by the directories to mount or unmount (:ro or :rw, default :rw).
+    /// The sandbox is the current directory's, unless --name or --scratch picks another.
+    #[arg(value_name = "HARNESS] [DIR", required = true)]
+    pub targets: Vec<String>,
+
+    /// Sandbox name
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Use the shared scratch sandbox
+    #[arg(long)]
+    pub scratch: bool,
 }
 
 #[derive(Debug, Args)]
@@ -280,5 +303,11 @@ mod tests {
             matches!(cli.command, Some(Command::Allow(ref a)) if a.targets == ["codex"] && a.host == ["a.com", "b.com:443"] && a.global)
         );
         assert!(Cli::try_parse_from(["sand", "allow", "--list", "--host", "a.com"]).is_err());
+        let cli = Cli::try_parse_from(["sand", "mount", "claude", "../lib:ro", "--name", "x"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Mount(ref m)) if m.targets == ["claude", "../lib:ro"] && m.name.as_deref() == Some("x"))
+        );
+        assert!(matches!(Cli::try_parse_from(["sand", "umount", "../lib"]).unwrap().command, Some(Command::Umount(_))));
+        assert!(Cli::try_parse_from(["sand", "mount"]).is_err());
     }
 }

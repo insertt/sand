@@ -270,6 +270,79 @@ fn resume_attaches_without_needing_the_mounts() {
 }
 
 #[test]
+fn resume_adds_the_mounts_on_the_command_line() {
+    let env = Env::new();
+    env.ok(&["codex"]);
+    env.take_log();
+    env.ok(&["codex", "--resume", ".", "../other:ro"]);
+    let log = env.take_log();
+    let other = env.p(&env.other);
+    assert!(starting(&log, "create").is_empty() && starting(&log, "umount").is_empty());
+    assert_eq!(starting(&log, "mount"), vec![format!("mount codex-proj {other}:{other}:ro")]);
+    assert_eq!(log.last().unwrap(), "run --name codex-proj");
+    assert_eq!(env.state("codex-proj")["mounts"]["extras"][0]["path"], other.as_str());
+
+    // Mounts it already has are left alone, and nothing is removed.
+    env.ok(&["codex", "--resume", "."]);
+    let log = env.take_log();
+    assert!(starting(&log, "mount").is_empty() && starting(&log, "umount").is_empty());
+    assert_eq!(env.state("codex-proj")["mounts"]["extras"].as_array().unwrap().len(), 1);
+
+    // The first directory picks the sandbox, so naming only the new one misses it.
+    let err = env.fails(&["codex", "--resume", "../other"]);
+    assert!(err.contains("nothing to resume") && err.contains("sand mount"), "{err}");
+}
+
+#[test]
+fn mount_and_umount_change_a_sandbox_during_a_session() {
+    let env = Env::new();
+    assert!(env.fails(&["mount", "codex", "../other"]).contains("no sandbox named 'codex-proj'"));
+
+    let gate = env.root.join("gate");
+    let mut session: Child = env
+        .command(&["codex"])
+        .env("FAKE_SBX_RUN_WAIT", &gate)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = PathBuf::from(format!("{}.started", gate.display()));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started.exists() {
+        assert!(Instant::now() < deadline, "session never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    env.take_log();
+
+    let other = env.p(&env.other);
+    let out = env.ok(&["mount", "codex", "../other:ro"]);
+    assert!(stderr(&out).contains("running session"), "{}", stderr(&out));
+    assert_eq!(starting(&env.take_log(), "mount"), vec![format!("mount codex-proj {other}:{other}:ro")]);
+    assert_eq!(env.state("codex-proj")["mounts"]["extras"][0]["mode"], "ro");
+
+    // Mounting it again is a no-op; a different mode remounts it.
+    env.ok(&["mount", "codex", "../other:ro"]);
+    assert!(starting(&env.take_log(), "mount").is_empty());
+    env.ok(&["mount", "codex", "../other"]);
+    let log = env.take_log();
+    assert_eq!(starting(&log, "umount"), vec![format!("umount codex-proj {other}")]);
+    assert_eq!(starting(&log, "mount"), vec![format!("mount codex-proj {other}")]);
+
+    assert!(env.fails(&["umount", "codex", "."]).contains("primary workspace"));
+    env.ok(&["umount", "codex", "../other"]);
+    assert_eq!(starting(&env.take_log(), "umount"), vec![format!("umount codex-proj {other}")]);
+    assert!(env.state("codex-proj")["mounts"]["extras"].as_array().unwrap().is_empty());
+    assert!(stderr(&env.ok(&["umount", "codex", "../other"])).contains("is not mounted"));
+
+    fs::write(&gate, "").unwrap();
+    assert!(session.wait().unwrap().success());
+    // The next launch with the original command line sees a sandbox that matches it.
+    env.take_log();
+    env.ok(&["codex"]);
+    assert!(starting(&env.take_log(), "mount").is_empty());
+}
+
+#[test]
 fn no_attach_sets_the_sandbox_up_without_running_the_agent() {
     let env = Env::new();
     let out = env.ok(&["codex", ".", "../other:ro", "--no-attach"]);

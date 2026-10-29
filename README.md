@@ -58,7 +58,7 @@ the same.
 | Flag | Effect |
 | --- | --- |
 | `--mcp a,b` | Expose these MCP servers (names from `sbx mcp ls`). |
-| `--resume` | Attach to the existing sandbox as it is, ignoring mounts on the command line. Fails if there is none. |
+| `--resume` | Attach to the existing sandbox without the "different setup" question: mounts and MCP servers on the command line are added, nothing is removed. Fails if there is none. |
 | `--no-attach` | Create or update the sandbox and start it, then exit without opening the agent. `sand [HARNESS] --resume` attaches later. |
 | `--recreate` | Remove the sandbox and create it again. Conversation history is kept. |
 | `--no-preserve-history` | With `--recreate`: discard the history too. |
@@ -80,8 +80,10 @@ directory) along with whether sbx reports it running and whether a `sand`
 session is attached; it runs nothing inside the sandbox, and `--json` prints the
 same on stdout for scripts. `sand allow [HARNESS] [DIR]` opens the
 network for hosts the sandbox was blocked from reaching (see
-[Blocked network access](#blocked-network-access)). `sand template
-build|save|ls|rm` manages templates.
+[Blocked network access](#blocked-network-access)). `sand mount [HARNESS]
+DIR[:ro|:rw]...` and `sand umount [HARNESS] DIR...` add and remove extra mounts
+of an existing sandbox (see [Adding mounts later](#adding-mounts-later)).
+`sand template build|save|ls|rm` manages templates.
 
 ### When the sandbox already exists
 
@@ -99,12 +101,35 @@ Adding MCP servers is never a conflict; they are attached live with
 `sbx mcp load`. Without a terminal, pass `--on-conflict`. In `--acp` mode,
 `sand` merges.
 
+### Adding mounts later
+
+To add a directory to the sandbox of the current directory, also while an agent
+is running in it:
+
+```console
+$ sand mount ../shared-lib:ro      # the agent sees it right away
+$ sand umount ../shared-lib
+```
+
+The sandbox is picked like for `sand status`: the current directory and the
+default harness, or `sand mount codex ...`, `--name` or `--scratch`. Mounting a
+directory again with another mode remounts it; the primary workspace cannot be
+changed this way.
+
+When starting a session, `--resume` adds mounts without asking. The first
+directory still picks the sandbox, so repeat the primary workspace:
+
+```console
+$ sand claude --resume . ../shared-lib:ro
+```
+
 ### One session per sandbox
 
 `sand` holds an OS file lock for the sandbox while a session runs. A second
 `sand` on the same sandbox, whether in a terminal or from an editor, fails
 immediately and says who holds it. The lock is released if `sand` crashes.
-Sessions started with plain `sbx run` are not detected.
+Sessions started with plain `sbx run` are not detected. `sand mount`,
+`sand umount`, `sand status` and `sand allow` do not take the lock.
 
 ## What sand sets up
 

@@ -16,7 +16,7 @@ use dialoguer::Select;
 
 use crate::acp;
 use crate::args;
-use crate::cli::{ConflictChoice, RunArgs, StatusArgs};
+use crate::cli::{ConflictChoice, MountArgs, RunArgs, StatusArgs};
 use crate::config::{Config, StatuslineKind};
 use crate::harness::{self, Profile};
 use crate::lock;
@@ -681,11 +681,15 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         bail!("a sandbox named '{}' already exists; --dedicated-scratch always creates a new one", req.name);
     }
     if args.resume && !exists {
-        bail!(
-            "nothing to resume: there is no sandbox named '{}'. Run without --resume to create it{}.",
-            req.name,
-            if args.name.is_none() { ", or pass --name to pick another sandbox" } else { "" }
-        );
+        let hint = if args.name.is_some() {
+            ""
+        } else if req.explicit_mounts {
+            ", or pass --name to pick another sandbox. The first directory picks the sandbox; \
+             `sand mount DIR` adds a directory to the current directory's sandbox"
+        } else {
+            ", or pass --name to pick another sandbox"
+        };
+        bail!("nothing to resume: there is no sandbox named '{}'. Run without --resume to create it{hint}.", req.name);
     }
     if args.recreate && exists {
         remove_sandbox(&sbx, dirs, &req.name, !args.no_preserve_history)?;
@@ -724,15 +728,26 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let decision = if !exists {
         Decision::Create
     } else if args.resume {
-        if req.explicit_mounts {
-            log::warn("--resume attaches to the sandbox as it is; the mounts on the command line are ignored");
-        }
         let load_mcp = match &current {
             Some(state) => req.mcp.iter().filter(|m| !state.mcp.contains(m)).cloned().collect(),
             None => req.mcp.clone(),
         };
-        let keep = current.as_ref().map(|s| s.mounts.clone()).unwrap_or_default();
-        Decision::Reuse { plan: mounts::plan(&keep, &keep, Strategy::Merge), load_mcp }
+        // Like MCP servers, mounts on the command line are added to what the sandbox has.
+        // Without any, the current directory is only what picked the sandbox.
+        let plan = match &current {
+            Some(state) if req.explicit_mounts => mounts::plan(&state.mounts, &req.mounts, Strategy::Merge),
+            Some(state) => mounts::plan(&state.mounts, &state.mounts, Strategy::Merge),
+            None => {
+                if req.explicit_mounts {
+                    log::warn(format!(
+                        "'{}' was not created by sand, so its mounts are unknown; the mounts on the command line are ignored",
+                        req.name
+                    ));
+                }
+                Plan::default()
+            }
+        };
+        Decision::Reuse { plan, load_mcp }
     } else {
         match &current {
             Some(state) => reconcile(&req, state, &args)?,
@@ -947,6 +962,54 @@ pub fn status(args: StatusArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let mcp_status = mcp::status(&sbx, &servers);
     let api = runtime::check_api(&sbx, &name, &profile);
     runtime::banner(&name, &profile, &mounts, api, &mcp_status);
+    Ok(0)
+}
+
+/// `sand mount` / `sand umount`: changes the extra mounts of an existing
+/// sandbox in place. It takes no session lock, so it also works while an agent
+/// runs in the sandbox, which sees the change right away.
+pub fn change_mounts(args: MountArgs, add: bool, dirs: &Dirs, config: &Config) -> Result<i32> {
+    let cwd = env::current_dir().context("determining the current directory")?;
+    let (harness, specs) = split_targets(&args.targets, config, &cwd, &dirs.home);
+    let verb = if add { "mount" } else { "unmount" };
+    if specs.is_empty() {
+        bail!("name at least one directory to {verb}");
+    }
+    let sbx = Sbx::connect(true)?;
+    let harness: Vec<String> = harness.into_iter().collect();
+    let (name, _) = find_sandbox(&sbx, &harness, args.name.as_deref(), args.scratch, dirs, config)?;
+    let Some(mut state) = state::load(dirs, &name)? else {
+        bail!("'{name}' was not created by sand, so its mounts are unknown; use `sbx {verb}` on it directly");
+    };
+
+    let plan = if add {
+        let list = MountSet::from_list(specs.iter().map(|s| Mount::parse(s, &cwd, &dirs.home)).collect::<Result<_>>()?);
+        let requested = MountSet { primary: None, extras: list.all().cloned().collect() };
+        mounts::plan(&state.mounts, &requested, Strategy::Merge)
+    } else {
+        let paths: Vec<PathBuf> = specs.iter().map(|s| Mount::resolve_path(s, &cwd, &dirs.home)).collect();
+        mounts::plan_umount(&state.mounts, &paths)?
+    };
+    if plan.is_noop() {
+        for note in &plan.notes {
+            log::warn(note);
+        }
+        log::ok(format!("nothing to {verb} in sandbox '{name}'"));
+        return Ok(0);
+    }
+
+    // The host directories behind saved mounts must exist before sbx starts the sandbox.
+    for mount in &state.internal_mounts {
+        let _ = fs::create_dir_all(&mount.host);
+    }
+    let keep_alive = sbx.keep_alive(&name)?;
+    sbx.wait_ready(&name, READY_TIMEOUT)?;
+    apply_plan(&sbx, dirs, &mut state, plan)?;
+    drop(keep_alive);
+    show_set(&format!("mounts of '{name}'"), &state.mounts);
+    if let Some(holder) = lock::holder(dirs, &name) {
+        log::info(format!("the running session ({holder}) sees the change right away"));
+    }
     Ok(0)
 }
 

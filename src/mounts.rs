@@ -67,6 +67,13 @@ impl Mount {
         Ok(Self { path, mode })
     }
 
+    /// Resolves the path of `path[:ro|:rw]` like [`Mount::parse`], but also when
+    /// it no longer exists (so that a deleted directory can still be unmounted).
+    pub fn resolve_path(spec: &str, cwd: &Path, home: &Path) -> PathBuf {
+        let joined = cwd.join(expand_tilde(split_mode(spec).0, home));
+        dunce::canonicalize(&joined).unwrap_or(joined)
+    }
+
     /// Workspace argument for `sbx create` / `sbx run`.
     pub fn create_arg(&self) -> OsString {
         let mut arg = self.path.clone().into_os_string();
@@ -228,6 +235,26 @@ pub fn plan(current: &MountSet, requested: &MountSet, strategy: Strategy) -> Pla
     plan
 }
 
+/// What has to happen to remove the extra mounts at `paths`. The primary
+/// workspace is baked in at creation time and cannot be removed.
+pub fn plan_umount(current: &MountSet, paths: &[PathBuf]) -> Result<Plan> {
+    let mut plan = Plan { result: current.clone(), ..Plan::default() };
+    for path in paths {
+        if current.primary.as_ref().is_some_and(|p| &p.path == path) {
+            bail!("{} is the primary workspace, which cannot be unmounted", path.display());
+        }
+        match current.extras.iter().find(|m| &m.path == path) {
+            Some(mount) if !plan.umount.contains(mount) => {
+                plan.umount.push(mount.clone());
+                plan.result.extras.retain(|m| &m.path != path);
+            }
+            Some(_) => {}
+            None => plan.notes.push(format!("{} is not mounted", path.display())),
+        }
+    }
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +351,26 @@ mod tests {
         assert!(plan.is_noop());
         assert_eq!(plan.notes.len(), 1);
         assert_eq!(plan.result, current);
+    }
+
+    #[test]
+    fn umount_removes_extras_only() {
+        let current = set("/p", &[("/a", Mode::Ro), ("/b", Mode::Rw)]);
+        let plan = plan_umount(&current, &[PathBuf::from("/a"), PathBuf::from("/a"), PathBuf::from("/c")]).unwrap();
+        assert_eq!(plan.umount, vec![m("/a", Mode::Ro)]);
+        assert!(plan.mount.is_empty());
+        assert_eq!(plan.result, set("/p", &[("/b", Mode::Rw)]));
+        assert_eq!(plan.notes, vec!["/c is not mounted".to_string()]);
+        assert!(plan_umount(&current, &[PathBuf::from("/p")]).is_err());
+        assert!(plan_umount(&current, &[PathBuf::from("/c")]).unwrap().is_noop());
+    }
+
+    #[test]
+    fn resolve_path_works_for_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        assert_eq!(Mount::resolve_path(".:ro", &root, &root), root);
+        assert_eq!(Mount::resolve_path("gone:ro", &root, &root), root.join("gone"));
     }
 
     #[test]
