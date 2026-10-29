@@ -45,6 +45,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Some(Command::Status(args)) => session::status(args, &dirs, &config),
         Some(Command::Describe(args)) => describe::describe(args, &dirs, &config),
         Some(Command::Allow(args)) => policy::allow(args, &dirs, &config),
+        Some(Command::Mount(args)) => session::change_mounts(args, true, &dirs, &config),
+        Some(Command::Umount(args)) => session::change_mounts(args, false, &dirs, &config),
         Some(Command::Template { action }) => {
             // `template ls` reads sand's own records and needs no sbx.
             let sbx = || Sbx::connect(true);
