@@ -804,8 +804,8 @@ mod tests {
         let notes = dunce::canonicalize(&notes).unwrap();
 
         let outcome = worker.answer_mount("~/notes", Some("ro"), Some("the user asked\nfor their notes"));
-        let at = notes.display().to_string();
-        assert_eq!(outcome, Outcome::allowed(format!("mounted {at} (ro) at {at}")));
+        let (shown, at) = (notes.display().to_string(), container_path(&notes.display().to_string()));
+        assert_eq!(outcome, Outcome::allowed(format!("mounted {shown} (ro) at {at}")));
         let question = asked.lock().unwrap()[0].clone();
         assert!(question.contains(&format!("mount a directory of this computer:\n\n{}\n\nread-only", notes.display())));
         assert!(question.contains("The agent says: \u{201c}the user asked for their notes\u{201d}"), "{question}");
@@ -821,7 +821,7 @@ mod tests {
         worker.confirm = Box::new(|q| if q.contains("read-only") { Answer::Allow } else { Answer::Deny });
         assert_eq!(
             worker.answer_mount("~/notes:ro", Some("rw"), None).message,
-            format!("mounted {} (ro) at {}", notes.display(), notes.display())
+            format!("mounted {shown} (ro) at {at}")
         );
         assert!(!worker.answer_mount("~/notes:rw", None, None).allowed);
         worker.confirm = Box::new(|_| Answer::Deny);
