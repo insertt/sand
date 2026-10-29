@@ -64,6 +64,15 @@ impl Env {
             .env_remove("ALL_PROXY")
             .env_remove("all_proxy")
             .env_remove("CODEX_HOME")
+            .env_remove("SAND_CONFIRM")
+            .env("TERM", "xterm-256color")
+            .env_remove("TERM_PROGRAM")
+            .env_remove("TERM_PROGRAM_VERSION")
+            .env_remove("LC_TERMINAL")
+            .env_remove("LC_TERMINAL_VERSION")
+            .env_remove("ITERM_SESSION_ID")
+            .env_remove("KITTY_WINDOW_ID")
+            .env_remove("WT_SESSION")
             .stdin(Stdio::null());
         cmd
     }
@@ -86,12 +95,13 @@ impl Env {
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
-    /// sbx invocations recorded since the last call.
+    /// sbx invocations recorded since the last call, without the approval list
+    /// the network-prompt bridge polls in the background while a session runs.
     fn take_log(&self) -> Vec<String> {
         let path = self.fake.join("log");
         let text = fs::read_to_string(&path).unwrap_or_default();
         let _ = fs::remove_file(&path);
-        text.lines().map(String::from).collect()
+        text.lines().filter(|line| *line != "policy approval ls --json").map(String::from).collect()
     }
 
     fn register_mcp(&self, names: &[&str]) {
@@ -154,7 +164,7 @@ fn first_launch_creates_mounts_and_runs_with_every_step_logged() {
         "Looking for an existing sandbox",
         "Creating sandbox 'codex-proj'",
         "Starting the sandbox",
-        "Mounting sand's status and history directories",
+        "Mounting sand's own directories",
         "Checking agent API and MCP servers",
         "Starting codex (bypass permissions)",
         "Session ended",
@@ -340,6 +350,156 @@ fn mount_and_umount_change_a_sandbox_during_a_session() {
     env.take_log();
     env.ok(&["codex"]);
     assert!(starting(&env.take_log(), "mount").is_empty());
+}
+
+#[test]
+fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
+    let env = Env::new();
+    let approvals = r#"{"approvals": [
+        {"id": "ap-1", "host": "pypi.org:443", "sandbox": "claude-proj", "options": [{"id": "once", "label": "Allow once"}]},
+        {"id": "ap-2", "host": "evil.com", "sandbox": "codex-other", "options": [{"id": "once", "label": "Allow once"}]}
+    ]}"#;
+    fs::write(env.fake.join("approvals.json"), approvals).unwrap();
+    // Stands in for the native dialog: records the question and allows.
+    let asked = env.root.join("asked");
+    let confirm = env.root.join("confirm");
+    fs::write(&confirm, format!("#!/bin/sh\nprintf '%s\\n---\\n' \"$1\" >> '{}'\n", asked.display())).unwrap();
+    fs::set_permissions(&confirm, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let gate = env.root.join("gate");
+    let session: Child = env
+        .command(&["claude"])
+        .env("FAKE_SBX_RUN_WAIT", &gate)
+        .env("SAND_CONFIRM", &confirm)
+        .env("TERM_PROGRAM", "iTerm.app")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wait_for = |path: &Path, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for(&PathBuf::from(format!("{}.started", gate.display())), "session never started");
+
+    let dir = env.sandbox_dir("claude-proj").join("policy");
+    let mount =
+        env.state("claude-proj")["internal_mounts"].as_array().unwrap().iter().any(|m| {
+            m["target"] == "/home/agent/.sand-policy" && m["mode"] == "rw" && m["host"] == env.p(&dir).as_str()
+        });
+    assert!(mount, "{:#?}", env.state("claude-proj"));
+    let staged = env.sandbox_dir("claude-proj").join("runtime/sync/home/.local/share/sand/mods/sand");
+    assert!(staged.join("hooks/register.tsx").is_file() && staged.join(".claude-plugin/plugin.json").is_file());
+
+    // Only this sandbox's approvals are listed for the mod.
+    wait_for(&dir.join("pending.json"), "no pending list");
+    let pending = fs::read_to_string(dir.join("pending.json")).unwrap();
+    assert!(pending.contains("ap-1") && !pending.contains("ap-2"), "{pending}");
+
+    fs::write(dir.join("requests/r1.json"), r#"{"host": "example.com:443"}"#).unwrap();
+    fs::write(dir.join("requests/r2.json"), r#"{"host": "evil.com", "approval": "ap-2", "option": "once"}"#).unwrap();
+    fs::write(dir.join("requests/r3.json"), r#"{"host": "*", "approval": null}"#).unwrap();
+    // A host refused before is blocked by a deny rule: allowing lifts this sandbox's own,
+    // but not one that applies to every sandbox.
+    for (scope, host, id) in [("claude-proj", "refused.com:443", "rule-1"), ("global", "global.com:443", "rule-2")] {
+        fs::create_dir_all(env.fake.join("deny").join(scope)).unwrap();
+        fs::write(env.fake.join("deny").join(scope).join(host), id).unwrap();
+    }
+    fs::write(dir.join("requests/r5.json"), r#"{"host": "refused.com:443"}"#).unwrap();
+    fs::write(dir.join("requests/r6.json"), r#"{"host": "global.com:443"}"#).unwrap();
+    // A mount the agent asked for; relative paths are taken from the primary workspace.
+    fs::write(dir.join("requests/m1.json"), r#"{"kind": "mount", "path": "../other:ro", "reason": "docs"}"#).unwrap();
+    // The host and options of an approval come from sbx, whatever the request says.
+    fs::write(dir.join("requests/r4.json"), r#"{"host": "other.com", "approval": "ap-1", "option": "once"}"#).unwrap();
+    for id in ["r1", "r2", "r3", "r4", "r5", "r6", "m1"] {
+        wait_for(&dir.join(format!("results/{id}.json")), "no result");
+    }
+    let result = |id: &str| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(dir.join(format!("results/{id}.json"))).unwrap()).unwrap()
+    };
+    assert_eq!(result("r1")["allowed"], true, "{}", result("r1"));
+    // Another sandbox's approval is not this sandbox's to answer, and wildcards are refused.
+    assert_eq!(result("r2")["ok"], false, "{}", result("r2"));
+    assert_eq!(result("r3")["ok"], false, "{}", result("r3"));
+    let questions = fs::read_to_string(&asked).unwrap();
+    assert!(questions.contains("Sandbox 'claude-proj' asks for network access to example.com:443"), "{questions}");
+    assert!(questions.contains("network access to pypi.org:443.\n\nAnswer: Allow once"), "{questions}");
+    assert_eq!(questions.matches("---").count(), 5, "{questions}");
+    let other = env.p(&env.other);
+    assert!(
+        questions.contains(&format!("asks to mount a directory of this computer:\n\n{other}\n\nread-only")),
+        "{questions}"
+    );
+    assert_eq!(result("m1")["message"], format!("mounted {other} (ro) at {other}"));
+    assert_eq!(env.state("claude-proj")["mounts"]["extras"][0]["path"], other.as_str());
+    assert_eq!(result("r4")["message"], "pypi.org:443: Allow once");
+    assert!(questions.contains("refused.com:443, which a deny rule blocks"), "{questions}");
+    assert_eq!(result("r5")["allowed"], true, "{}", result("r5"));
+    assert!(!env.fake.join("deny/claude-proj/refused.com:443").exists());
+    assert_eq!(result("r6")["ok"], false, "{}", result("r6"));
+    assert!(
+        result("r6")["message"].as_str().unwrap().contains("sbx policy rm network --id rule-2"),
+        "{}",
+        result("r6")
+    );
+    assert!(env.fake.join("deny/global/global.com:443").exists());
+
+    fs::write(&gate, "").unwrap();
+    let out = session.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let err = stderr(&out);
+    let summary = err.lines().find(|l| l.contains("allowed during the session, for this sandbox:")).unwrap_or_default();
+    for host in ["example.com:443", "refused.com:443", "pypi.org:443"] {
+        assert!(summary.contains(host), "{err}");
+    }
+    assert!(!summary.contains("global.com"), "{err}");
+    assert!(err.contains(&format!("mounted during the session: {other} (ro)")), "{err}");
+    let log = env.take_log();
+    assert!(has(&log, "policy allow network --sandbox claude-proj example.com:443"), "{log:#?}");
+    assert_eq!(starting(&log, "policy approval respond"), vec!["policy approval respond ap-1 --option once"]);
+    let lifted = "policy rm network --sandbox claude-proj --id rule-1 --force";
+    let at = |line: &str| log.iter().position(|l| l == line).unwrap_or_else(|| panic!("{line}: {log:#?}"));
+    assert!(at(lifted) < at("policy allow network --sandbox claude-proj refused.com:443"), "{log:#?}");
+    assert!(!has(&log, "policy allow network --sandbox claude-proj global.com:443"), "{log:#?}");
+    // The agent raises desktop notifications through the host's terminal, so it is told which one that is.
+    assert!(has(&log, "run --name claude-proj -e TERM_PROGRAM=iTerm.app"), "{log:#?}");
+    let record = fs::read_to_string(env.sandbox_dir("claude-proj").join("network-prompts.log")).unwrap();
+    assert_eq!(record.lines().count(), 7, "{record}");
+    assert!(log.contains(&format!("mount claude-proj {other}:{other}:ro")), "{log:#?}");
+
+    // Turned off, the mod and the bridge are gone.
+    env.config("[harness.claude]\nnetwork_prompts = false\n");
+    // The mount the agent asked for is kept, as one `sand mount` adds: resuming keeps it without asking.
+    env.ok(&["claude", "--resume"]);
+    assert!(!staged.exists());
+}
+
+#[test]
+fn extra_mounts_are_working_directories_of_claude_code() {
+    let env = Env::new();
+    env.ok(&["claude", ".", "../other:ro", "--no-attach"]);
+    let staged = env.sandbox_dir("claude-proj").join("runtime/sync/home/.claude/settings.json");
+    let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(&staged).unwrap()).unwrap();
+    assert_eq!(settings["permissions"]["additionalDirectories"], serde_json::json!([env.p(&env.other)]));
+    assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
+}
+
+#[test]
+fn mounts_that_reach_sands_own_data_are_warned_about() {
+    let env = Env::new();
+    fs::create_dir_all(&env.data).unwrap();
+    let data = env.p(&env.data);
+    let err = stderr(&env.ok(&["codex", ".", &format!("{data}:ro")]));
+    assert!(
+        err.contains("contains sand's per-sandbox data") && err.contains("read the history of every sandbox"),
+        "{err}"
+    );
+    let err = stderr(&env.ok(&["mount", "codex", &data]));
+    assert!(err.contains("file network prompts in their name"), "{err}");
+    assert!(!stderr(&env.ok(&["codex", "--resume"])).contains("per-sandbox data"));
 }
 
 #[test]
@@ -734,6 +894,8 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
         settings["env"],
         serde_json::json!({
             "DEBUG": "1",
+            "CLAUDE_CODE_PLUGIN_DIRS": "/home/agent/.local/share/sand/mods/sand",
+            "SAND_POLICY_DIR": "/home/agent/.sand-policy",
             "CLAUDE_CODE_USE_VERTEX": "1",
             "CLAUDE_CODE_SKIP_VERTEX_AUTH": "1",
             "ANTHROPIC_VERTEX_PROJECT_ID": "acme",
@@ -765,7 +927,14 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
     assert!(starting(&log, "secret").is_empty());
     assert_eq!(log.last().unwrap(), "run --name claude-proj");
     let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(&staged).unwrap()).unwrap();
-    assert_eq!(settings["env"], serde_json::json!({"DEBUG": "1"}));
+    assert_eq!(
+        settings["env"],
+        serde_json::json!({
+            "DEBUG": "1",
+            "CLAUDE_CODE_PLUGIN_DIRS": "/home/agent/.local/share/sand/mods/sand",
+            "SAND_POLICY_DIR": "/home/agent/.sand-policy",
+        })
+    );
 }
 
 #[test]

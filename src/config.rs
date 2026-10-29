@@ -158,6 +158,8 @@ pub struct HarnessOverride {
     pub template: Option<String>,
     pub nightly: Option<bool>,
     pub import_skills: Option<bool>,
+    /// Ask in the agent's UI whether to allow hosts the network policy blocked.
+    pub network_prompts: Option<bool>,
     /// How the agent authenticates to its model API (default: sbx).
     pub auth: Option<Auth>,
     /// Settings merged over the overlay when `auth = "vertex"`. In strings,

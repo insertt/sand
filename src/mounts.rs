@@ -50,6 +50,12 @@ pub fn split_mode(spec: &str) -> (&str, Mode) {
     }
 }
 
+/// Whether mounting `path` reaches into `protected`: it is that directory, one
+/// of its ancestors or something inside it.
+pub fn exposes(path: &Path, protected: &Path) -> bool {
+    protected.starts_with(path) || path.starts_with(protected)
+}
+
 impl Mount {
     pub fn rw(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into(), mode: Mode::Rw }
@@ -258,6 +264,19 @@ pub fn plan_umount(current: &MountSet, paths: &[PathBuf]) -> Result<Plan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mounts_reaching_sands_own_directories_are_found() {
+        let data = Path::new("/home/me/.local/share/sand/sandboxes");
+        for path in ["/", "/home/me", "/home/me/.local/share/sand", "/home/me/.local/share/sand/sandboxes/x/history"] {
+            assert!(exposes(Path::new(path), data), "{path}");
+        }
+        for path in
+            ["/home/me/dev/proj", "/home/me/.local/share/sand/scratch", "/home/me/.local/share/sand/sandboxes-old"]
+        {
+            assert!(!exposes(Path::new(path), data), "{path}");
+        }
+    }
 
     fn m(path: &str, mode: Mode) -> Mount {
         Mount { path: PathBuf::from(path), mode }
