@@ -27,6 +27,8 @@ pub enum ApiState {
     Unreachable,
     /// The harness has no API endpoint configured to probe.
     NotConfigured,
+    /// Not probed: in ACP mode nobody reads the banner before the agent starts.
+    Skipped,
 }
 
 /// Interprets the output of `curl -w '\n%{http_code}'` run inside the sandbox.
@@ -147,6 +149,7 @@ pub fn describe_api(api: ApiState, profile: &Profile) -> String {
         }
         ApiState::Unreachable => format!("{} {host} unreachable from the sandbox", mark(false)),
         ApiState::NotConfigured => format!("not checked (set harness.{}.api_check_url to enable)", profile.name),
+        ApiState::Skipped => "not checked in ACP mode".to_string(),
     }
 }
 

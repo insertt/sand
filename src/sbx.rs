@@ -48,6 +48,11 @@ pub fn shell_quote(word: &str) -> String {
     }
 }
 
+/// Sandbox names, one per line, as `sbx ls -q` prints them.
+fn parse_list(out: &str) -> Vec<String> {
+    out.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
 /// Copies lines from one stream to another through `filter`, until either end closes.
 fn pump(mut from: impl BufRead, mut to: impl Write, filter: impl Fn(&str) -> String) {
     let mut line = String::new();
@@ -75,22 +80,38 @@ impl Sbx {
     /// first, so that a missing or expired login is dealt with up front rather
     /// than by whichever sbx call happens to run into it.
     pub fn connect(interactive: bool) -> Result<Self> {
+        Ok(Self::connect_listing(interactive)?.0)
+    }
+
+    /// Like `connect`, also returning the sandboxes the login probe listed
+    /// (`None` when it did not succeed), which saves a second `sbx ls`.
+    pub fn connect_listing(interactive: bool) -> Result<(Self, Option<Vec<String>>)> {
         let sbx = Self::new(interactive);
-        sbx.ensure_signed_in()?;
-        Ok(sbx)
+        let listed = sbx.ensure_signed_in()?;
+        Ok((sbx, listed))
+    }
+
+    /// For a session whose sandbox another sand session has just set up, and
+    /// so signed in for: it skips the login probe.
+    pub fn prepared(interactive: bool) -> Self {
+        Self::new(interactive)
     }
 
     /// Runs `sbx login` when sbx reports that the user is not signed in or that
     /// the login expired. `sbx ls` is the probe: cheap, and it needs a login.
-    /// Any other failure is left to the command that runs into it.
-    fn ensure_signed_in(&self) -> Result<()> {
+    /// Any other failure is left to the command that runs into it. Returns the
+    /// sandboxes `sbx ls` listed when it succeeded.
+    fn ensure_signed_in(&self) -> Result<Option<Vec<String>>> {
         let output = Command::new(&self.bin)
             .args(["ls", "-q"])
             .stdin(Stdio::null())
             .output()
             .map_err(|e| self.spawn_error(e))?;
-        if output.status.success() || !needs_login(&output) {
-            return Ok(());
+        if output.status.success() {
+            return Ok(Some(parse_list(&String::from_utf8_lossy(&output.stdout))));
+        }
+        if !needs_login(&output) {
+            return Ok(None);
         }
         if !self.can_prompt() {
             let mut err = io::stderr().lock();
@@ -104,7 +125,7 @@ impl Sbx {
         if !self.interact(args!["login"])?.success() {
             bail!("`sbx login` failed; sign in with `sbx login` and try again");
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Whether a command may prompt the user: sbx login opens a browser and waits on the terminal.
@@ -245,7 +266,7 @@ impl Sbx {
         let out = self.capture(args!["ls", "-q"])?.ok_or_else(|| {
             anyhow!("`sbx ls` failed; is the sandbox daemon running and are you signed in (`sbx login`)?")
         })?;
-        Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+        Ok(parse_list(&out))
     }
 
     /// What sbx reports a sandbox is doing (running, stopped, …); `None` when

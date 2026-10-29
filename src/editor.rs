@@ -1,4 +1,4 @@
-//! `--install-editor`: registers sand as an ACP agent in an editor's configuration.
+//! `--install-acp`: registers sand as an ACP agent in an editor's or terminal's configuration.
 
 use std::env;
 use std::fs;
@@ -11,14 +11,16 @@ use serde_json::{Map, Value, json};
 
 use crate::log;
 use crate::paths::Dirs;
+use crate::tern;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Editor {
+pub enum AcpClient {
     Zed,
     Jetbrains,
+    Tern,
 }
 
-/// The command an editor runs to start the agent.
+/// The command an editor or terminal runs to start the agent.
 pub struct AgentCommand {
     pub label: String,
     pub program: String,
@@ -112,11 +114,15 @@ pub fn jetbrains_config_with_agent(existing: &str, agent: &AgentCommand) -> Resu
     Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
 }
 
-pub fn install(editor: Editor, dirs: &Dirs, harness: Option<&str>) -> Result<()> {
-    let agent = AgentCommand::for_harness(harness)?;
-    let (path, name) = match editor {
-        Editor::Zed => (zed_settings_path(dirs)?, "Zed"),
-        Editor::Jetbrains => (jetbrains_acp_path(dirs), "JetBrains"),
+pub fn install(client: AcpClient, dirs: &Dirs, harness: Option<&str>) -> Result<()> {
+    let mut agent = AgentCommand::for_harness(harness)?;
+    if client == AcpClient::Tern {
+        agent.label = tern::agent_name(harness);
+    }
+    let (path, name) = match client {
+        AcpClient::Zed => (zed_settings_path(dirs)?, "Zed"),
+        AcpClient::Jetbrains => (jetbrains_acp_path(dirs), "JetBrains"),
+        AcpClient::Tern => (tern::settings_path(dirs)?, "Tern"),
     };
     log::step(format!("Installing ACP agent '{}' for {name}", agent.label));
     log::info(format!("config file: {}", path.display()));
@@ -126,9 +132,11 @@ pub fn install(editor: Editor, dirs: &Dirs, harness: Option<&str>) -> Result<()>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let updated = match editor {
-        Editor::Zed => zed_settings_with_agent(&existing, &agent)?,
-        Editor::Jetbrains => jetbrains_config_with_agent(&existing, &agent)?,
+    let tern_id = tern::agent_id(harness);
+    let updated = match client {
+        AcpClient::Zed => zed_settings_with_agent(&existing, &agent)?,
+        AcpClient::Jetbrains => jetbrains_config_with_agent(&existing, &agent)?,
+        AcpClient::Tern => tern::settings_with_agent(&existing, &tern_id, &agent)?,
     };
     if updated == existing {
         log::ok("already installed; nothing to change");
@@ -137,10 +145,19 @@ pub fn install(editor: Editor, dirs: &Dirs, harness: Option<&str>) -> Result<()>
     backup(&path)?;
     write(&path, &updated)?;
     log::ok(format!("added agent server '{}'", agent.label));
-    match editor {
-        Editor::Zed => log::info(format!("In Zed: open the Agent Panel, click +, and pick '{}'.", agent.label)),
-        Editor::Jetbrains => {
+    match client {
+        AcpClient::Zed => log::info(format!("In Zed: open the Agent Panel, click +, and pick '{}'.", agent.label)),
+        AcpClient::Jetbrains => {
             log::info(format!("In the IDE: open AI Chat, choose the agent selector, and pick '{}'.", agent.label))
+        }
+        AcpClient::Tern => {
+            log::info(format!(
+                "In Tern: pick '{}' in the agent picker, or run `{}` in a Tern pane to open it in Tern's chat.",
+                agent.label,
+                harness.map_or_else(|| "sand".to_string(), |h| format!("sand {h}"))
+            ));
+            log::info(format!("'{tern_id}' uses its own file and terminal tools, so they run inside the sandbox."));
+            return Ok(());
         }
     }
     log::info("The editor starts the agent in the project directory, which becomes the sandbox's primary workspace.");

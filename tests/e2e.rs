@@ -73,6 +73,8 @@ impl Env {
             .env_remove("ITERM_SESSION_ID")
             .env_remove("KITTY_WINDOW_ID")
             .env_remove("WT_SESSION")
+            .env_remove("TERN_ACP")
+            .env("TERN_CONFIG_DIR", self.home.join("tern"))
             .stdin(Stdio::null());
         cmd
     }
@@ -778,6 +780,49 @@ fn acp_mode_keeps_stdout_clean_and_merges_without_asking() {
 }
 
 #[test]
+fn acp_mode_skips_what_it_cannot_ask_about() {
+    let env = Env::new();
+    env.register_mcp(&["gitlab"]);
+    fs::write(env.fake.join("mcp.json"), r#"[{"name": "gitlab", "auth_status": "needs authorization"}]"#).unwrap();
+    env.ok(&["claude", "--mcp", "gitlab"]);
+    env.take_log();
+    env.config("nightly = true\n");
+    let out = env.ok(&["claude", "--acp"]);
+    let (log, err) = (env.take_log(), stderr(&out));
+    assert!(!err.contains("nightly") && !err.contains("Authorizing MCP servers"), "{err}");
+    assert!(!has(&log, "version"), "{log:#?}");
+    // The login probe's listing finds the sandbox; it is not listed again.
+    assert_eq!(log.iter().filter(|l| l.as_str() == "ls -q").count(), 1, "{log:#?}");
+}
+
+#[test]
+fn a_sandbox_handed_over_to_terns_chat_is_attached_without_setup() {
+    let env = Env::new();
+    env.ok(&["claude"]);
+    env.take_log();
+    // What `open_in_tern` holds while Tern's chat runs `sand claude --acp`.
+    let locks = env.data.join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let handoff = fs::File::create(locks.join("claude-proj.handoff")).unwrap();
+    handoff.lock().unwrap();
+
+    let out = env.ok(&["claude", "--acp"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ACP-READY\n");
+    let log = env.take_log();
+    let acp = format!(
+        "exec -i --workdir {} claude-proj bash -lc exec npx -y @agentclientprotocol/claude-agent-acp",
+        env.p(&env.proj)
+    );
+    assert_eq!(log, vec![acp], "only the agent is started");
+    assert!(stderr(&out).contains("has set the sandbox up"), "{}", stderr(&out));
+
+    // Without the handoff the sandbox is set up as usual.
+    drop(handoff);
+    env.ok(&["claude", "--acp"]);
+    assert!(has(&env.take_log(), "apply.sh"));
+}
+
+#[test]
 fn host_configuration_is_copied_without_credentials() {
     let env = Env::new();
     let codex = env.home.join(".codex");
@@ -906,13 +951,24 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
     let err = stderr(&out);
     assert!(err.contains("Registering the Vertex AI access token") && err.contains("refresh 45m"), "{err}");
 
-    // An existing sandbox gets the secret again (the command or hosts may have changed), ACP sessions too.
-    env.ok(&["claude", "--acp"]);
+    // An existing sandbox whose secret is unchanged is not registered again, ACP sessions neither.
+    let out = env.ok(&["claude", "--acp"]);
     let log = env.take_log();
-    assert_eq!(starting(&log, "secret"), vec![secret]);
-    assert!(has(&log, "bash -lc ANTHROPIC_AUTH_TOKEN=sand-vertex-claude-proj exec npx"), "{log:#?}");
+    assert!(starting(&log, "secret").is_empty(), "{log:#?}");
+    assert!(stderr(&out).contains("already registered"), "{}", stderr(&out));
+    assert!(has(&log, "bash -lc ANTHROPIC_AUTH_TOKEN=sand-vertex-claude-proj exec "), "{log:#?}");
+    // The ACP banner is not read before the agent starts, so the API is not probed.
+    assert!(!has(&log, "curl -sS"), "{log:#?}");
+
+    // A changed command or host list is registered again.
+    env.config(
+        "[vertex]\nproject = \"acme\"\nregion = \"us-east5\"\nrefresh = \"30m\"\n\n[harness.claude]\nauth = \"vertex\"\n",
+    );
+    env.ok(&["claude"]);
+    assert_eq!(starting(&env.take_log(), "secret"), vec![secret.replace("45m", "30m")]);
 
     // Without a working token source there is no point in starting the agent.
+    env.config("[vertex]\nproject = \"acme\"\nregion = \"us-east5\"\n\n[harness.claude]\nauth = \"vertex\"\n");
     let out = env.command(&["claude"]).env("FAKE_SBX_SECRET_FAIL", "1").output().unwrap();
     assert!(!out.status.success());
     assert!(
@@ -1121,24 +1177,32 @@ fn open_config_creates_edits_and_validates() {
 }
 
 #[test]
-fn install_editor_writes_the_editor_config() {
+fn install_acp_writes_the_client_config() {
     let env = Env::new();
     let zed = env.home.join(".config/zed/settings.json");
     fs::create_dir_all(zed.parent().unwrap()).unwrap();
     fs::write(&zed, "// zed settings\n{\n  \"theme\": \"One Dark\"\n}\n").unwrap();
 
-    env.ok(&["codex", "--install-editor", "zed"]);
+    env.ok(&["codex", "--install-acp", "zed"]);
     let text = fs::read_to_string(&zed).unwrap();
     assert!(text.contains("// zed settings") && text.contains("\"theme\": \"One Dark\""), "{text}");
     assert!(text.contains("\"sand (codex)\"") && text.contains("\"--acp\""), "{text}");
     assert!(zed.with_file_name("settings.json.sand-backup").exists());
     assert!(env.take_log().is_empty(), "installing an editor never touches sbx");
 
-    env.ok(&["--install-editor", "jetbrains"]);
+    env.ok(&["--install-acp", "jetbrains"]);
     let acp: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(env.home.join(".jetbrains/acp.json")).unwrap()).unwrap();
     assert_eq!(acp["agent_servers"]["sand"]["args"], serde_json::json!(["--acp"]));
     assert!(acp["agent_servers"]["sand"]["command"].as_str().unwrap().ends_with("sand"));
+
+    env.ok(&["claude", "--install-acp", "tern"]);
+    let tern: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.home.join("tern/settings.json")).unwrap()).unwrap();
+    assert_eq!(tern["agents"]["custom"][0]["id"], "sand-claude");
+    assert_eq!(tern["agents"]["custom"][0]["args"], serde_json::json!(["claude", "--acp"]));
+    assert_eq!(tern["agents"]["own_tools"], serde_json::json!(["sand-claude"]));
+    assert!(env.take_log().is_empty(), "installing never touches sbx");
 }
 
 #[test]

@@ -67,7 +67,7 @@ the same.
 | `--name NAME` | Sandbox name. The default is `<harness>-<directory>`. |
 | `--template T` | Create the sandbox from a template (see [Templates](#templates)). |
 | `--acp` | Speak ACP on stdio instead of opening the terminal UI (see [Editors](#editors)). |
-| `--install-editor zed\|jetbrains` | Register `sand [HARNESS] --acp` in the editor, then exit. |
+| `--install-acp zed\|jetbrains\|tern` | Register `sand [HARNESS] --acp` in the editor or terminal, then exit. |
 | `--open-config` | Open the [config file](#configuration) in your editor, then exit. |
 | `--on-conflict replace\|merge\|abort` | Answer the "sandbox exists with a different setup" question up front. |
 | `-v`, `--verbose` | Echo every `sbx` command sand runs and show its output (otherwise shown only when a command fails). Works with the subcommands too. |
@@ -360,8 +360,9 @@ Before a sandbox starts, `sand` checks the servers it uses and runs
 `sbx mcp auth <name>` for each one whose credentials are missing or expired.
 `sbx` refreshes the credential on its own when it can and asks you to sign in
 only when that needs your consent. A server that cannot be authorized is
-reported and the launch continues without it. Without a terminal (and in
-`--acp` mode) nothing is authorized; `sand` names the command to run instead.
+reported and the launch continues without it. Without a terminal nothing is
+authorized and `sand` names the command to run instead; `--acp` mode skips
+the check.
 
 ## Templates
 
@@ -412,15 +413,16 @@ the registry whether a newer build has been published since. If one has, it
 offers to recreate the sandbox from it: history is kept, anything you installed
 in the sandbox by hand is lost. Choosing to keep the sandbox is remembered
 until the next build. `--on-conflict replace` recreates without asking and
-`--on-conflict merge` keeps the sandbox; without a terminal, and in `--acp`
-mode, the sandbox is kept and the log says a newer image exists. `--resume`
-skips the check, and a registry that cannot be reached never blocks a launch.
+`--on-conflict merge` keeps the sandbox; without a terminal the sandbox is
+kept and the log says a newer image exists. `--resume` and `--acp` skip the
+check, and a registry that cannot be reached never blocks a launch.
 
 ## Editors
 
 ```console
-$ sand claude --install-editor zed
-$ sand codex --install-editor jetbrains
+$ sand claude --install-acp zed
+$ sand codex --install-acp jetbrains
+$ sand claude --install-acp tern
 ```
 
 This adds an agent server entry that runs `sand <harness> --acp` (the previous
@@ -434,6 +436,25 @@ both directions.
 
 The first start of a new sandbox takes a while. If the editor times out, run
 `sand <harness>` once in that project from a terminal.
+
+### Tern
+
+`--install-acp tern` adds a custom agent `sand-<harness>` to Tern's
+`settings.json` (`$TERN_CONFIG_DIR` if set) and lists it in `own_tools`, so
+the agent uses its own file and terminal tools, which run inside the sandbox,
+rather than Tern's, which would run on the host.
+
+Run in a Tern pane that opens agent commands as ACP chats (Settings › Agents),
+`sand <harness>` then sets the sandbox up as usual and opens the session in
+Tern's chat (`tern acp sand-<harness>`) instead of the agent's terminal UI.
+Tern starts `sand <harness> --acp` in the current directory, which keeps the
+sandbox's mounts and MCP servers; while the chat is open, the first `sand`
+holds a handoff lock (`locks/<sandbox>.handoff` in sand's data directory), so
+the ACP session skips the setup it has just done and starts the agent right
+away. With `--name`, `--scratch`,
+`--dedicated-scratch`, a primary workspace other than the current directory,
+or agent arguments, the terminal UI opens instead. To always get the terminal
+UI, add the agent's id to `agents.keep_tui` in Tern's settings.
 
 ## Configuration
 

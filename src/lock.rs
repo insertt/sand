@@ -52,11 +52,38 @@ pub fn acquire(dirs: &Dirs, sandbox: &str, description: &str) -> Result<SessionL
 /// Who holds the session lock for `sandbox`, or `None` when no session is running.
 pub fn holder(dirs: &Dirs, sandbox: &str) -> Option<String> {
     let dir = dirs.locks_dir();
-    let file = OpenOptions::new().write(true).open(dir.join(format!("{sandbox}.lock"))).ok()?;
-    match file.try_lock() {
-        Err(TryLockError::WouldBlock) => Some(read_holder(&dir.join(format!("{sandbox}.info")))),
-        _ => None,
-    }
+    is_held(&dir.join(format!("{sandbox}.lock"))).then(|| read_holder(&dir.join(format!("{sandbox}.info"))))
+}
+
+/// Held by a session that set `sandbox` up and handed it to Tern's chat, for
+/// as long as the chat is open. Its own keep-alive keeps the sandbox running
+/// meanwhile, so the `--acp` session Tern starts can skip the setup.
+pub struct Handoff {
+    _file: File,
+}
+
+pub fn hand_over(dirs: &Dirs, sandbox: &str) -> Result<Handoff> {
+    let dir = dirs.locks_dir();
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("{sandbox}.handoff"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock().with_context(|| format!("locking {}", path.display()))?;
+    Ok(Handoff { _file: file })
+}
+
+/// Whether a session that set `sandbox` up is waiting on Tern's chat.
+pub fn handed_over(dirs: &Dirs, sandbox: &str) -> bool {
+    is_held(&dirs.locks_dir().join(format!("{sandbox}.handoff")))
+}
+
+fn is_held(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().write(true).open(path) else { return false };
+    matches!(file.try_lock(), Err(TryLockError::WouldBlock))
 }
 
 fn read_holder(info: &Path) -> String {
@@ -84,5 +111,17 @@ mod tests {
         drop(first);
         assert_eq!(holder(&dirs, "claude-proj"), None);
         acquire(&dirs, "claude-proj", "again").unwrap();
+    }
+
+    #[test]
+    fn handoff_is_seen_only_while_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs =
+            Dirs { home: tmp.path().into(), data: tmp.path().join("data"), config_file: tmp.path().join("c.toml") };
+        assert!(!handed_over(&dirs, "claude-proj"));
+        let handoff = hand_over(&dirs, "claude-proj").unwrap();
+        assert!(handed_over(&dirs, "claude-proj") && !handed_over(&dirs, "codex-proj"));
+        drop(handoff);
+        assert!(!handed_over(&dirs, "claude-proj"));
     }
 }
