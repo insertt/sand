@@ -25,7 +25,7 @@ Examples:
 #[derive(Debug, Parser)]
 #[command(
     name = "sand",
-    version,
+    version = env!("SAND_VERSION"),
     about = "Run AI coding agents in Docker Sandboxes with one command",
     after_help = EXAMPLES,
     args_conflicts_with_subcommands = true
