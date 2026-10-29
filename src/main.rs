@@ -10,6 +10,7 @@ mod lock;
 mod log;
 mod mcp;
 mod mounts;
+mod network;
 mod paths;
 mod policy;
 mod registry;

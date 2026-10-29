@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::config::{Auth, Config, CopyPair, HarnessOverride, SettingsFormat, StatuslineKind};
+use crate::network;
 use crate::paths::RUNTIME_DIR_NAME;
 use crate::sync::deep_merge;
 use crate::vertex::{self, Vertex};
@@ -70,6 +71,9 @@ pub struct Profile {
     /// mounts read-only over the skills directory), so sand runs
     /// `sbx skills import` instead of copying them.
     pub import_skills: bool,
+    /// Ship the `sand` mod, which asks in the agent's UI whether to
+    /// allow hosts the network policy blocked, and answer its requests.
+    pub network_prompts: bool,
     /// Settings that point the agent at Vertex AI, merged over the overlay when
     /// `auth = "vertex"` (placeholders: `{project}`, `{region}`, `{host}`, `{token}`).
     pub vertex_overlay: Option<Value>,
@@ -110,6 +114,7 @@ impl Profile {
             template: None,
             nightly: false,
             import_skills: false,
+            network_prompts: false,
             vertex_overlay: None,
             vertex_token_env: None,
             vertex: None,
@@ -148,6 +153,7 @@ impl Profile {
                 acp_command: strings(&["npx", "-y", "@agentclientprotocol/claude-agent-acp"]),
                 api_check_url: Some("https://api.anthropic.com/v1/models".into()),
                 import_skills: true,
+                network_prompts: true,
                 // Claude Code leaves Google authentication alone and sends the
                 // token placeholder as its bearer token.
                 vertex_overlay: Some(json!({
@@ -243,7 +249,8 @@ impl Profile {
             statusline,
             acp_command,
             nightly,
-            import_skills
+            import_skills,
+            network_prompts
         );
         set_some!(host_config_dir, sandbox_config_dir, api_check_url, template, vertex_token_env);
         if let Some(overlay) = &o.vertex_overlay {
@@ -270,6 +277,9 @@ impl Profile {
         let overrides = config.harness.get(name);
         if let Some(overrides) = overrides {
             profile.apply(overrides)?;
+        }
+        if profile.network_prompts {
+            deep_merge(&mut profile.overlay, network::settings(config.sandbox_home()));
         }
         if overrides.and_then(|o| o.auth) == Some(Auth::Vertex) {
             if profile.vertex_overlay.is_none() && profile.vertex_token_env.is_none() {
@@ -326,6 +336,11 @@ mod tests {
         let claude = Profile::resolve("claude", &config).unwrap();
         assert_eq!(claude.overlay["permissions"]["defaultMode"], "bypassPermissions");
         assert_eq!(claude.overlay["statusLine"]["command"], "sh /home/agent/.sand/statusline.sh");
+        assert_eq!(claude.overlay["env"]["CLAUDE_CODE_PLUGIN_DIRS"], "/home/agent/.local/share/sand/mods/sand");
+        let off: Config = toml::from_str("[harness.claude]\nnetwork_prompts = false").unwrap();
+        let off = Profile::resolve("claude", &off).unwrap();
+        assert!(!off.network_prompts && off.overlay.get("env").is_none());
+        assert!(!Profile::resolve("codex", &config).unwrap().network_prompts);
     }
 
     #[test]
@@ -378,7 +393,7 @@ mod tests {
     #[test]
     fn vertex_auth_is_opt_in_and_wired_through_the_overlay() {
         let plain = Profile::resolve("claude", &Config::default()).unwrap();
-        assert!(plain.vertex.is_none() && plain.overlay.get("env").is_none());
+        assert!(plain.vertex.is_none() && plain.overlay["env"] == crate::network::settings("/home/agent")["env"]);
 
         let config: Config = toml::from_str(
             r#"

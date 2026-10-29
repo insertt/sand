@@ -123,6 +123,20 @@ directory still picks the sandbox, so repeat the primary workspace:
 $ sand claude --resume . ../shared-lib:ro
 ```
 
+In Claude Code you can also just ask the agent: "mount ~/notes read-only", or
+in the command line's syntax, "mount ~/notes:ro" or "mount ../shared-lib:rw".
+The `sand` mod gives it a `request_mount` tool; the request shows up above the
+prompt with **Mount read-write**, **Mount read-only** and **Dismiss**, and
+choosing a mount has `sand` confirm it in a dialog on the host (see
+[Prompts in Claude Code](#prompts-in-claude-code)), naming the resolved
+directory and mode, before it mounts it as `sand mount` would. `~` is your home
+on the host and relative paths start at the primary workspace. The directory
+appears at the same path inside the sandbox, the agent is told once it is
+there, and it stays mounted like one `sand mount` added. On the next
+launch it is also a working directory of Claude Code, as every extra mount is
+(`permissions.additionalDirectories` in the sandbox's settings). sand's own data
+directory is never mounted this way.
+
 ### One session per sandbox
 
 `sand` holds an OS file lock for the sandbox while a session runs. A second
@@ -288,6 +302,52 @@ shows that reason: deny rules take precedence, so an allow may not lift it.
 A host the sandbox reached after it was last blocked is marked "reached
 since" rather than hidden.
 
+### Prompts in Claude Code
+
+For Claude Code, `sand` also ships a small mod, `sand`, into the
+sandbox. When a tool call runs into the network policy, it shows a toast and a
+row above the prompt with the blocked host. When the sandbox daemon published
+an approval for it, the row offers that approval's own options; otherwise it
+offers to allow the host for this sandbox, or to dismiss it. The agent is told
+the host is waiting for your answer, and when it is allowed, that it can retry.
+
+So that a blocked agent is noticed while you are in another window, the mod
+also raises a desktop notification as soon as a host is blocked, such as
+"claude-myproject is blocked from reaching pypi.org. Answer in Claude Code."
+Claude Code sends it the way it sends its own: as the escape sequence your
+terminal turns into a notification (iTerm2, Ghostty, kitty), so it comes from
+the terminal under the permission you already gave it, and follows your Claude
+Code notification setting. Other terminals, like macOS Terminal, ring the bell
+instead. So that the agent can tell which terminal it runs in, `sand` passes
+the host's terminal variables (`TERM_PROGRAM` and the like) into the session,
+and sets `TERM_PROGRAM` from `TERM` for Ghostty and kitty reached over SSH.
+
+Choosing an option in Claude Code only files a request. `sand` answers it on
+the host while the session runs: allowing anything first needs your
+confirmation in a native dialog (`osascript` on macOS, `zenity` or `kdialog`
+on Linux, a message box on Windows), which the agent cannot answer, and only
+then does `sand` run `sbx policy approval respond` or
+`sbx policy allow network --sandbox <name>`. Refusing an approval needs no
+confirmation. Requests for wildcards, lists of hosts or approvals of other
+sandboxes are refused without asking, a burst of retries for a host you just
+declined does not ask again, and every request is recorded in
+`network-prompts.log` in the sandbox's data directory. Where no dialog can be
+shown (a host without a graphical session), the request fails with a pointer
+to `sand allow`.
+
+A host you refused before stays blocked by the deny rule that refusal left,
+which wins over any allow. The mod offers to lift it, the dialog says so, and
+`sand` removes that rule for this sandbox before allowing the host. A deny rule
+that applies to every sandbox is not removed: the request fails with the
+`sbx policy rm` command to remove it yourself.
+
+Requests and answers go through a directory of each sandbox's own, mounted
+read-write at `~/.sand-policy` in that sandbox alone. Since a request names its
+sandbox by where it appears, keep sand's data directory out of your mounts:
+`sand` warns about a mount that contains it. The mod is loaded through
+`CLAUDE_CODE_PLUGIN_DIRS` in the sandbox's Claude Code settings. Set
+`network_prompts = false` under `[harness.claude]` to leave it out.
+
 ## MCP servers
 
 `sbx` owns the MCP registry. Register a server once with `sbx mcp add`, or
@@ -411,8 +471,8 @@ url = "https://mcp.linear.app/mcp"
 All harness keys: `agent`, `host_config_dir`, `sandbox_config_dir`, `copy`,
 `extra_copy`, `exclude`, `settings_files`, `settings_format`, `strip_keys`,
 `overlay`, `history`, `bypass_args`, `statusline`, `acp_command`,
-`api_check_url`, `template`, `nightly`, `import_skills`, `auth`,
-`vertex_overlay`, `vertex_token_env`.
+`api_check_url`, `template`, `nightly`, `import_skills`, `network_prompts`,
+`auth`, `vertex_overlay`, `vertex_token_env`.
 
 State lives in the platform data directory (`~/.local/share/sand`,
 `~/Library/Application Support/sand`, `%LOCALAPPDATA%\sand`), or

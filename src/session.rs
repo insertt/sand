@@ -23,7 +23,8 @@ use crate::lock;
 use crate::log;
 use crate::mcp;
 use crate::mounts::{self, Mode, Mount, MountSet, Plan, Strategy};
-use crate::paths::{Dirs, RUNTIME_DIR_NAME, container_path};
+use crate::network::{self, Bridge};
+use crate::paths::{Dirs, POLICY_DIR_NAME, RUNTIME_DIR_NAME, container_path};
 use crate::registry;
 use crate::runtime::{self, Refresher};
 use crate::sbx::{Sbx, shell_quote};
@@ -498,6 +499,26 @@ fn create_sandbox(sbx: &Sbx, dirs: &Dirs, config: &Config, req: &Request) -> Res
     Ok(state)
 }
 
+/// Warns about mounts that reach sand's per-sandbox directories: through them
+/// the agent could read other sandboxes' history and, read-write, change it and
+/// file network prompts in another sandbox's name.
+fn warn_exposing<'a>(dirs: &Dirs, mounts: impl Iterator<Item = &'a Mount>) {
+    let sandboxes = dirs.sandboxes_dir();
+    for mount in mounts.filter(|m| mounts::exposes(&m.path, &sandboxes)) {
+        let what = match mount.mode {
+            Mode::Ro => "read the history of every sandbox sand manages",
+            Mode::Rw => {
+                "read and change the history of every sandbox sand manages and file network prompts in their name"
+            }
+        };
+        log::warn(format!(
+            "{} contains sand's per-sandbox data ({}): the agent can {what}; mount a narrower directory",
+            mount.path.display(),
+            sandboxes.display()
+        ));
+    }
+}
+
 fn apply_plan(sbx: &Sbx, dirs: &Dirs, state: &mut SandboxState, plan: Plan) -> Result<()> {
     for note in &plan.notes {
         log::warn(note);
@@ -525,8 +546,9 @@ fn apply_plan(sbx: &Sbx, dirs: &Dirs, state: &mut SandboxState, plan: Plan) -> R
     Ok(())
 }
 
-/// Mounts sand's own directories: the runtime dir (status line, staged config)
-/// and, unless the sandbox is disposable, host-backed history directories.
+/// Mounts sand's own directories: the runtime dir (status line, staged config),
+/// the network-prompt bridge and, unless the sandbox is disposable, host-backed
+/// history directories.
 fn ensure_internal_mounts(
     sbx: &Sbx,
     dirs: &Dirs,
@@ -537,6 +559,9 @@ fn ensure_internal_mounts(
     let home = config.sandbox_home();
     let runtime = dirs.runtime_dir(&state.name);
     let mut wanted = vec![(runtime, format!("{home}/{RUNTIME_DIR_NAME}"), Mode::Ro)];
+    if profile.network_prompts {
+        wanted.push((dirs.policy_dir(&state.name), format!("{home}/{POLICY_DIR_NAME}"), Mode::Rw));
+    }
     if state.kind != Kind::Dedicated {
         for rel in &profile.history {
             let host = dirs.history_dir(&state.name).join(rel.replace('/', "_"));
@@ -556,11 +581,17 @@ fn ensure_internal_mounts(
     if missing.is_empty() {
         return Ok(());
     }
-    log::step("Mounting sand's status and history directories");
+    log::step("Mounting sand's own directories");
     let targets = missing.iter().map(|m| shell_quote(&m.target)).collect::<Vec<_>>().join(" ");
     sbx.exec_sh(&state.name, &format!("mkdir -p {targets}"))?;
     for mount in missing {
-        let what = if mount.mode == Mode::Ro { "status" } else { "history" };
+        let what = if mount.target.ends_with(POLICY_DIR_NAME) {
+            "network prompts"
+        } else if mount.mode == Mode::Ro {
+            "status"
+        } else {
+            "history"
+        };
         log::info(format!("{what}: {} → {}", mount.host, mount.target));
         let mut spec = OsString::from(&mount.host);
         spec.push(format!(":{}:{}", mount.target, mount.mode));
@@ -612,7 +643,8 @@ fn sync_config(sbx: &Sbx, dirs: &Dirs, config: &Config, profile: &Profile, name:
             ));
         }
     }
-    let staged = sync::stage(profile, &dirs.home, home, &runtime.join("sync"), settings)?;
+    let generated = if profile.network_prompts { network::mod_files() } else { Vec::new() };
+    let staged = sync::stage(profile, &dirs.home, home, &runtime.join("sync"), settings, &generated)?;
     fs::write(runtime.join("apply.sh"), sync::apply_script(home))?;
     log::info(format!(
         "{} file(s) staged, {} changed since the last launch; credentials are never copied",
@@ -621,6 +653,39 @@ fn sync_config(sbx: &Sbx, dirs: &Dirs, config: &Config, profile: &Profile, name:
     sbx.run(args!["exec", name, "sh", format!("{home}/{RUNTIME_DIR_NAME}/apply.sh")])?;
     log::ok("configuration applied");
     Ok(())
+}
+
+/// Variables by which a terminal makes itself known. The agent picks how to
+/// raise a desktop notification (the escape sequence its terminal turns into
+/// one, under the terminal's own notification permission) by them, and inside
+/// the sandbox it cannot see the host terminal's.
+const TERMINAL_ENV: &[&str] = &[
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "ITERM_SESSION_ID",
+    "KITTY_WINDOW_ID",
+    "WT_SESSION",
+];
+
+/// `NAME=value` for each terminal variable `lookup` finds set. Where only
+/// `TERM` names the terminal (Ghostty or kitty reached over SSH, which forwards
+/// nothing else), `TERM_PROGRAM` is derived from it; `TERM` itself stays the
+/// sandbox's, whose terminfo may not know the host terminal's.
+fn terminal_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let get = |name: &str| lookup(name).filter(|v| !v.is_empty());
+    let mut pairs: Vec<String> =
+        TERMINAL_ENV.iter().filter_map(|name| get(name).map(|v| format!("{name}={v}"))).collect();
+    if get("TERM_PROGRAM").is_none() {
+        let program = match get("TERM").as_deref() {
+            Some("xterm-ghostty") => Some("ghostty"),
+            Some("xterm-kitty") => Some("kitty"),
+            _ => None,
+        };
+        pairs.extend(program.map(|p| format!("TERM_PROGRAM={p}")));
+    }
+    pairs
 }
 
 /// Bypass-permissions flags are part of sbx's default agent command, but a
@@ -647,6 +712,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     }
 
     let mut req = build_request(&args, dirs, config, harness, specs)?;
+    warn_exposing(dirs, req.mounts.all());
     let profile = &req.profile;
     let sbx = Sbx::connect(!args.acp)?;
 
@@ -835,7 +901,12 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         log::ok("MCP servers attached");
     }
 
-    sync_config(&sbx, dirs, config, profile, &state.name)?;
+    // Extra mounts are working directories of Claude Code, so that `@` suggests their files.
+    let mut synced = profile.clone();
+    if let Some(extra) = network::working_directories(&state.mounts).filter(|_| profile.network_prompts) {
+        sync::deep_merge(&mut synced.overlay, extra);
+    }
+    sync_config(&sbx, dirs, config, &synced, &state.name)?;
 
     log::step("Checking agent API and MCP servers");
     let runtime_dir = dirs.runtime_dir(&state.name);
@@ -884,6 +955,9 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         if let Some(pair) = vertex_env(profile, &state.name) {
             cmd.extend(args!["-e", pair]);
         }
+        for pair in terminal_env(|name| env::var(name).ok()) {
+            cmd.extend(args!["-e", pair]);
+        }
         let extra = agent_args(profile, &args.agent_args);
         if !extra.is_empty() {
             if profile.bypass_args.is_empty() && !args.agent_args[0].starts_with('-') {
@@ -898,6 +972,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     };
 
     let refresher = (!args.acp).then(|| Refresher::start(sbx.clone(), runtime_dir, state.mcp.clone())).flatten();
+    let bridge = profile.network_prompts.then(|| Bridge::start(sbx.clone(), dirs.clone(), state.name.clone()));
     IN_SESSION.store(true, Ordering::SeqCst);
     let status = match acp::PathMap::new(&state.mounts).filter(|_| args.acp) {
         Some(paths) => {
@@ -908,8 +983,15 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     };
     IN_SESSION.store(false, Ordering::SeqCst);
     drop(refresher);
+    let summary = bridge.map(Bridge::finish).unwrap_or_default();
     drop(keep_alive);
     let status = status?;
+    if !summary.allowed.is_empty() {
+        log::info(format!("allowed during the session, for this sandbox: {}", summary.allowed.join(", ")));
+    }
+    if !summary.mounted.is_empty() {
+        log::info(format!("mounted during the session: {}", summary.mounted.join(", ")));
+    }
 
     log::step(format!("Session ended ({status})"));
     if disposal.is_some() {
@@ -965,6 +1047,33 @@ pub fn status(args: StatusArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     Ok(0)
 }
 
+/// Adds `mount` to a sandbox while its session runs, as `sand mount` does but
+/// without a word on the terminal, which the agent owns. Answers whether
+/// anything changed.
+pub fn mount_in_session(sbx: &Sbx, dirs: &Dirs, name: &str, mount: &Mount) -> Result<bool> {
+    let Some(mut state) = state::load(dirs, name)? else {
+        bail!("'{name}' was not created by sand, so its mounts are unknown");
+    };
+    let requested = MountSet { primary: None, extras: vec![mount.clone()] };
+    let plan = mounts::plan(&state.mounts, &requested, Strategy::Merge);
+    if plan.is_noop() {
+        // A note here is a change that cannot be made in place, such as the primary workspace's mode.
+        if let Some(note) = plan.notes.first() {
+            bail!("{note}");
+        }
+        return Ok(false);
+    }
+    for old in &plan.umount {
+        sbx.run_quiet(args!["umount", name, old.umount_spec()])?;
+    }
+    for new in &plan.mount {
+        sbx.run_quiet(args!["mount", name, new.mount_spec()])?;
+    }
+    state.mounts = plan.result;
+    state::save(dirs, &state)?;
+    Ok(true)
+}
+
 /// `sand mount` / `sand umount`: changes the extra mounts of an existing
 /// sandbox in place. It takes no session lock, so it also works while an agent
 /// runs in the sandbox, which sees the change right away.
@@ -985,6 +1094,7 @@ pub fn change_mounts(args: MountArgs, add: bool, dirs: &Dirs, config: &Config) -
     let plan = if add {
         let list = MountSet::from_list(specs.iter().map(|s| Mount::parse(s, &cwd, &dirs.home)).collect::<Result<_>>()?);
         let requested = MountSet { primary: None, extras: list.all().cloned().collect() };
+        warn_exposing(dirs, requested.all());
         mounts::plan(&state.mounts, &requested, Strategy::Merge)
     } else {
         let paths: Vec<PathBuf> = specs.iter().map(|s| Mount::resolve_path(s, &cwd, &dirs.home)).collect();
@@ -1048,6 +1158,23 @@ mod tests {
         for bad in ["a", "-ab", "a b", "a/b", "default", ""] {
             assert!(validate_name(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_host_terminal_is_made_known_to_the_agent() {
+        let host = |name: &str| match name {
+            "TERM_PROGRAM" => Some("ghostty".to_string()),
+            "KITTY_WINDOW_ID" => Some(String::new()),
+            "HOME" => Some("/Users/me".to_string()),
+            _ => None,
+        };
+        assert_eq!(terminal_env(host), vec!["TERM_PROGRAM=ghostty"]);
+        let over_ssh = |name: &str| (name == "TERM").then(|| "xterm-ghostty".to_string());
+        assert_eq!(terminal_env(over_ssh), vec!["TERM_PROGRAM=ghostty"]);
+        let kitty = |name: &str| (name == "TERM").then(|| "xterm-kitty".to_string());
+        assert_eq!(terminal_env(kitty), vec!["TERM_PROGRAM=kitty"]);
+        let plain = |name: &str| (name == "TERM").then(|| "xterm-256color".to_string());
+        assert!(terminal_env(plain).is_empty());
     }
 
     #[test]

@@ -1,0 +1,6 @@
+{
+  "name": "sand",
+  "version": "0.1.0",
+  "description": "Asks whether to allow hosts the sandbox network policy blocked; sand confirms on the host",
+  "types": "./types/index.d.ts"
+}

@@ -66,6 +66,11 @@ impl Sbx {
         Self { bin, interactive }
     }
 
+    #[cfg(test)]
+    pub fn with_bin(bin: &str) -> Self {
+        Self { bin: OsString::from(bin), interactive: false }
+    }
+
     /// The wrapper every command starts from: it makes sure sbx is signed in
     /// first, so that a missing or expired login is dealt with up front rather
     /// than by whichever sbx call happens to run into it.
@@ -183,6 +188,23 @@ impl Sbx {
         let output =
             self.command(&args).stdin(Stdio::null()).stderr(Stdio::null()).output().map_err(|e| self.spawn_error(e))?;
         Ok(output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
+    }
+
+    /// Runs a command without a word on the terminal and hands back what it printed.
+    pub fn output(&self, args: Vec<OsString>) -> Result<Output> {
+        self.command(&args).stdin(Stdio::null()).output().map_err(|e| self.spawn_error(e))
+    }
+
+    /// Runs a command without a word on the terminal; a failure carries the
+    /// last line sbx printed.
+    pub fn run_quiet(&self, args: Vec<OsString>) -> Result<()> {
+        let out = self.output(args.clone())?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&out.stderr);
+        let text = if text.trim().is_empty() { String::from_utf8_lossy(&out.stdout) } else { text };
+        bail!("{}", text.trim().lines().last().unwrap_or(&format!("`sbx {}` failed", display(&args))))
     }
 
     /// Runs a command with the terminal (or ACP stream) fully attached.

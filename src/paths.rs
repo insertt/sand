@@ -9,6 +9,8 @@ use anyhow::{Context, Result, anyhow};
 pub const DEFAULT_SANDBOX_HOME: &str = "/home/agent";
 /// Where the per-sandbox runtime directory is mounted (read-only) inside the sandbox.
 pub const RUNTIME_DIR_NAME: &str = ".sand";
+/// Where the per-sandbox network-prompt bridge is mounted (read-write) inside the sandbox.
+pub const POLICY_DIR_NAME: &str = ".sand-policy";
 
 #[derive(Clone, Debug)]
 pub struct Dirs {
@@ -40,7 +42,7 @@ impl Dirs {
     }
 
     pub fn sandbox_dir(&self, name: &str) -> PathBuf {
-        self.data.join("sandboxes").join(name)
+        self.sandboxes_dir().join(name)
     }
 
     pub fn state_file(&self, name: &str) -> PathBuf {
@@ -54,6 +56,17 @@ impl Dirs {
 
     pub fn history_dir(&self, name: &str) -> PathBuf {
         self.sandbox_dir(name).join("history")
+    }
+
+    /// Host directory mounted read-write at `~/.sand-policy` inside the sandbox:
+    /// the network prompts the sandbox files and what sand answers.
+    pub fn policy_dir(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("policy")
+    }
+
+    /// Where sand keeps the per-sandbox directories of every sandbox.
+    pub fn sandboxes_dir(&self) -> PathBuf {
+        self.data.join("sandboxes")
     }
 
     pub fn locks_dir(&self) -> PathBuf {

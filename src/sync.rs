@@ -288,13 +288,15 @@ pub struct SettingsFile {
 }
 
 /// Builds `<sync_dir>/home` (a mirror of what goes into the sandbox home) and
-/// `<sync_dir>/manifest` from the host configuration.
+/// `<sync_dir>/manifest` from the host configuration, the merged settings and
+/// `generated` files (paths relative to the sandbox home, and their content).
 pub fn stage(
     profile: &Profile,
     host_home: &Path,
     sandbox_home: &str,
     sync_dir: &Path,
     settings: Option<SettingsFile>,
+    generated: &[(String, &str)],
 ) -> Result<Staged> {
     let home_out = sync_dir.join("home");
     fs::create_dir_all(&home_out).with_context(|| format!("creating {}", home_out.display()))?;
@@ -313,16 +315,21 @@ pub fn stage(
     for pair in &profile.extra_copy {
         stager.copy(&expand_tilde(&pair.from, host_home), pair.to.trim_matches('/'), 0)?;
     }
-    if let Some(settings) = settings {
-        let dst = home_out.join(&settings.rel);
+    let settings = settings.map(|s| (s.rel, s.content));
+    for (rel, content) in settings
+        .iter()
+        .map(|(rel, content)| (rel, content.as_str()))
+        .chain(generated.iter().map(|(rel, content)| (rel, *content)))
+    {
+        let dst = home_out.join(rel);
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
-        if fs::read_to_string(&dst).ok().as_deref() != Some(settings.content.as_str()) {
-            fs::write(&dst, &settings.content).with_context(|| format!("writing {}", dst.display()))?;
+        if fs::read_to_string(&dst).ok().as_deref() != Some(content) {
+            fs::write(&dst, content).with_context(|| format!("writing {}", dst.display()))?;
             stager.copied += 1;
         }
-        stager.manifest.insert(settings.rel);
+        stager.manifest.insert(rel.clone());
     }
 
     let Stager { manifest, copied, .. } = stager;
@@ -473,7 +480,9 @@ mod tests {
         assert_eq!(merged.withheld_env, vec!["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]);
         assert!(!merged.content.contains("sk-secret") && !merged.content.contains("ghp"));
         let value: Value = serde_json::from_str(&merged.content).unwrap();
-        assert_eq!(value["env"], json!({"ANTHROPIC_BASE_URL": "https://proxy", "DEBUG": "1"}));
+        assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "https://proxy");
+        assert_eq!(value["env"]["DEBUG"], "1");
+        assert!(value["env"].get("ANTHROPIC_API_KEY").is_none() && value["env"].get("GITHUB_TOKEN").is_none());
     }
 
     #[test]
@@ -527,9 +536,11 @@ mod tests {
             content: "{\"merged\":true}\n".into(),
             withheld_env: vec![],
         };
-        let staged = stage(&p, &home, "/home/agent", &sync, Some(settings)).unwrap();
-        assert_eq!(staged.total, 4);
-        assert_eq!(staged.updated, 4);
+        let generated = [(".local/share/sand/mods/m/plugin.json".to_string(), "{}")];
+        let staged = stage(&p, &home, "/home/agent", &sync, Some(settings), &generated).unwrap();
+        assert_eq!(staged.total, 5);
+        assert_eq!(staged.updated, 5);
+        assert_eq!(fs::read_to_string(sync.join("home/.local/share/sand/mods/m/plugin.json")).unwrap(), "{}");
 
         let out = sync.join("home/.claude");
         assert_eq!(fs::read_to_string(out.join("CLAUDE.md")).unwrap(), "be nice");
@@ -545,19 +556,22 @@ mod tests {
         let manifest = fs::read_to_string(sync.join("manifest")).unwrap();
         assert_eq!(
             manifest,
-            ".claude/CLAUDE.md\n.claude/commands/review/go.md\n.claude/plugins/installed_plugins.json\n.claude/settings.json\n"
+            ".claude/CLAUDE.md\n.claude/commands/review/go.md\n.claude/plugins/installed_plugins.json\n.claude/settings.json\n\
+             .local/share/sand/mods/m/plugin.json\n"
         );
 
-        // A second run copies nothing new and drops files that vanished on the host.
+        // A second run copies nothing new and drops files that vanished on the
+        // host, and generated files that are no longer asked for.
         fs::remove_dir_all(cfg.join("commands")).unwrap();
         let settings = SettingsFile {
             rel: ".claude/settings.json".into(),
             content: "{\"merged\":true}\n".into(),
             withheld_env: vec![],
         };
-        let staged = stage(&p, &home, "/home/agent", &sync, Some(settings)).unwrap();
+        let staged = stage(&p, &home, "/home/agent", &sync, Some(settings), &[]).unwrap();
         assert_eq!((staged.total, staged.updated), (3, 0));
         assert!(!out.join("commands").exists());
+        assert!(!sync.join("home/.local/share/sand/mods").exists());
     }
 
     #[test]

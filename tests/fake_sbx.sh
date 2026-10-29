@@ -118,7 +118,48 @@ case "$cmd" in
   policy)
     case "${1:-}" in
       log) cat "$root/policy.json" 2>/dev/null || echo '{}' ;;
-      allow) [ -z "${FAKE_SBX_ALLOW_FAIL:-}" ] || { echo "fake sbx: allow refused" >&2; exit 1; } ;;
+      allow)
+        [ -z "${FAKE_SBX_ALLOW_FAIL:-}" ] || { echo "fake sbx: allow refused" >&2; exit 1; }
+        # Deny rules are files $root/deny/<scope>/<host> holding the rule id; an
+        # allow beside a deny of the same scope is refused, as sbx does.
+        if [ "${3:-}" = "--sandbox" ] && [ -f "$root/deny/$4/$5" ]; then
+          echo "error: allow network rule: allow: \"$5\" conflicts with existing deny rule \"$(cat "$root/deny/$4/$5")\"" >&2
+          exit 1
+        fi
+        ;;
+      check)
+        # check network --sandbox NAME HOST
+        for scope in "$4" global; do
+          if [ -f "$root/deny/$scope/$5" ]; then
+            printf 'Denied: %s\nContext: sandbox:%s\nReason: denied by local rule rule "local:%s"\n' "$5" "$4" "$(cat "$root/deny/$scope/$5")"
+            exit 0
+          fi
+        done
+        printf 'Denied: %s\nReason: no matching allow rule - blocked by default deny policy\n' "$5"
+        ;;
+      rm)
+        # rm network [--sandbox NAME] --id ID --force
+        scope=global; id=""
+        shift 2
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --sandbox) scope="$2"; shift ;;
+            --id) id="$2"; shift ;;
+          esac
+          shift
+        done
+        for rule in "$root/deny/$scope"/*; do
+          [ -f "$rule" ] && [ "$(cat "$rule")" = "$id" ] && rm -f "$rule" && exit 0
+        done
+        echo "error: no rule $id in scope $scope" >&2
+        exit 1
+        ;;
+      approval)
+        case "${2:-}" in
+          ls) [ -f "$root/approvals.json" ] && cat "$root/approvals.json" && exit 0; exit 1 ;;
+          respond) ;;
+        esac
+        ;;
     esac
     ;;
   skills)
