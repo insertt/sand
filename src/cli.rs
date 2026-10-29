@@ -2,7 +2,7 @@
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::editor::Editor;
+use crate::editor::AcpClient;
 
 const EXAMPLES: &str = "\
 Examples:
@@ -17,7 +17,8 @@ Examples:
   sand codex --no-attach                     set the sandbox up without opening the agent
   sand codex --scratch                       shared scratch space, no project
   sand --acp                                 ACP agent on stdio (for editors)
-  sand codex --install-editor zed            register `sand codex --acp` in Zed
+  sand codex --install-acp zed               register `sand codex --acp` in Zed
+  sand claude --install-acp tern             register `sand claude --acp` in Tern
   sand --open-config                         edit sand's config file
   sand claude -- --continue                  pass arguments to the agent";
 
@@ -131,9 +132,9 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Register sand as an ACP agent in an editor, then exit
-    #[arg(long, value_enum, value_name = "EDITOR")]
-    pub install_editor: Option<Editor>,
+    /// Register sand as an ACP agent in an editor or terminal, then exit
+    #[arg(long, value_enum, value_name = "CLIENT")]
+    pub install_acp: Option<AcpClient>,
 
     /// Open the config file in $VISUAL or $EDITOR (created if missing), then exit
     #[arg(long)]
@@ -256,8 +257,9 @@ mod tests {
         assert_eq!(a.mcp, ["atlassian", "gitlab"]);
         assert_eq!(a.name.as_deref(), Some("x"));
         assert!(run(&["--acp"]).acp && run(&["--acp"]).targets.is_empty());
-        assert_eq!(run(&["codex", "--install-editor", "zed"]).install_editor, Some(Editor::Zed));
-        assert_eq!(run(&["--install-editor", "jetbrains"]).install_editor, Some(Editor::Jetbrains));
+        assert_eq!(run(&["codex", "--install-acp", "zed"]).install_acp, Some(AcpClient::Zed));
+        assert_eq!(run(&["--install-acp", "jetbrains"]).install_acp, Some(AcpClient::Jetbrains));
+        assert_eq!(run(&["claude", "--install-acp", "tern"]).install_acp, Some(AcpClient::Tern));
         assert!(run(&["--open-config"]).open_config && !run(&["codex"]).open_config);
     }
 
@@ -274,7 +276,8 @@ mod tests {
             &["codex", "--resume", "--recreate"],
             &["codex", "--scratch", "--dedicated-scratch"],
             &["codex", "--no-preserve-history"],
-            &["codex", "--install-editor", "vim"],
+            &["codex", "--install-acp", "vim"],
+            &["codex", "--install-editor", "zed"],
             &["codex", "--resume", "--dedicated-scratch"],
             &["codex", "--no-attach", "--acp"],
             &["codex", "--no-attach", "--dedicated-scratch"],

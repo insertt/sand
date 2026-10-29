@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -26,8 +27,8 @@ use crate::mounts::{self, Mode, Mount, MountSet, Plan, Strategy};
 use crate::network::{self, Bridge};
 use crate::paths::{Dirs, POLICY_DIR_NAME, RUNTIME_DIR_NAME, container_path};
 use crate::registry;
-use crate::runtime::{self, Refresher};
-use crate::sbx::{Sbx, shell_quote};
+use crate::runtime::{self, ApiState, Refresher};
+use crate::sbx::{KeepAlive, Sbx, shell_quote};
 use crate::state::{self, InternalMount, Kind, SandboxState};
 use crate::sync;
 use crate::template;
@@ -406,8 +407,21 @@ pub fn dispose() {
 /// Registers the Vertex AI access token as a custom secret of the sandbox. sbx
 /// runs the token command on the host and keeps the token fresh; the sandbox
 /// only ever holds the placeholder.
-fn register_vertex_secret(sbx: &Sbx, profile: &Profile, name: &str) -> Result<()> {
-    let Some(vertex) = &profile.vertex else { return Ok(()) };
+/// Registers the token secret unless `registered` shows sbx already has this
+/// one; returns what to record as registered.
+fn register_vertex_secret(
+    sbx: &Sbx,
+    profile: &Profile,
+    name: &str,
+    registered: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(vertex) = &profile.vertex else { return Ok(None) };
+    let args = vertex.secret_args(name, profile.vertex_token_env.as_deref());
+    let fingerprint = args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
+    if registered == Some(fingerprint.as_str()) {
+        log::ok("Vertex AI access token already registered with sbx");
+        return Ok(Some(fingerprint));
+    }
     log::step("Registering the Vertex AI access token with sbx");
     log::info(format!("project {}, region {}", vertex.project, vertex.region));
     log::info(format!(
@@ -416,7 +430,7 @@ fn register_vertex_secret(sbx: &Sbx, profile: &Profile, name: &str) -> Result<()
         vertex.refresh,
         vertex.hosts.join(", ")
     ));
-    sbx.run(vertex.secret_args(name, profile.vertex_token_env.as_deref())).with_context(|| {
+    sbx.run(args).with_context(|| {
         format!(
             "registering the token secret (does `{}` print a token on the host? \
              `sbx secret set-custom --show-error` shows why sbx rejected it)",
@@ -424,7 +438,7 @@ fn register_vertex_secret(sbx: &Sbx, profile: &Profile, name: &str) -> Result<()
         )
     })?;
     log::ok("the sandbox proxy adds the token to Vertex AI requests; it never enters the sandbox");
-    Ok(())
+    Ok(Some(fingerprint))
 }
 
 /// `NAME=placeholder` for the agent's environment when the token is read from one.
@@ -492,6 +506,7 @@ fn create_sandbox(sbx: &Sbx, dirs: &Dirs, config: &Config, req: &Request) -> Res
         image_digest,
         declined_digest: None,
         internal_mounts: Vec::new(),
+        vertex_secret: None,
         created_at: state::now(),
     };
     state::save(dirs, &state)?;
@@ -688,6 +703,88 @@ fn terminal_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
     pairs
 }
 
+struct TernHandoff {
+    /// Tern's executable.
+    tern: String,
+    /// The id of the custom agent running `sand <harness> --acp`.
+    agent: String,
+}
+
+/// In a Tern pane that opens agent CLIs as ACP chats, with sand registered
+/// there (`--install-acp tern`), the session opens in Tern's chat instead of
+/// the agent's terminal UI. Tern starts `sand <harness> --acp` in the current
+/// directory, so only a session that picks the same sandbox is handed over.
+/// Questions are asked and changes the command line asks for are made here
+/// first; the ACP session keeps the sandbox's mounts and MCP servers.
+fn tern_handoff(args: &RunArgs, req: &Request, dirs: &Dirs, config: &Config, cwd: &Path) -> Option<TernHandoff> {
+    let tern = crate::tern::acp_executable(|name| env::var(name).ok())?;
+    if args.acp || args.no_attach || req.profile.acp_command.is_empty() {
+        return None;
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return None;
+    }
+    let settings = crate::tern::settings_path(dirs).ok().and_then(|p| fs::read_to_string(p).ok()).unwrap_or_default();
+    let default_harness = req.profile.name == config.default_harness();
+    let Some(agent) = crate::tern::find_agent(&settings, &req.profile.name, default_harness) else {
+        if !crate::tern::has_sand_agent(&settings) {
+            log::info(format!(
+                "in Tern, `sand {} --install-acp tern` opens sessions in Tern's chat instead",
+                req.profile.name
+            ));
+        }
+        return None;
+    };
+
+    let here = Mount::parse(".", cwd, &dirs.home).ok().map(|m| m.path);
+    let reason = if req.kind != Kind::Project {
+        Some("a scratch sandbox")
+    } else if args.name.is_some() {
+        Some("--name")
+    } else if req.mounts.primary.as_ref().map(|m| &m.path) != here.as_ref() {
+        Some("a primary workspace other than this directory")
+    } else if !args.agent_args.is_empty() {
+        Some("agent arguments")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        log::info(format!(
+            "opening the terminal UI: Tern's chat (agent '{agent}') starts in this directory and cannot take {reason}"
+        ));
+        return None;
+    }
+    Some(TernHandoff { tern, agent })
+}
+
+/// Runs `tern acp <agent>`, which opens the chat in this pane and starts
+/// `sand <harness> --acp`; that session takes the lock itself. Called once the
+/// sandbox is fully set up, which keeps it running until the chat ends; the
+/// handoff lock held meanwhile tells the ACP session to skip the setup.
+fn open_in_tern(
+    handoff: TernHandoff,
+    dirs: &Dirs,
+    profile: &Profile,
+    state: &SandboxState,
+    lock: lock::SessionLock,
+    keep_alive: KeepAlive,
+) -> Result<i32> {
+    let TernHandoff { tern, agent } = handoff;
+    // Taken before the session lock is let go, so that the ACP session sees it.
+    let handed_over = lock::hand_over(dirs, &state.name)?;
+    drop(lock);
+    log::step(format!("Opening {} in Tern's chat (agent '{agent}')", profile.name));
+    log::command(format!("{tern} acp {agent}"));
+    IN_SESSION.store(true, Ordering::SeqCst);
+    let status = std::process::Command::new(&tern).args(["acp", &agent]).status();
+    IN_SESSION.store(false, Ordering::SeqCst);
+    drop(handed_over);
+    drop(keep_alive);
+    let status = status.with_context(|| format!("starting {tern}"))?;
+    log::step(format!("Session ended ({status})"));
+    Ok(status.code().unwrap_or(1))
+}
+
 /// Bypass-permissions flags are part of sbx's default agent command, but a
 /// bare first argument replaces those defaults, so they are put back.
 fn agent_args(profile: &Profile, user: &[String]) -> Vec<String> {
@@ -706,16 +803,32 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let cwd = env::current_dir().context("determining the current directory")?;
     let (harness, specs) = split_targets(&args.targets, config, &cwd, &dirs.home);
 
-    if let Some(editor) = args.install_editor {
-        crate::editor::install(editor, dirs, harness.as_deref())?;
+    if let Some(client) = args.install_acp {
+        crate::editor::install(client, dirs, harness.as_deref())?;
         return Ok(0);
     }
 
     let mut req = build_request(&args, dirs, config, harness, specs)?;
     warn_exposing(dirs, req.mounts.all());
+    let handoff = tern_handoff(&args, &req, dirs, config, &cwd);
     let profile = &req.profile;
-    let sbx = Sbx::connect(!args.acp)?;
 
+    // Before sbx lists the sandboxes, so that what it lists stays true.
+    let description = match &req.mounts.primary {
+        Some(primary) => format!("{} on {}", profile.name, primary.path.display()),
+        None => format!("{} scratch session", profile.name),
+    };
+    let lock = lock::acquire(dirs, &req.name, &description)?;
+
+    // Tern's chat, opened by a session that has just set this sandbox up.
+    if args.acp
+        && lock::handed_over(dirs, &req.name)
+        && let Some(state) = state::load(dirs, &req.name)?
+    {
+        return attach_prepared(&args, dirs, profile, &state, lock);
+    }
+
+    let (sbx, listed) = Sbx::connect_listing(!args.acp)?;
     log::step(format!("sand: {} in sandbox '{}'", profile.name, req.name));
     if profile.is_basic() {
         log::info(format!(
@@ -723,18 +836,18 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
             profile.name
         ));
     }
-    log::info(format!("using {}", sbx.version()?));
-
-    let description = match &req.mounts.primary {
-        Some(primary) => format!("{} on {}", profile.name, primary.path.display()),
-        None => format!("{} scratch session", profile.name),
-    };
-    let _lock = lock::acquire(dirs, &req.name, &description)?;
+    // In ACP mode nobody reads it before the agent starts.
+    if !args.acp {
+        log::info(format!("using {}", sbx.version()?));
+    }
     log::ok("session lock acquired");
 
     // --- find out what exists -------------------------------------------------
     log::step("Looking for an existing sandbox");
-    let mut exists = sbx.exists(&req.name)?;
+    let mut exists = match listed {
+        Some(names) => names.contains(&req.name),
+        None => sbx.exists(&req.name)?,
+    };
     let mut current = state::load(dirs, &req.name)?;
     if !exists && current.is_some() {
         log::info("sand has a record of this sandbox but sbx does not; it was removed outside sand (history is kept)");
@@ -765,7 +878,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         state::forget(dirs, &req.name, false)?;
     }
 
-    if let (true, false, Some(state)) = (exists, args.resume, current.as_mut()) {
+    // ACP mode cannot ask about a newer image, so it does not look for one.
+    if let (true, false, false, Some(state)) = (exists, args.resume, args.acp, current.as_mut()) {
         match nightly_update(&req, dirs, state, &args)? {
             ConflictChoice::Merge => {}
             ConflictChoice::Replace => {
@@ -827,8 +941,11 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         Decision::Create => req.mcp.clone(),
         Decision::Reuse { load_mcp, .. } => current.iter().flat_map(|s| &s.mcp).chain(load_mcp).cloned().collect(),
     };
-    let can_prompt = !args.acp && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    mcp::ensure_authorized(&sbx, &used_mcp, can_prompt)?;
+    // ACP mode has no terminal to authorize on.
+    if !args.acp {
+        let can_prompt = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        mcp::ensure_authorized(&sbx, &used_mcp, can_prompt)?;
+    }
 
     let mut disposal = None;
     let (mut state, plan, load_mcp) = match decision {
@@ -844,14 +961,15 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
                 disposal = Some(DisposeGuard::arm(&sbx, dirs, &req.name));
             }
             // Before the sandbox exists, so that sbx sets the token variable in it.
-            register_vertex_secret(&sbx, profile, &req.name)?;
-            let state = create_sandbox(&sbx, dirs, config, &req)?;
+            let secret = register_vertex_secret(&sbx, profile, &req.name, None)?;
+            let mut state = create_sandbox(&sbx, dirs, config, &req)?;
+            state.vertex_secret = secret;
             // Extra mounts of a mountless sandbox still have to be attached.
             let pending = mounts::plan(&state.mounts, &req.mounts, Strategy::Merge);
             (state, pending, Vec::new())
         }
         Decision::Reuse { plan, load_mcp } => {
-            let state = current.unwrap_or_else(|| SandboxState {
+            let mut state = current.unwrap_or_else(|| SandboxState {
                 name: req.name.clone(),
                 harness: profile.name.clone(),
                 agent: profile.agent.clone(),
@@ -866,10 +984,11 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
                 image_digest: None,
                 declined_digest: None,
                 internal_mounts: Vec::new(),
+                vertex_secret: None,
                 created_at: state::now(),
             });
             log::step(format!("Using existing sandbox '{}'", req.name));
-            register_vertex_secret(&sbx, profile, &req.name)?;
+            state.vertex_secret = register_vertex_secret(&sbx, profile, &req.name, state.vertex_secret.as_deref())?;
             (state, plan, load_mcp)
         }
     };
@@ -913,7 +1032,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     runtime::write_info(&runtime_dir, &state.name, profile)?;
     let mcp_status = mcp::status(&sbx, &state.mcp);
     runtime::write_mcp_status(&runtime_dir, &mcp_status)?;
-    let api = runtime::check_api(&sbx, &state.name, profile);
+    let api = if args.acp { ApiState::Skipped } else { runtime::check_api(&sbx, &state.name, profile) };
     runtime::banner(&state.name, profile, &state.mounts, api, &mcp_status);
     if args.no_attach {
         log::ok(format!("sandbox '{}' is ready; `sand {} --resume` attaches to it", state.name, profile.name));
@@ -931,6 +1050,28 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     }
 
     // --- hand over to the agent -------------------------------------------------
+    if let Some(handoff) = handoff {
+        return open_in_tern(handoff, dirs, profile, &state, lock, keep_alive);
+    }
+    let status = attach(&sbx, dirs, &args, profile, &state, Some(keep_alive))?;
+    if disposal.is_some() {
+        drop(disposal);
+    } else {
+        log::info(format!("sandbox '{}' is kept; `sand {} --resume` attaches to it again", state.name, profile.name));
+    }
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Starts the agent (its terminal UI, or its ACP server in ACP mode) and
+/// waits for it. `keep_alive` is let go once the agent ends.
+fn attach(
+    sbx: &Sbx,
+    dirs: &Dirs,
+    args: &RunArgs,
+    profile: &Profile,
+    state: &SandboxState,
+    keep_alive: Option<KeepAlive>,
+) -> Result<ExitStatus> {
     let launch = if args.acp {
         if profile.acp_command.is_empty() {
             bail!(
@@ -971,6 +1112,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         cmd
     };
 
+    let runtime_dir = dirs.runtime_dir(&state.name);
     let refresher = (!args.acp).then(|| Refresher::start(sbx.clone(), runtime_dir, state.mcp.clone())).flatten();
     let bridge = profile.network_prompts.then(|| Bridge::start(sbx.clone(), dirs.clone(), state.name.clone()));
     IN_SESSION.store(true, Ordering::SeqCst);
@@ -992,13 +1134,24 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     if !summary.mounted.is_empty() {
         log::info(format!("mounted during the session: {}", summary.mounted.join(", ")));
     }
-
     log::step(format!("Session ended ({status})"));
-    if disposal.is_some() {
-        drop(disposal);
-    } else {
-        log::info(format!("sandbox '{}' is kept; `sand {} --resume` attaches to it again", state.name, profile.name));
-    }
+    Ok(status)
+}
+
+/// The ACP session Tern starts for a session that handed its sandbox over
+/// (`open_in_tern`): that one has just set the sandbox up and keeps it running
+/// until the chat ends, so the agent is started right away.
+fn attach_prepared(
+    args: &RunArgs,
+    dirs: &Dirs,
+    profile: &Profile,
+    state: &SandboxState,
+    _lock: lock::SessionLock,
+) -> Result<i32> {
+    log::step(format!("sand: {} in sandbox '{}'", profile.name, state.name));
+    log::ok("the session that opened this chat has set the sandbox up; starting the agent");
+    let sbx = Sbx::prepared(false);
+    let status = attach(&sbx, dirs, args, profile, state, None)?;
     Ok(status.code().unwrap_or(1))
 }
 

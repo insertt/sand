@@ -20,6 +20,7 @@ mod session;
 mod state;
 mod sync;
 mod template;
+mod tern;
 mod vertex;
 
 use std::process::ExitCode;

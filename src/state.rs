@@ -48,6 +48,9 @@ pub struct SandboxState {
     pub declined_digest: Option<String>,
     #[serde(default)]
     pub internal_mounts: Vec<InternalMount>,
+    /// The Vertex AI token secret last registered with sbx for this sandbox.
+    #[serde(default)]
+    pub vertex_secret: Option<String>,
     #[serde(default)]
     pub created_at: u64,
 }
@@ -180,6 +183,7 @@ mod tests {
             image_digest: None,
             declined_digest: None,
             internal_mounts: vec![],
+            vertex_secret: None,
             created_at: 0,
         }
     }
