@@ -1,0 +1,149 @@
+name: E2E
+
+# Runs tests/e2e.rs: the sand binary against a real sbx installation,
+# creating real sandboxes. Signing sbx in needs Docker Hub credentials, so
+# it runs only where secrets are available: pushes to main, PRs from branches
+# of this repository (never forks), the nightly schedule, and manual runs.
+#
+# Repository settings it needs:
+#   vars.DOCKERHUB_USERNAME   Docker Hub account the tests sign sbx in with
+#   secrets.DOCKERHUB_TOKEN   a personal access token of that account
+#
+# The release channel (the latest tagged sbx) is what users have today. The
+# nightly schedule also runs the rolling nightly build, so a change in sbx
+# that breaks sand shows up before it is released; that leg never fails the run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: sbx build to test against
+        type: choice
+        options: [release, nightly]
+        default: release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Every sbx call is scoped to this instance: its own daemon, login and policy.
+  SAND_E2E_APP_NAME: sand-e2e
+
+jobs:
+  e2e:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: e2e (sbx ${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.channel == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: >-
+          ${{ fromJSON(github.event_name == 'schedule' && '["release","nightly"]' ||
+                       format('["{0}"]', inputs.channel || 'release')) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Fails fast on compile errors, before sbx is installed and signed in.
+      - name: Build tests
+        run: cargo test --locked --test e2e --no-run
+
+      # sbx runs each sandbox in a microVM.
+      - name: Enable KVM access
+        run: |
+          sudo chmod 666 /dev/kvm
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install sbx (${{ matrix.channel }})
+        env:
+          CHANNEL: ${{ matrix.channel }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$CHANNEL" in
+            release) tag=$(gh release view --repo docker/sbx-releases --json tagName --jq .tagName) ;;
+            nightly) tag=nightly ;;
+            *) echo "::error::unknown sbx channel: $CHANNEL"; exit 1 ;;
+          esac
+          echo "Installing sbx $tag"
+          pkg="$RUNNER_TEMP/sbx-package"
+          mkdir -p "$pkg"
+          gh release download "$tag" --repo docker/sbx-releases \
+            --pattern DockerSandboxes-linux.tar.gz --dir "$pkg"
+          tar xzf "$pkg/DockerSandboxes-linux.tar.gz" -C "$pkg"
+          sudo PREFIX="$HOME/.docker/sbx" "$pkg/docker-sbx/install.sh"
+          echo "$HOME/.docker/sbx/bin" >> "$GITHUB_PATH"
+
+      - name: sbx version
+        run: sbx version
+
+      - name: Sign in to Docker Hub
+        env:
+          USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$USERNAME" ] || [ -z "$TOKEN" ]; then
+            echo "::error::DOCKERHUB_USERNAME (variable) and DOCKERHUB_TOKEN (secret) must be set to run the e2e tests"
+            exit 1
+          fi
+          # Pasted secrets can carry stray whitespace; Hub names and PATs have none.
+          user=$(printf '%s' "$USERNAME" | tr -d '[:space:]')
+          token=$(printf '%s' "$TOKEN" | tr -d '[:space:]')
+          # Hub throttles logins (429) and is sometimes slow; retry those only.
+          delay=10
+          for attempt in 1 2 3 4; do
+            if out=$(printf '%s' "$token" | sbx --app-name "$SAND_E2E_APP_NAME" login --username "$user" --password-stdin 2>&1); then
+              printf '%s\n' "$out"
+              exit 0
+            fi
+            printf '%s\n' "$out"
+            case "$out" in
+              *"rate limited"*|*429*|*"service unavailable"*|*"deadline exceeded"*|*"Client.Timeout"*) ;;
+              *) exit 1 ;;
+            esac
+            echo "Docker Hub login throttled or unavailable (attempt $attempt); retrying in ${delay}s"
+            sleep "$delay"
+            delay=$((delay * 2))
+          done
+          echo "::error::Docker Hub login still failing after 4 attempts"
+          exit 1
+
+      # A fresh sbx asks for a network policy on first use; there is no
+      # terminal here to ask on. Nothing the tests run needs more than balanced.
+      - name: Initialize network policy
+        run: |
+          sbx --app-name "$SAND_E2E_APP_NAME" policy init balanced </dev/null
+          sbx --app-name "$SAND_E2E_APP_NAME" ls </dev/null
+
+      - name: Test
+        run: cargo test --locked --test e2e -- --ignored --test-threads=1
+
+      - name: sbx state after failure
+        if: failure()
+        run: |
+          sbx --app-name "$SAND_E2E_APP_NAME" ls || true
+          sbx --app-name "$SAND_E2E_APP_NAME" policy log || true
+          sbx --app-name "$SAND_E2E_APP_NAME" diagnose || true
+
+      - name: Sign out of Docker Hub
+        if: always()
+        run: sbx --app-name "$SAND_E2E_APP_NAME" logout --yes || true
