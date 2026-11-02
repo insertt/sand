@@ -38,6 +38,7 @@ use crate::mcp::McpStatus;
 use crate::runtime::ApiState;
 use crate::sbx::Sbx;
 use driver::Driver;
+pub use model::Limits;
 pub use view::Info;
 use view::Msg;
 
@@ -85,6 +86,8 @@ pub enum Command {
 /// What the status shows, as it changes.
 pub enum Update {
     Api(ApiState),
+    /// The subscription's limits, as Anthropic reports them to the host.
+    Limits(Limits),
     Mcp(Vec<McpStatus>),
     Branch(Option<String>),
     Mounts(Vec<String>),
@@ -111,6 +114,8 @@ pub struct ChatSpec {
     pub workspace: Option<PathBuf>,
     /// The host directories the sandbox mounts now, for `@` mentions above the workspace.
     pub mounts: Mounts,
+    /// The Claude login on the host to ask for the subscription limits with.
+    pub usage: Option<crate::usage::Credentials>,
 }
 
 /// Reads the host directories a sandbox mounts, as they are at the time.

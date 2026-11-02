@@ -53,6 +53,10 @@ const LOG_TAIL: usize = 12;
 const BRANCH_EVERY: Duration = Duration::from_secs(5);
 const PROBE_EVERY: Duration = Duration::from_secs(30);
 
+/// How often the subscription limits are asked for, and how soon again after a turn.
+const USAGE_EVERY: Duration = Duration::from_secs(180);
+const USAGE_AFTER_TURN: Duration = Duration::from_secs(30);
+
 /// How old the workspace's file list may get while an `@` mention is typed.
 const FILES_EVERY: Duration = Duration::from_secs(10);
 
@@ -104,6 +108,8 @@ pub struct Driver {
     commands: Sender<Command>,
     waker: Option<Waker>,
     stop_probes: Arc<AtomicBool>,
+    /// Set when a turn ends, for the limits to be asked for again.
+    usage_poke: Arc<AtomicBool>,
     /// Where the answers to the person's questions go, oldest first.
     confirm_replies: Vec<Sender<bool>>,
     /// Where answers to sbx's network approvals, and to blocked hosts, go.
@@ -153,6 +159,7 @@ impl Driver {
             commands,
             waker,
             stop_probes: Arc::new(AtomicBool::new(false)),
+            usage_poke: Arc::new(AtomicBool::new(false)),
             confirm_replies: Vec::new(),
             approvals: None,
             agent_notes: Vec::new(),
@@ -345,6 +352,8 @@ impl Driver {
     fn update(&mut self, update: Update) {
         match update {
             Update::Api(api) => self.info.api = Some(api),
+            // The host's figures are the ones with percentages: they replace the agent's.
+            Update::Limits(limits) => self.t.limits = Some(limits),
             Update::Mcp(mcp) => self.info.mcp = mcp,
             Update::Branch(branch) => self.info.branch = branch,
             Update::Mounts(mounts) => self.info.mounts = mounts,
@@ -366,12 +375,15 @@ impl Driver {
     fn start(&mut self, spec: ChatSpec, now: Instant) {
         self.t.setup.finish(now);
         self.t.turn = Turn::Starting;
-        let ChatSpec { sbx, launch, log, paths, cwd, profile, sandbox, mcp, servers, workspace, mounts } = spec;
+        let ChatSpec { sbx, launch, log, paths, cwd, profile, sandbox, mcp, servers, workspace, mounts, usage } = spec;
         self.workspace = workspace.clone();
         self.mounts = mounts();
         self.above_from = Some((sbx.clone(), sandbox.clone(), cwd.clone(), mounts));
         self.list_files();
         self.probe(sbx.clone(), profile, sandbox, mcp, workspace);
+        if let Some(credentials) = usage {
+            self.watch_usage(credentials);
+        }
         let spawned = (|| -> Result<Child> {
             if let Some(parent) = log.parent() {
                 fs::create_dir_all(parent)?;
@@ -412,6 +424,38 @@ impl Driver {
         self.agent = Some(Agent { client, rx, child, log, cwd, open: true });
         let sent = self.client().map(Client::initialize);
         self.check(sent);
+    }
+
+    /// Asks Anthropic, from the host, how much of the subscription's limits is
+    /// spent: every few minutes, and again soon after a turn ends. Failures
+    /// leave the limits as they were; the token stays in [`crate::usage`].
+    fn watch_usage(&self, credentials: crate::usage::Credentials) {
+        let (tx, waker, stop) = (self.commands.clone(), self.waker.clone(), Arc::clone(&self.stop_probes));
+        let poke = Arc::clone(&self.usage_poke);
+        thread::spawn(move || {
+            let mut asked: Option<Instant> = None;
+            loop {
+                let due = asked.is_none_or(|at| {
+                    at.elapsed() >= USAGE_EVERY || poke.load(Ordering::Relaxed) && at.elapsed() >= USAGE_AFTER_TURN
+                });
+                if due {
+                    asked = Some(Instant::now());
+                    poke.store(false, Ordering::Relaxed);
+                    if let Some(Ok(limits)) = crate::usage::fetch(&credentials) {
+                        if tx.send(Command::Update(Update::Limits(limits))).is_err() {
+                            return;
+                        }
+                        if let Some(waker) = &waker {
+                            waker.wake();
+                        }
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
     }
 
     /// Looks at the branch, the API and the MCP servers again now and then.
@@ -586,6 +630,7 @@ impl Driver {
             (Call::Prompt, Ok(result)) => {
                 let stop = result["stopReason"].as_str();
                 self.t.turn_ended(stop, &result["usage"], now);
+                self.usage_poke.store(true, Ordering::Relaxed);
                 if let Some(prompt) = self.forced.take() {
                     // The stop was for this message: it goes now, and the queue runs on after it.
                     self.t.queue_paused = false;

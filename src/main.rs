@@ -22,6 +22,7 @@ mod status;
 mod sync;
 mod template;
 mod tern;
+mod usage;
 mod vertex;
 
 use std::process::ExitCode;

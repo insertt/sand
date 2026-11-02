@@ -543,9 +543,15 @@ quits (or stops setup) only when pressed twice in a row; a toast asks for the
 second press. Ctrl+D twice quits too. This needs no setup in Tern and works for
 every kind of sandbox, but not with agent arguments, which open the terminal
 UI. The subscription limits (5h, 7d) appear under the composer for Claude Code
-Pro and Max plans, once the agent reports them (they ride on its usage updates,
-so only after a response, and a window shows once it has been reported);
-there the API mark reads `Subscription` instead of `API`. If setup fails or is
+Pro and Max plans, and the API mark reads `Subscription` instead of `API`.
+ACP reports a limit's state but not how much of it is spent, so sand asks
+Anthropic for the figures itself, every few minutes and soon after each turn,
+with the Claude login on the host (`~/.claude/.credentials.json`, or the
+Keychain on macOS). The request goes from the host, not through the sandbox,
+and the token is never logged, stored or passed to the sandbox, which only
+gets the percentages. An expired login is not refreshed (Claude Code on the
+host does that); the limits then stay as they were. Set
+`usage_limits = false` in the config to turn this off. If setup fails or is
 aborted, its log is printed in the terminal as usual. The agent's stderr goes
 to `acp-agent.log` in the sandbox's runtime directory. To keep the terminal
 UI, set `tern_native = false` in the config, or `SAND_TERN_NATIVE=0` (or
