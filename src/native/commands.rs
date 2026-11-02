@@ -80,6 +80,16 @@ pub fn complete(draft: &str, agent: &[SlashCommand]) -> Vec<SlashCommand> {
         .collect()
 }
 
+/// Where in `draft` the `/name` it starts with sits, when that names one of
+/// sand's commands or the agent's: the composer marks it as one that runs.
+pub fn recognized(draft: &str, agent: &[SlashCommand]) -> Option<std::ops::Range<usize>> {
+    let start = draft.len() - draft.trim_start().len();
+    let rest = draft[start..].strip_prefix('/')?;
+    let name = rest.split(char::is_whitespace).next().unwrap_or_default();
+    let known = parse(&draft[start..]).is_some() || agent.iter().any(|c| c.name == name);
+    (!name.is_empty() && known).then(|| start..start + 1 + name.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +120,18 @@ mod tests {
         assert!(names("/resume").is_empty(), "a command typed whole needs no completion");
         assert!(names("/review x").is_empty());
         assert!(names("hi").is_empty());
+    }
+
+    #[test]
+    fn whole_command_names_are_recognized() {
+        let agent = [agent("review")];
+        assert_eq!(recognized("/fork", &agent), Some(0..5));
+        assert_eq!(recognized(" /mount ~/x", &agent), Some(1..7));
+        assert_eq!(recognized("/clear", &agent), Some(0..6));
+        assert_eq!(recognized("/review this", &agent), Some(0..7));
+        assert_eq!(recognized("/for", &agent), None);
+        assert_eq!(recognized("/forks", &agent), None);
+        assert_eq!(recognized("/", &agent), None);
+        assert_eq!(recognized("fork", &agent), None);
     }
 }

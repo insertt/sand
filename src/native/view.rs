@@ -1225,6 +1225,15 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
         .on_edit(|e| Msg::Edit { from: e.from, to: e.to, text: e.text.clone(), cursor: e.cursor, len: e.len })
         .on_undo(Msg::Undo)
         .on_focus(Msg::Focus);
+    // A command typed whole, marked as one that runs: no completion says so.
+    let editor = match commands::recognized(&composer.draft, &t.commands) {
+        Some(range) => {
+            let utf16 = |at: usize| composer.draft[..at].encode_utf16().count();
+            let s = "accent strong".to_string();
+            editor.decor(vec![ui::Decor { from: utf16(range.start), to: utf16(range.end), s, fx: None }])
+        }
+        None => editor,
+    };
     // The rest of the highlighted command, faint after the caret.
     let completions = if composer.dismissed { Vec::new() } else { commands::complete(&composer.draft, &t.commands) };
     let editor = match completions.get(composer.pick.min(completions.len().saturating_sub(1))) {
