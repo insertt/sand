@@ -29,43 +29,84 @@ use crate::runtime::ApiState;
 pub const STYLE: &str = r#"
 [data-role='sand.composer'] {
 	width: calc(100% - 24px);
-	max-width: 736px;
-	margin: 0 auto 10px !important;
-	padding: 8px 10px 6px;
+	max-width: 760px;
+	margin: 0 auto 12px !important;
+	padding: 14px 14px 10px 18px;
 	box-sizing: border-box;
-	gap: 6px;
-	border-radius: 14px;
+	gap: 10px;
+	border-radius: 22px;
 	background: var(--card);
-	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t1) 12%, transparent), 0 10px 30px -18px rgba(0, 0, 0, 0.35);
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t1) 12%, transparent), 0 12px 32px -20px rgba(0, 0, 0, 0.45);
 	font-family: var(--sans);
 }
+/* The input: a size up from the transcript's text, on the card itself. */
 [data-role='sand.composer'] > .sf-editor {
-	min-height: calc(2 * var(--sf-lh));
-	background: transparent;
-	box-shadow: none;
+	min-height: calc(2 * 22px);
+	padding: 0 !important;
+	font-size: 15px !important;
+	line-height: 22px !important;
+	--sf-lh: 22px;
+	background: transparent !important;
+	box-shadow: none !important;
 }
 [data-role='sand.composer.context'] { margin: 0 4px; }
-[data-role='sand.composer.bar'] { gap: 8px; min-width: 0; font: 12.5px/1.3 var(--sans); }
+[data-role='sand.composer.bar'] { gap: 10px; min-width: 0; font: 14px/1.3 var(--sans); }
 [data-role='sand.composer.bar'] > * { flex: none; }
+/* Model, effort and mode: pills with a hairline ring, as Tern's own chat draws them. */
+:is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']) :is(.sf-select-btn, .sf-menu-trigger),
+:is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']).sf-row {
+	height: 34px;
+	padding: 0 14px !important;
+	gap: 8px;
+	border-radius: 999px !important;
+	background: transparent;
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t1) 13%, transparent) !important;
+	font: 14.5px/1 var(--sans) !important;
+	color: var(--t1);
+}
+:is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']) .sf-select-btn:hover {
+	background: color-mix(in srgb, var(--t1) 6%, transparent);
+}
+[data-role='sand.composer.bar'] .sf-select-label { display: none; }
+/* A mode other than the default: a pill tinted in its tone. */
+[data-role='sand.composer.mode'][data-tone] .sf-select-btn,
+[data-role='sand.composer.mode'][data-tone].sf-row {
+	background: color-mix(in srgb, var(--tc) 14%, transparent) !important;
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tc) 35%, transparent) !important;
+	color: var(--tc);
+}
 [data-role='sand.composer.mcp'] .sf-btn-label, [data-role='sand.composer.mcp'] .ico { color: var(--tc); }
 [data-role='sand.composer.facts'] {
-	gap: 4px 14px;
-	padding: 4px 4px 0;
+	gap: 4px 16px;
+	padding: 6px 4px 0;
 	border-top: 1px solid color-mix(in srgb, var(--t1) 8%, transparent);
-	font: 12px/1.3 var(--sans);
+	font: 13px/1.3 var(--mono);
 	color: var(--t3);
 }
-:is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']).sf-row {
-	padding: 2px 8px;
-	border-radius: 999px;
-	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t1) 12%, transparent);
-}
-[data-role='sand.composer.usage'] { font-family: var(--mono); }
+[data-role='sand.composer.usage'] { font: 13.5px/1 var(--mono); color: var(--t3); }
+/* Send and stop: a round button at the bar's end. */
 :is([data-role='sand.composer.send'], [data-role='sand.composer.stop']) {
-	padding: 3px 8px;
-	border-radius: 8px;
-	background: var(--l2);
+	width: 40px;
+	height: 40px;
+	flex: none !important;
+	justify-content: center !important;
+	align-items: center !important;
+	padding: 0 !important;
+	border-radius: 50% !important;
+	background: color-mix(in srgb, var(--t1) 10%, transparent);
+	font: 600 13px/1 var(--sans);
 }
+:is([data-role='sand.composer.send'], [data-role='sand.composer.stop']):hover {
+	background: color-mix(in srgb, var(--t1) 16%, transparent);
+}
+[data-role='sand.composer.send'] .sf-kbd, [data-role='sand.composer.send'] .kbd {
+	background: transparent !important;
+	box-shadow: none !important;
+	border: 0 !important;
+	padding: 0 !important;
+	font-size: 17px;
+}
+[data-role='sand.composer.stop'] { color: var(--sf-bad, var(--tc)); }
 [data-role='sand.notes'], [data-role='sand.queue'] {
 	width: calc(100% - 24px);
 	max-width: 736px;
@@ -1107,8 +1148,6 @@ fn chip(t: &Transcript, key: &str, role: &str, icon: &str, text: &str, label: &s
             .key(key)
             .role(role)
             .variant("quiet")
-            .label(label)
-            .size("sm")
             .options(options)
             .value(current.unwrap_or_default())
             .title(format!("{label} · click to change{hint}"))
@@ -1248,7 +1287,7 @@ fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
             .title("Stop (Esc)")
             .gap("xs")
             .align("center")
-            .child(ui::text("Stop").key("t"))
+            .child(ui::icon("stop").key("i"))
             .on_click(Msg::Stop)
     } else {
         ui::row()
