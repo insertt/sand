@@ -821,7 +821,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
 
     let mut req = build_request(&args, dirs, config, harness, specs)?;
     warn_exposing(dirs, req.mounts.all());
-    let native = native_eligible(&args, &req.profile);
+    let native = native_eligible(&args, &req.profile, config);
     let handoff = tern_handoff(&args, &req, dirs, config, &cwd, native);
     let profile = &req.profile;
 
@@ -1087,9 +1087,10 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
 
 /// Whether the session may be drawn natively in Tern, should the terminal
 /// turn out to speak the Tern Surface Protocol.
-fn native_eligible(args: &RunArgs, profile: &Profile) -> bool {
+fn native_eligible(args: &RunArgs, profile: &Profile, config: &Config) -> bool {
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let eligible = tty && native::eligible(args.acp, args.no_attach, profile, &args.agent_args);
+    let eligible = tty
+        && native::eligible(args.acp, args.no_attach, profile, &args.agent_args, config.tern_native.unwrap_or(true));
     if tty && !eligible && !args.agent_args.is_empty() && env::var("TERM_PROGRAM").is_ok_and(|t| t == "tern") {
         log::info("opening the terminal UI: Tern draws sessions natively only without agent arguments");
     }

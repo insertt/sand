@@ -511,8 +511,10 @@ every kind of sandbox, but not with agent arguments, which open the terminal
 UI. The subscription limits (5h, 7d) the terminal status line shows are not
 reported over ACP, so the native composer leaves them out. If setup fails or is
 aborted, its log is printed in the terminal as usual. The agent's stderr goes
-to `acp-agent.log` in the sandbox's runtime directory. Set
-`SAND_TERN_NATIVE=0` (or `TERN_TSP=0`) to keep the terminal UI.
+to `acp-agent.log` in the sandbox's runtime directory. To keep the terminal
+UI, set `tern_native = false` in the config, or `SAND_TERN_NATIVE=0` (or
+`TERN_TSP=0`) for one run; `SAND_TERN_NATIVE=1` turns it back on over the
+config.
 
 `--install-acp tern` adds a custom agent `sand-<harness>` to Tern's
 `settings.json` (`$TERN_CONFIG_DIR` if set) and lists it in `own_tools`, so
@@ -542,6 +544,7 @@ commented examples if there is none) and checks it when the editor closes.
 ```toml
 default_harness = "codex"
 nightly = true                       # use nightly harness images (see Templates)
+tern_native = false                  # keep the agent's terminal UI in Tern
 
 # Change a built-in harness…
 [harness.claude]

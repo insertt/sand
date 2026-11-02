@@ -40,7 +40,8 @@ use driver::Driver;
 pub use view::Info;
 use view::Msg;
 
-/// Turns native sessions off, to keep the agent's own terminal UI.
+/// Turns native sessions off (`0`) or on (anything else), to keep the agent's
+/// own terminal UI or override `tern_native` in the config.
 const OPT_OUT: &str = "SAND_TERN_NATIVE";
 
 /// What setup tells the surface thread.
@@ -123,12 +124,12 @@ fn host() -> std::sync::MutexGuard<'static, Option<Host>> {
 
 /// Whether this session may be drawn natively; the terminal decides in
 /// [`start`]. Agent arguments are for the terminal UI, which ACP has no
-/// place for.
-pub fn eligible(acp: bool, no_attach: bool, profile: &Profile, agent_args: &[String]) -> bool {
+/// place for. `configured` is `tern_native` from the config.
+pub fn eligible(acp: bool, no_attach: bool, profile: &Profile, agent_args: &[String], configured: bool) -> bool {
     !acp && !no_attach
         && !profile.acp_command.is_empty()
         && agent_args.is_empty()
-        && env::var(OPT_OUT).map_or(true, |v| v != "0")
+        && env::var(OPT_OUT).map_or(configured, |v| v != "0")
 }
 
 /// Asks the terminal whether it speaks TSP; `None` when it does not (or TSP
