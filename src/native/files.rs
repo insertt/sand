@@ -165,7 +165,7 @@ pub fn links(text: &str, root: &Path) -> Vec<Link> {
             !path.is_empty()
                 && Path::new(path).is_relative()
                 && !path.split(['/', '\\']).any(|part| part == "..")
-                && root.join(path).exists()
+                && inside(root, path).is_some()
         });
         if let Some((len, path)) = found {
             let uri = file_uri(&root.join(path.trim_end_matches('/')));
@@ -189,9 +189,17 @@ pub fn file_uri(path: &Path) -> String {
     uri
 }
 
-/// The text of the file `link` names, when it is a small text file.
+/// `root/path` resolved, when it exists and stays under `root`: the agent can
+/// put links in the workspace that lead to any file of the host.
+fn inside(root: &Path, path: &str) -> Option<std::path::PathBuf> {
+    let root = dunce::canonicalize(root).ok()?;
+    let resolved = dunce::canonicalize(root.join(path)).ok()?;
+    resolved.starts_with(&root).then_some(resolved)
+}
+
+/// The text of the file `link` names, when it is a small text file in the workspace.
 pub fn contents(root: &Path, link: &Link) -> Option<String> {
-    let path = root.join(&link.path);
+    let path = inside(root, &link.path)?;
     let meta = fs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > MAX_EMBEDDED {
         return None;
@@ -252,6 +260,23 @@ mod tests {
         assert!(!links[2].uri.ends_with('/'));
         assert_eq!(contents(dir.path(), &links[0]).as_deref(), Some("fn a() {}"));
         assert_eq!(contents(dir.path(), &links[2]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mentions_never_lead_out_of_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, outside) = (dir.path().join("w"), dir.path().join("secret"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "key").unwrap();
+        fs::write(root.join("real.md"), "ok").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("notes.md")).unwrap();
+        std::os::unix::fs::symlink(root.join("real.md"), root.join("alias.md")).unwrap();
+        let links = links("see @notes.md and @alias.md", &root);
+        assert_eq!(links.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(), ["alias.md"]);
+        assert_eq!(contents(&root, &links[0]).as_deref(), Some("ok"));
+        let forged = Link { range: 0..1, path: "notes.md".into(), uri: String::new(), text: None };
+        assert_eq!(contents(&root, &forged), None);
     }
 
     #[test]
