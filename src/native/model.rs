@@ -306,6 +306,8 @@ impl ConfigOption {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
     Model,
+    /// The permission mode (ask, accept edits, bypass permissions, …).
+    Mode,
     Effort,
 }
 
@@ -716,6 +718,7 @@ impl Transcript {
     pub fn option(&self, setting: Setting) -> Option<&ConfigOption> {
         self.options.iter().find(|o| match setting {
             Setting::Model => o.category == "model" || o.id == "model",
+            Setting::Mode => o.category == "mode" || o.id == "mode",
             Setting::Effort => o.is_effort(),
         })
     }
@@ -733,16 +736,31 @@ impl Transcript {
         self.option(Setting::Effort).map(ConfigOption::current_name)
     }
 
+    /// The agent's choices for `setting` as (value, name), and the current value.
+    pub fn choices(&self, setting: Setting) -> (Vec<(String, String)>, Option<String>) {
+        let listed = |list: &[Mode]| list.iter().map(|m| (m.id.clone(), m.name.clone())).collect();
+        match (self.option(setting), setting) {
+            (Some(option), _) => (option.choices.clone(), Some(option.current.clone())),
+            (None, Setting::Model) => (listed(&self.models), self.model.clone()),
+            (None, Setting::Mode) => (listed(&self.modes), self.mode.clone()),
+            (None, Setting::Effort) => (Vec::new(), None),
+        }
+    }
+
     /// The name of the current mode, as the agent calls it.
     pub fn mode_name(&self) -> Option<&str> {
+        if let Some(option) = self.option(Setting::Mode) {
+            return Some(option.current_name());
+        }
         let id = self.mode.as_deref()?;
         Some(self.modes.iter().find(|m| m.id == id).map_or(id, |m| m.name.as_str()))
     }
 
-    /// The mode after the current one, wrapping around.
-    pub fn next_mode(&self) -> Option<&Mode> {
-        let at = self.modes.iter().position(|m| Some(&m.id) == self.mode.as_ref());
-        self.modes.get(at.map_or(0, |i| (i + 1) % self.modes.len()))
+    /// The value of the mode after the current one, wrapping around.
+    pub fn next_mode(&self) -> Option<String> {
+        let (choices, current) = self.choices(Setting::Mode);
+        let at = choices.iter().position(|(v, _)| Some(v) == current.as_ref());
+        choices.get(at.map_or(0, |i| (i + 1) % choices.len())).map(|(v, _)| v.clone())
     }
 }
 
@@ -915,7 +933,7 @@ mod tests {
         ];
         t.apply(&json!({"sessionUpdate": "current_mode_update", "currentModeId": "plan"}), now);
         assert_eq!(t.mode_name(), Some("Plan"));
-        assert_eq!(t.next_mode().map(|m| m.id.as_str()), Some("default"));
+        assert_eq!(t.next_mode().as_deref(), Some("default"));
         t.apply(&json!({"sessionUpdate": "available_commands_update", "availableCommands": [{"name": "init"}]}), now);
         assert_eq!(t.commands, vec!["init"]);
     }

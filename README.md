@@ -458,9 +458,10 @@ ACP server in the sandbox and becomes its client:
 - the composer stays at the bottom of the pane and shows what the status line
   shows: a context bar (used and window size), the model and its reasoning
   effort, the sandbox, the git branch, whether the agent's API is reachable,
-  each MCP server's state, the mode (click or Shift+Tab to change it) and the
-  session's cost. The model and effort chips are pickers of the choices the
-  agent offers; until it says, they show what your harness settings pick.
+  each MCP server's state, the permission mode and the session's cost. The
+  model, effort and mode chips are pickers of the choices the agent offers
+  (Shift+Tab also steps through the modes, and a mode other than the default
+  shows in the warning color); until it says, they show what your harness settings pick.
   Branch, API and MCP are checked again while the session runs.
 
 You can type during setup; the first message is sent once the agent is ready.

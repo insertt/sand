@@ -47,7 +47,7 @@ pub const STYLE: &str = r#"
 [data-role='sand.composer.bar'] { gap: 8px; min-width: 0; font: 12.5px/1.3 var(--sans); }
 [data-role='sand.composer.bar'] > * { flex: none; }
 [data-role='sand.composer.bar'] > [data-role='sand.composer.extras'] { flex: 1 1 auto !important; min-width: 0; overflow: hidden; }
-:is([data-role='sand.composer.model'], [data-role='sand.composer.effort']).sf-row {
+:is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']).sf-row {
 	padding: 2px 8px;
 	border-radius: 999px;
 	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t1) 12%, transparent);
@@ -87,8 +87,6 @@ pub enum Msg {
     Answer(Approval),
     /// An option of setup's question.
     Choose(usize),
-    /// The mode segment.
-    CycleMode,
     /// A choice picked in the model or effort chip.
     Pick(Setting, String),
 }
@@ -735,22 +733,19 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
 /// The model or effort: a picker of the agent's choices once it offers
 /// them, else what the host's settings name.
 fn chip(t: &Transcript, key: &str, role: &str, icon: &str, text: &str, label: &str, setting: Setting) -> Node<Msg> {
-    let choices: Vec<(String, String)> = match (t.option(setting), setting) {
-        (Some(option), _) => option.choices.clone(),
-        (None, Setting::Model) => t.models.iter().map(|m| (m.id.clone(), m.name.clone())).collect(),
-        (None, Setting::Effort) => Vec::new(),
-    };
-    let current = match (t.option(setting), setting) {
-        (Some(option), _) => Some(option.current.clone()),
-        (None, Setting::Model) => t.model.clone(),
-        (None, Setting::Effort) => None,
+    let (choices, current) = t.choices(setting);
+    // A mode that drops the agent's permission prompts reads as a warning.
+    let tone = match (setting, current.as_deref()) {
+        (Setting::Mode, Some(mode)) if mode != "default" => "warning",
+        _ => "accent",
     };
     if choices.len() > 1 {
         let options: Vec<ui::SelectOption> = choices
             .into_iter()
             .map(|(value, name)| ui::SelectOption { icon: Some(icon.into()), ..ui::SelectOption::new(value, name) })
             .collect();
-        return ui::select()
+        let hint = if setting == Setting::Mode { " · Shift+Tab cycles" } else { "" };
+        let select = ui::select()
             .key(key)
             .role(role)
             .variant("quiet")
@@ -758,9 +753,9 @@ fn chip(t: &Transcript, key: &str, role: &str, icon: &str, text: &str, label: &s
             .size("sm")
             .options(options)
             .value(current.unwrap_or_default())
-            .title(format!("{label} · click to change"))
-            .on_change(move |change| Msg::Pick(setting, change.value.as_str().unwrap_or_default().to_string()))
-            .into();
+            .title(format!("{label} · click to change{hint}"))
+            .on_change(move |change| Msg::Pick(setting, change.value.as_str().unwrap_or_default().to_string()));
+        return if tone == "warning" { select.tone(tone).into() } else { select.into() };
     }
     ui::row()
         .key(key)
@@ -768,7 +763,7 @@ fn chip(t: &Transcript, key: &str, role: &str, icon: &str, text: &str, label: &s
         .gap("xs")
         .align("center")
         .title(label.to_string())
-        .child(ui::icon(icon).tone("accent").key("i"))
+        .child(ui::icon(icon).tone(tone).key("i"))
         .child(ui::text(text.to_string()).key("t"))
         .into()
 }
@@ -779,6 +774,9 @@ fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
     row = row.child(chip(t, "model", "sand.composer.model", "sparkle", info.model(t), "Model", Setting::Model));
     if let Some(effort) = info.effort(t) {
         row = row.child(chip(t, "effort", "sand.composer.effort", "brain", effort, "Effort", Setting::Effort));
+    }
+    if let Some(mode) = t.mode_name() {
+        row = row.child(chip(t, "mode", "sand.composer.mode", "shield", mode, "Mode", Setting::Mode));
     }
 
     let mut status = ui::status().key("extras").role("sand.composer.extras").transparent(true).grow(1.0);
@@ -820,14 +818,6 @@ fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
                 .priority(4.0)
                 .title(format!("MCP server {}", server.name)),
         );
-    }
-    if let Some(mode) = t.mode_name() {
-        let tone = if t.mode.as_deref() == Some("default") { "neutral" } else { "warning" };
-        let mut seg = ui::seg(mode.to_string()).key("mode").icon("shield").tone(tone).priority(7.0);
-        if t.modes.len() > 1 {
-            seg = seg.title("Mode · Shift+Tab or click to change").on_click(Msg::CycleMode);
-        }
-        status = status.child(seg);
     }
     row = row.child(status);
 
@@ -1026,6 +1016,18 @@ mod tests {
         assert_eq!(picker("sand.composer.effort")["options"].as_array().map(Vec::len), Some(2));
         let composer = find(region(&v, 1), "sand.composer").unwrap();
         assert!(composer.child_nodes()[0].props().get("readonly").is_none());
+
+        // The mode is a picker too, warning-toned when it drops the permission prompts.
+        t.modes = vec![
+            super::super::model::Mode { id: "default".into(), name: "Default".into() },
+            super::super::model::Mode { id: "bypassPermissions".into(), name: "Bypass Permissions".into() },
+        ];
+        t.mode = Some("bypassPermissions".into());
+        let v = view(&t, &Composer::default(), &info());
+        let mode = find(region(&v, 1), "sand.composer.mode").unwrap().props().clone();
+        assert_eq!(mode["value"], "bypassPermissions");
+        assert_eq!((mode["variant"].as_str(), mode["tone"].as_str()), (Some("quiet"), Some("warning")));
+        assert_eq!(mode["options"][1]["label"], "Bypass Permissions");
     }
 
     #[test]

@@ -481,7 +481,6 @@ impl Driver {
             Msg::Stop => self.cancel(),
             Msg::Answer(approval) => self.answer(approval),
             Msg::Choose(choice) => self.choose(Some(choice)),
-            Msg::CycleMode => self.next_mode(),
             Msg::Pick(setting, value) => self.pick(setting, &value),
             Msg::Focus => {}
         }
@@ -552,21 +551,23 @@ impl Driver {
                 self.asked_model = Some(value.to_string());
                 self.client().map(|c| c.set_model(&session, value))
             }
+            None if setting == Setting::Mode && self.t.mode.as_deref() != Some(value) => {
+                self.asked_mode = Some(value.to_string());
+                self.client().map(|c| c.set_mode(&session, value))
+            }
             _ => return,
         };
         self.check(sent);
     }
 
+    /// Shift+Tab: the next mode, as the mode chip would pick it.
     fn next_mode(&mut self) {
-        let (Some(session), Some(mode)) = (self.session.clone(), self.t.next_mode().map(|m| m.id.clone())) else {
-            return;
-        };
-        if self.t.modes.len() < 2 {
+        if self.t.choices(Setting::Mode).0.len() < 2 {
             return;
         }
-        let sent = self.client().map(|c| c.set_mode(&session, &mode));
-        self.asked_mode = Some(mode);
-        self.check(sent);
+        if let Some(mode) = self.t.next_mode() {
+            self.pick(Setting::Mode, &mode);
+        }
     }
 }
 
