@@ -737,6 +737,17 @@ impl Driver {
                 let sent = self.client().map(|c| c.new_session(&cwd));
                 self.check(sent);
             }
+            Builtin::Mount(None) => {
+                self.t.error("Say which directory: /mount <dir>, or <dir>:ro for read-only".to_string(), None);
+            }
+            Builtin::Mount(Some(dir)) => match &self.approvals {
+                Some(answers) if answers.send(Answered::Mount(dir.clone())).is_ok() => {
+                    self.t.entries.push(Entry::Notice(format!("Mounting {dir}…")));
+                }
+                _ => {
+                    self.t.error(format!("sand cannot mount from here; run `sand mount {dir}` on this computer"), None)
+                }
+            },
             Builtin::Help => {
                 let agent = self.t.commands.iter().map(|c| format!("/{}", c.name)).collect::<Vec<_>>().join(" ");
                 let sand: Vec<String> =
@@ -1450,6 +1461,14 @@ mod tests {
         let declined = Outcome { ok: true, allowed: false, message: "mounting /h/x: declined on the host".into() };
         d.command(Command::Told(Asked::Mount("~/x".into()), declined));
         assert!(d.agent_notes[1].contains("sand mounted /h/notes (ro)"));
+
+        d.composer.set("/mount ~/notes:ro");
+        d.key(&Key::named("enter"));
+        assert_eq!(answered.recv().unwrap(), Answered::Mount("~/notes:ro".into()));
+        assert!(matches!(d.t.entries.last(), Some(Entry::Notice(t)) if t == "Mounting ~/notes:ro…"));
+        d.composer.set("/mount");
+        d.key(&Key::named("enter"));
+        assert!(matches!(d.t.entries.last(), Some(Entry::Error { .. })));
         assert_eq!(d.agent_notes[2], "[sand] The directory ~/x was not mounted: mounting /h/x: declined on the host.");
     }
 

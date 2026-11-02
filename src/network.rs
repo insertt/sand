@@ -415,6 +415,8 @@ pub enum Answered {
     Approval(String, String),
     /// A host the policy blocked without an approval, allowed for this sandbox.
     Allow(String),
+    /// A host directory to mount (`DIR`, `DIR:ro` or `DIR:rw`), asked for by the person.
+    Mount(String),
 }
 
 /// How a session that draws its own UI takes part: it asks the questions in
@@ -550,6 +552,19 @@ impl Worker {
                     };
                     (Asked::Host(host), outcome, request)
                 }
+                Answered::Mount(path) => {
+                    let outcome = self.answer_mount(&path, None, None, true);
+                    let request = Request {
+                        kind: Some("mount".into()),
+                        host: String::new(),
+                        approval: None,
+                        option: None,
+                        path: Some(path.clone()),
+                        mode: None,
+                        reason: None,
+                    };
+                    (Asked::Mount(path), outcome, request)
+                }
             };
             self.record(&request, &outcome);
             if let Some(told) = &self.told {
@@ -627,7 +642,7 @@ impl Worker {
     fn answer(&mut self, request: &Request) -> Outcome {
         if request.kind.as_deref() == Some("mount") {
             let path = request.path.as_deref().unwrap_or_default();
-            return self.answer_mount(path, request.mode.as_deref(), request.reason.as_deref());
+            return self.answer_mount(path, request.mode.as_deref(), request.reason.as_deref(), false);
         }
         match &request.approval {
             Some(approval) => self.answer_approval(approval, request.option.as_deref(), false),
@@ -635,7 +650,9 @@ impl Worker {
         }
     }
 
-    fn answer_mount(&mut self, path: &str, mode: Option<&str>, reason: Option<&str>) -> Outcome {
+    /// Mounts `path`; `confirmed` when the person asked for it in a UI the
+    /// agent cannot reach (`/mount`), which needs no second question.
+    fn answer_mount(&mut self, path: &str, mode: Option<&str>, reason: Option<&str>, confirmed: bool) -> Outcome {
         // `DIR:ro` / `DIR:rw`, as on sand's command line, wins over `mode`.
         let path = path.trim();
         let (raw, suffix) = mounts::split_mode(path);
@@ -664,7 +681,7 @@ impl Worker {
             ));
         }
         let key = format!("mount:{shown}");
-        if self.declined.get(&key).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
+        if !confirmed && self.declined.get(&key).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
             return Outcome::done(format!("mounting {shown}: declined on the host a moment ago"));
         }
         let access = match mode {
@@ -677,7 +694,7 @@ impl Worker {
             question.push_str(&format!("\n\nThe agent says: \u{201c}{reason}\u{201d}"));
         }
         question.push_str("\n\nMount it?");
-        match (self.confirm)(&question) {
+        match if confirmed { Answer::Allow } else { (self.confirm)(&question) } {
             Answer::Allow => {}
             Answer::Deny => {
                 self.declined.insert(key, Instant::now());
@@ -1077,6 +1094,25 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_the_person_asked_for_needs_no_second_question() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, asked) = worker(tmp.path(), Answer::Deny);
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let heard = told.clone();
+        worker.told = Some(Box::new(move |asked: &Asked, outcome: &Outcome| {
+            heard.lock().unwrap().push((asked.clone(), outcome.allowed));
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.answers = Some(rx);
+        fs::create_dir_all(tmp.path().join("notes")).unwrap();
+        let dir = format!("{}:ro", tmp.path().join("notes").display());
+        tx.send(Answered::Mount(dir.clone())).unwrap();
+        worker.round(&AtomicBool::new(false));
+        assert!(asked.lock().unwrap().is_empty(), "/mount is the person's own ask");
+        assert_eq!(*told.lock().unwrap(), [(Asked::Mount(dir), true)]);
+    }
+
+    #[test]
     fn blocks_are_read_from_the_proxys_403_bodies() {
         let text = "curl: (22) 403\nBlocked by network policy: domain PyPI.org\n  rule: x\n\
                     Approval required for api.github.com.\nBlocked by local rule for evil.test:8443\n\
@@ -1097,7 +1133,7 @@ mod tests {
         fs::create_dir_all(&notes).unwrap();
         let notes = dunce::canonicalize(&notes).unwrap();
 
-        let outcome = worker.answer_mount("~/notes", Some("ro"), Some("the user asked\nfor their notes"));
+        let outcome = worker.answer_mount("~/notes", Some("ro"), Some("the user asked\nfor their notes"), false);
         let (shown, at) = (notes.display().to_string(), container_path(&notes.display().to_string()));
         assert_eq!(outcome, Outcome::allowed(format!("mounted {shown} (ro) at {at}")));
         let question = asked.lock().unwrap()[0].clone();
@@ -1107,23 +1143,25 @@ mod tests {
 
         // Declined just now: not asked again. Refused outright, unasked:
         worker.confirm = Box::new(|_| Answer::Deny);
-        assert!(!worker.answer_mount("~/notes", None, None).allowed);
-        assert!(worker.answer_mount("~/notes", None, None).message.ends_with("declined on the host a moment ago"));
-        assert!(!worker.answer_mount("~/missing", None, None).ok);
+        assert!(!worker.answer_mount("~/notes", None, None, false).allowed);
+        assert!(
+            worker.answer_mount("~/notes", None, None, false).message.ends_with("declined on the host a moment ago")
+        );
+        assert!(!worker.answer_mount("~/missing", None, None, false).ok);
         // The command line's suffix names the mode, and wins over `mode`.
         worker.declined.clear();
         worker.confirm = Box::new(|q| if q.contains("read-only") { Answer::Allow } else { Answer::Deny });
         assert_eq!(
-            worker.answer_mount("~/notes:ro", Some("rw"), None).message,
+            worker.answer_mount("~/notes:ro", Some("rw"), None, false).message,
             format!("mounted {shown} (ro) at {at}")
         );
-        assert!(!worker.answer_mount("~/notes:rw", None, None).allowed);
+        assert!(!worker.answer_mount("~/notes:rw", None, None, false).allowed);
         worker.confirm = Box::new(|_| Answer::Deny);
-        assert!(!worker.answer_mount("~/notes", Some("rwx"), None).ok);
-        assert!(!worker.answer_mount("", None, None).ok);
+        assert!(!worker.answer_mount("~/notes", Some("rwx"), None, false).ok);
+        assert!(!worker.answer_mount("", None, None, false).ok);
         fs::create_dir_all(worker.dirs.sandboxes_dir()).unwrap();
         let data = worker.dirs.data.display().to_string();
-        assert!(worker.answer_mount(&data, Some("ro"), None).message.contains("never mounted on request"));
+        assert!(worker.answer_mount(&data, Some("ro"), None, false).message.contains("never mounted on request"));
         assert_eq!(asked.lock().unwrap().len(), 1);
     }
 
