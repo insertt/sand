@@ -47,16 +47,22 @@ pub fn agent_id(harness: Option<&str>) -> String {
     id.chars().take(64).collect()
 }
 
+/// The product a harness runs, e.g. `Claude Code`.
+pub fn product_name(harness: &str) -> &str {
+    match harness {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        other => other,
+    }
+}
+
 /// The agent's name in Tern's agent picker, e.g. `Claude Code (sand)`.
 pub fn agent_name(harness: Option<&str>) -> String {
-    let product = match harness {
-        None => return "sand".to_string(),
-        Some("claude") => "Claude Code",
-        Some("codex") => "Codex",
-        Some("opencode") => "OpenCode",
-        Some(other) => other,
-    };
-    format!("{product} (sand)")
+    match harness {
+        None => "sand".to_string(),
+        Some(harness) => format!("{} (sand)", product_name(harness)),
+    }
 }
 
 /// Names earlier versions of sand gave the agent, like `sand (claude)`.

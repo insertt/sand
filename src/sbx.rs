@@ -256,6 +256,18 @@ impl Sbx {
         Ok(status)
     }
 
+    /// Starts a command with its stdin and stdout piped to sand and its stderr
+    /// written to `stderr`.
+    pub fn spawn_piped(&self, args: Vec<OsString>, stderr: std::fs::File) -> Result<Child> {
+        log::command(format!("sbx {}", display(&args)));
+        self.command(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .map_err(|e| self.spawn_error(e))
+    }
+
     pub fn version(&self) -> Result<String> {
         self.capture(args!["version"])?
             .map(|v| v.trim().to_string())

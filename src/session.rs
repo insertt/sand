@@ -24,6 +24,7 @@ use crate::lock;
 use crate::log;
 use crate::mcp;
 use crate::mounts::{self, Mode, Mount, MountSet, Plan, Strategy};
+use crate::native;
 use crate::network::{self, Bridge};
 use crate::paths::{Dirs, POLICY_DIR_NAME, RUNTIME_DIR_NAME, container_path};
 use crate::registry;
@@ -716,7 +717,14 @@ struct TernHandoff {
 /// directory, so only a session that picks the same sandbox is handed over.
 /// Questions are asked and changes the command line asks for are made here
 /// first; the ACP session keeps the sandbox's mounts and MCP servers.
-fn tern_handoff(args: &RunArgs, req: &Request, dirs: &Dirs, config: &Config, cwd: &Path) -> Option<TernHandoff> {
+fn tern_handoff(
+    args: &RunArgs,
+    req: &Request,
+    dirs: &Dirs,
+    config: &Config,
+    cwd: &Path,
+    native: bool,
+) -> Option<TernHandoff> {
     let tern = crate::tern::acp_executable(|name| env::var(name).ok())?;
     if args.acp || args.no_attach || req.profile.acp_command.is_empty() {
         return None;
@@ -727,7 +735,7 @@ fn tern_handoff(args: &RunArgs, req: &Request, dirs: &Dirs, config: &Config, cwd
     let settings = crate::tern::settings_path(dirs).ok().and_then(|p| fs::read_to_string(p).ok()).unwrap_or_default();
     let default_harness = req.profile.name == config.default_harness();
     let Some(agent) = crate::tern::find_agent(&settings, &req.profile.name, default_harness) else {
-        if !crate::tern::has_sand_agent(&settings) {
+        if !native && !crate::tern::has_sand_agent(&settings) {
             log::info(format!(
                 "in Tern, `sand {} --install-acp tern` opens sessions in Tern's chat instead",
                 req.profile.name
@@ -810,7 +818,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
 
     let mut req = build_request(&args, dirs, config, harness, specs)?;
     warn_exposing(dirs, req.mounts.all());
-    let handoff = tern_handoff(&args, &req, dirs, config, &cwd);
+    let native = native_eligible(&args, &req.profile);
+    let handoff = tern_handoff(&args, &req, dirs, config, &cwd, native);
     let profile = &req.profile;
 
     // Before sbx lists the sandboxes, so that what it lists stays true.
@@ -1050,16 +1059,77 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     }
 
     // --- hand over to the agent -------------------------------------------------
-    if let Some(handoff) = handoff {
+    // Asked only now: the handshake puts the terminal in raw mode.
+    let code = if let Some(tsp) = native.then(native::connect).flatten() {
+        attach_native(tsp, &sbx, dirs, config, profile, &state, keep_alive)?
+    } else if let Some(handoff) = handoff {
         return open_in_tern(handoff, dirs, profile, &state, lock, keep_alive);
-    }
-    let status = attach(&sbx, dirs, &args, profile, &state, Some(keep_alive))?;
+    } else {
+        attach(&sbx, dirs, &args, profile, &state, Some(keep_alive))?.code().unwrap_or(1)
+    };
     if disposal.is_some() {
         drop(disposal);
     } else {
         log::info(format!("sandbox '{}' is kept; `sand {} --resume` attaches to it again", state.name, profile.name));
     }
-    Ok(status.code().unwrap_or(1))
+    Ok(code)
+}
+
+/// Whether the session may be drawn natively in Tern, should the terminal
+/// turn out to speak the Tern Surface Protocol.
+fn native_eligible(args: &RunArgs, profile: &Profile) -> bool {
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let eligible = tty && native::eligible(args.acp, args.no_attach, profile, &args.agent_args);
+    if tty && !eligible && !args.agent_args.is_empty() && env::var("TERM_PROGRAM").is_ok_and(|t| t == "tern") {
+        log::info("opening the terminal UI: Tern draws sessions natively only without agent arguments");
+    }
+    eligible
+}
+
+/// Runs the session in this Tern pane, drawn natively: sand starts the
+/// agent's ACP server and is its client. `keep_alive` is let go once it ends.
+fn attach_native(
+    tsp: tern_sdk::Session<native::Msg>,
+    sbx: &Sbx,
+    dirs: &Dirs,
+    config: &Config,
+    profile: &Profile,
+    state: &SandboxState,
+    keep_alive: KeepAlive,
+) -> Result<i32> {
+    log::step(format!("Opening {} in this Tern pane", profile.name));
+    let launch = acp_launch(profile, state);
+    let bridge = profile.network_prompts.then(|| Bridge::start(sbx.clone(), dirs.clone(), state.name.clone()));
+    IN_SESSION.store(true, Ordering::SeqCst);
+    let code = native::run(sbx, dirs, profile, state, tsp, launch, config.sandbox_home());
+    IN_SESSION.store(false, Ordering::SeqCst);
+    let summary = bridge.map(Bridge::finish).unwrap_or_default();
+    drop(keep_alive);
+    let code = code?;
+    log_summary(&summary);
+    log::step(format!("Session ended (exit code {code})"));
+    Ok(code)
+}
+
+/// `sbx exec` of the harness's ACP server, in the primary workspace.
+fn acp_launch(profile: &Profile, state: &SandboxState) -> Vec<OsString> {
+    let command = profile.acp_command.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ");
+    let mut cmd = args!["exec", "-i"];
+    if let Some(primary) = &state.mounts.primary {
+        cmd.extend(args!["--workdir", container_path(&primary.path.to_string_lossy())]);
+    }
+    let env = vertex_env(profile, &state.name).map(|pair| format!("{} ", shell_quote(&pair))).unwrap_or_default();
+    cmd.extend(args![&state.name, "bash", "-lc", format!("{env}exec {command}")]);
+    cmd
+}
+
+fn log_summary(summary: &network::Summary) {
+    if !summary.allowed.is_empty() {
+        log::info(format!("allowed during the session, for this sandbox: {}", summary.allowed.join(", ")));
+    }
+    if !summary.mounted.is_empty() {
+        log::info(format!("mounted during the session: {}", summary.mounted.join(", ")));
+    }
 }
 
 /// Starts the agent (its terminal UI, or its ACP server in ACP mode) and
@@ -1082,13 +1152,7 @@ fn attach(
         }
         let command = profile.acp_command.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ");
         log::step(format!("Starting ACP agent: {command}"));
-        let mut cmd = args!["exec", "-i"];
-        if let Some(primary) = &state.mounts.primary {
-            cmd.extend(args!["--workdir", container_path(&primary.path.to_string_lossy())]);
-        }
-        let env = vertex_env(profile, &state.name).map(|pair| format!("{} ", shell_quote(&pair))).unwrap_or_default();
-        cmd.extend(args![&state.name, "bash", "-lc", format!("{env}exec {command}")]);
-        cmd
+        acp_launch(profile, state)
     } else {
         log::step(format!("Starting {} (bypass permissions)", profile.name));
         let mut cmd = args!["run", "--name", &state.name];
@@ -1128,12 +1192,7 @@ fn attach(
     let summary = bridge.map(Bridge::finish).unwrap_or_default();
     drop(keep_alive);
     let status = status?;
-    if !summary.allowed.is_empty() {
-        log::info(format!("allowed during the session, for this sandbox: {}", summary.allowed.join(", ")));
-    }
-    if !summary.mounted.is_empty() {
-        log::info(format!("mounted during the session: {}", summary.mounted.join(", ")));
-    }
+    log_summary(&summary);
     log::step(format!("Session ended ({status})"));
     Ok(status)
 }

@@ -439,13 +439,27 @@ The first start of a new sandbox takes a while. If the editor times out, run
 
 ### Tern
 
+In a [Tern](https://docs.stencil.so/tern/) pane, `sand <harness>` draws the
+session natively: once the sandbox is set up, sand asks the terminal whether it
+speaks the Tern Surface Protocol and, if it does, starts the harness's ACP
+server in the sandbox and becomes its client. The conversation is an inline Tern
+surface: replies stream as Markdown messages, tool calls are cards
+with their command or file, output and diffs (a call that needs permission asks
+in its card: Enter allows, Esc denies), thoughts fold once done, and the plan
+sits above the composer. Enter sends, Shift+Enter starts a new line, Shift+Tab
+switches the agent's mode, Esc or Ctrl+C stops a turn, and Ctrl+D quits.
+This needs no setup in Tern and works for every kind of sandbox, but not with
+agent arguments, which open the terminal UI. The agent's stderr goes to
+`acp-agent.log` in the sandbox's runtime directory. Set `SAND_TERN_NATIVE=0`
+(or `TERN_TSP=0`) to keep the terminal UI.
+
 `--install-acp tern` adds a custom agent `sand-<harness>` to Tern's
 `settings.json` (`$TERN_CONFIG_DIR` if set) and lists it in `own_tools`, so
 the agent uses its own file and terminal tools, which run inside the sandbox,
 rather than Tern's, which would run on the host.
 
-Run in a Tern pane that opens agent commands as ACP chats (Settings › Agents),
-`sand <harness>` then sets the sandbox up as usual and opens the session in
+With native drawing turned off, in a Tern pane that opens agent commands as
+ACP chats (Settings › Agents), `sand <harness>` then sets the sandbox up as usual and opens the session in
 Tern's chat (`tern acp sand-<harness>`) instead of the agent's terminal UI.
 Tern starts `sand <harness> --acp` in the current directory, which keeps the
 sandbox's mounts and MCP servers; while the chat is open, the first `sand`
