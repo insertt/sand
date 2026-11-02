@@ -466,6 +466,15 @@ ACP server in the sandbox and becomes its client:
   shows in the warning color); until it says, they show what your harness settings pick.
   Branch, API and MCP are checked again while the session runs.
 
+Typing `/` completes commands under the caret (↑↓ choose, Tab completes,
+Enter runs, Esc hides): the agent's own (`/init`, `/review`, …), sent to it
+as a prompt, and sand's, which ACP offers as methods rather than commands:
+`/sessions` (or `/resume` without an id) lists the agent's sessions for this
+project in a picker, and resumes the one you choose, replaying its
+conversation when the agent can; `/resume <id>` resumes one directly; `/new`
+starts a new session; and `/help` lists them all. Resuming needs an agent that
+supports ACP's session listing and loading.
+
 You can type during setup; the first message is sent once the agent is ready.
 Enter sends, Shift+Enter starts a new line, Esc stops a turn, Ctrl+C stops
 setup (or a turn), and Ctrl+D quits. This needs no setup in Tern and works for

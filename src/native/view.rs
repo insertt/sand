@@ -15,10 +15,11 @@ use tern_sdk::ui::{
     TraceLine, View,
 };
 
+use super::commands;
 use super::composer::Composer;
 use super::model::{
-    Approval, Entry, Permission, Question, Setting, Setup, StepStatus, TargetKind, ToolCall, ToolContent, ToolStatus,
-    Transcript, Turn, TurnUsage,
+    Approval, Entry, Permission, Question, SessionPicker, Setting, Setup, StepStatus, TargetKind, ToolCall,
+    ToolContent, ToolStatus, Transcript, Turn, TurnUsage,
 };
 use crate::mcp::{McpState, McpStatus};
 use crate::runtime::ApiState;
@@ -101,6 +102,12 @@ pub enum Msg {
     Choose(usize),
     /// A choice picked in the model or effort chip.
     Pick(Setting, String),
+    /// A click on a completion of the draft.
+    Complete(usize),
+    /// A session picked in the session picker, or highlighted there.
+    Session(usize),
+    HoverSession(usize),
+    ClosePicker,
 }
 
 /// What the session runs in: what the status line shows besides the agent's own facts.
@@ -135,7 +142,93 @@ impl Info {
 }
 
 pub fn view(t: &Transcript, composer: &Composer, info: &Info) -> View<Msg> {
-    View::new().main(ui::col().children(transcript(t, info))).dock(ui::col().children(dock(t, composer, info)))
+    View::new()
+        .main(ui::col().children(transcript(t, info)))
+        .dock(ui::col().children(dock(t, composer, info)))
+        .layer(ui::col().children(layer(t, composer, info)))
+}
+
+/// The item a list event names: its node id ends in the item's key, `<letter><index>`.
+fn item_index(item: &str) -> usize {
+    item.rsplit('.').next().and_then(|key| key.get(1..)).and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+/// What floats over the session: the completions of a `/command` being
+/// typed, under the caret, and the session picker.
+fn layer(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
+    if let Some(picker) = &t.picker {
+        return vec![session_picker(picker, info)];
+    }
+    let completions = if composer.dismissed { Vec::new() } else { commands::complete(&composer.draft, &t.commands) };
+    if completions.is_empty() {
+        return Vec::new();
+    }
+    let selected = composer.pick.min(completions.len() - 1);
+    let items = completions.iter().enumerate().map(|(i, command)| {
+        let mut item = ui::item(format!("/{}", command.name)).key(format!("c{i}")).detail(command.description.clone());
+        if let Some(hint) = &command.hint {
+            item = item.value(hint.clone());
+        }
+        if command.builtin {
+            item = item.icon("box");
+        }
+        item
+    });
+    let list = ui::list()
+        .key("list")
+        .selected(format!("layer.complete.list.c{selected}"))
+        .max_lines(10)
+        .children(items)
+        .on_select(|item| Msg::Complete(item_index(item)))
+        .on_activate(|item| Msg::Complete(item_index(item)));
+    vec![
+        ui::overlay()
+            .key("complete")
+            .role("omp.autocomplete")
+            .anchor(ui::Anchor::Caret(EDITOR.to_string()))
+            .size("sm")
+            .child(list)
+            .into(),
+    ]
+}
+
+/// The sessions `/sessions` and `/resume` offer, newest first as the agent lists them.
+fn session_picker(picker: &SessionPicker, info: &Info) -> Node<Msg> {
+    let empty = match (&picker.error, picker.loading) {
+        (Some(error), _) => error.clone(),
+        (None, true) => format!("Asking {} for its sessions…", info.product),
+        (None, false) => "No sessions".to_string(),
+    };
+    let items = picker.sessions.iter().enumerate().map(|(i, session)| {
+        let mut detail = Vec::new();
+        detail.extend(session.updated.as_deref().map(|u| u.replace('T', " ").chars().take(16).collect::<String>()));
+        detail.extend(session.cwd.clone());
+        ui::item(session.label())
+            .key(format!("s{i}"))
+            .icon("history")
+            .detail(detail.join(" · "))
+            .value(session.id.chars().take(8).collect::<String>())
+    });
+    let selected = picker.selected.min(picker.sessions.len().saturating_sub(1));
+    let list = ui::list()
+        .key("list")
+        .selected(format!("layer.sessions.list.s{selected}"))
+        .empty(empty)
+        .max_lines(12)
+        .children(items)
+        .on_select(|item| Msg::HoverSession(item_index(item)))
+        .on_activate(|item| Msg::Session(item_index(item)));
+    let hint = ui::text(spans(&[("↑↓ choose · Enter resumes · Esc closes", "muted")])).key("hint");
+    ui::overlay()
+        .key("sessions")
+        .role("sand.sessions")
+        .anchor(ui::Anchor::Center)
+        .size("md")
+        .head(format!("Resume a {} session", info.product))
+        .end(ui::button("Close").key("close").variant("quiet").size("sm").keys(["esc"]).on_click(Msg::ClosePicker))
+        .child(list)
+        .foot(hint)
+        .into()
 }
 
 fn spans(parts: &[(&str, &str)]) -> Vec<Span> {
@@ -194,12 +287,18 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
             nodes.push(user(key, text, false));
             continue;
         }
+        if let Entry::Resumed(title) = entry {
+            flush(&mut nodes, &mut turn, &mut turn_key);
+            let label = if title.is_empty() { "Resumed".to_string() } else { format!("Resumed · {title}") };
+            nodes.push(ui::rule().key(key).role("agent.resumed").label(label).into());
+            continue;
+        }
         if turn_key.is_empty() {
             turn_key = format!("turn{i}");
         }
         let streaming = i == last && t.turn == Turn::Working;
         turn.push(match entry {
-            Entry::User(_) => unreachable!("handled above"),
+            Entry::User(_) | Entry::Resumed(_) => unreachable!("handled above"),
             Entry::Agent(text) => ui::md(text.clone()).key(key).prop("stream", streaming).into(),
             Entry::Thought(thought) => {
                 let head = match thought.took {
@@ -227,7 +326,7 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
         nodes.push(user("queued".to_string(), text, true));
     }
     // Room under the last turn, so that its end and its tooltips clear the floating composer.
-    nodes.push(ui::row().key("tail").role("sand.tail").min(Bound::h(Extent::Lines(6.0))).into());
+    nodes.push(ui::row().key("tail").role("sand.tail").min(Bound::h(Extent::Lines(9.0))).into());
     nodes
 }
 
@@ -668,7 +767,10 @@ fn working(t: &Transcript, info: &Info) -> Option<Node<Msg>> {
             let step = t.setup.steps.iter().rev().find(|s| s.status == StepStatus::Running);
             ("setup".to_string(), step.map_or_else(|| "Setting up".to_string(), |s| s.title.clone()))
         }
-        Turn::Starting => ("starting".to_string(), format!("Starting {}", info.product)),
+        Turn::Starting => match &t.resuming {
+            Some(title) => ("resuming".to_string(), format!("Resuming {title}")),
+            None => ("starting".to_string(), format!("Starting {}", info.product)),
+        },
         Turn::Working if t.permission.is_none() => {
             let label = match (t.running_tool(), t.entries.last()) {
                 (Some(tool), _) => match &tool.target {
@@ -711,7 +813,7 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
         Turn::Setup | Turn::Starting => format!("Ask {} anything — it is sent once the agent is ready", info.product),
         Turn::Working if t.permission.is_some() => "Enter allows · Esc denies".to_string(),
         Turn::Working => format!("Esc stops {}", info.product),
-        Turn::Idle => format!("Ask {} anything", info.product),
+        Turn::Idle => format!("Ask {} anything — / for commands", info.product),
         Turn::Exited => "Enter closes".to_string(),
     };
     let editor = ui::editor()
@@ -1063,7 +1165,7 @@ mod tests {
         assert_eq!(mcp["items"][1]["detail"], "needs authorization: sbx mcp auth github");
         assert_eq!(find(dock, "sand.composer.usage").unwrap().props()["spans"][0]["t"], "$0.04");
         assert_eq!(main.last().unwrap().props()["role"], "sand.tail");
-        assert_eq!(main.last().unwrap().props()["min"], json!({"h": "6lines"}));
+        assert_eq!(main.last().unwrap().props()["min"], json!({"h": "9lines"}));
     }
 
     #[test]
@@ -1125,6 +1227,50 @@ mod tests {
         assert!(find(dock, "omp.working").is_none());
         let composer = find(dock, "sand.composer").unwrap();
         assert_eq!(composer.child_nodes()[0].props()["placeholder"], "Enter allows · Esc denies");
+    }
+
+    #[test]
+    fn slash_commands_complete_under_the_caret_and_sessions_pick() {
+        let mut t = Transcript::default();
+        t.turn = Turn::Idle;
+        t.commands = vec![commands::SlashCommand {
+            name: "review".into(),
+            description: "Review a PR".into(),
+            hint: Some("PR number".into()),
+            builtin: false,
+        }];
+        let mut composer = Composer::default();
+        composer.insert("/re");
+        composer.pick = 1;
+        let v = view(&t, &composer, &info());
+        let overlay = &region(&v, 2)[0];
+        assert_eq!(overlay.props()["role"], "omp.autocomplete");
+        assert_eq!(overlay.props()["anchor"], json!({"caret": EDITOR}));
+        let list = &overlay.child_nodes()[0];
+        assert_eq!(list.props()["selected"], "layer.complete.list.c1");
+        let labels: Vec<&str> = list.child_nodes().iter().map(|i| i.props()["label"].as_str().unwrap()).collect();
+        assert_eq!(labels, ["/resume", "/review"]);
+        assert_eq!(list.child_nodes()[1].props()["detail"], "Review a PR");
+        assert_eq!(list.child_nodes()[1].props()["value"], "PR number");
+        composer.dismissed = true;
+        assert!(region(&view(&t, &composer, &info()), 2).is_empty());
+
+        t.picker = Some(SessionPicker {
+            sessions: vec![super::super::model::SessionEntry {
+                id: "abcdef123456".into(),
+                title: Some("Fix the build".into()),
+                cwd: Some("/w".into()),
+                updated: Some("2026-11-02T10:00:00Z".into()),
+            }],
+            ..SessionPicker::default()
+        });
+        let v = view(&t, &Composer::default(), &info());
+        let picker = &region(&v, 2)[0];
+        assert_eq!(picker.props()["role"], "sand.sessions");
+        let item = &picker.child_nodes().iter().find(|n| n.kind() == "list").unwrap().child_nodes()[0];
+        assert_eq!(item.props()["detail"], "2026-11-02 10:00 · /w");
+        assert_eq!(item.props()["value"], "abcdef12");
+        assert_eq!(item_index("layer.sessions.list.s12"), 12);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use super::commands::SlashCommand;
 use crate::log::Line;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,38 @@ pub enum Entry {
     },
     /// The end of a turn: how long it took and what it cost.
     TurnEnd(TurnUsage),
+    /// Where a resumed session's earlier conversation ends.
+    Resumed(String),
+}
+
+/// A session the agent can resume (ACP's `session/list`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionEntry {
+    pub id: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    /// When it last changed, as the agent says (ISO 8601).
+    pub updated: Option<String>,
+}
+
+impl SessionEntry {
+    pub fn parse(session: &Value) -> Option<Self> {
+        let text = |key: &str| session[key].as_str().filter(|v| !v.is_empty()).map(str::to_string);
+        Some(Self { id: text("sessionId")?, title: text("title"), cwd: text("cwd"), updated: text("updatedAt") })
+    }
+
+    pub fn label(&self) -> String {
+        self.title.clone().unwrap_or_else(|| format!("Session {}", self.id.chars().take(8).collect::<String>()))
+    }
+}
+
+/// The session picker `/sessions` and `/resume` open.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionPicker {
+    pub sessions: Vec<SessionEntry>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -325,7 +358,10 @@ pub struct Transcript {
     pub turn: Turn,
     pub modes: Vec<Mode>,
     pub mode: Option<String>,
-    pub commands: Vec<String>,
+    pub commands: Vec<SlashCommand>,
+    pub picker: Option<SessionPicker>,
+    /// A session being resumed: the working line says so until the agent answers.
+    pub resuming: Option<String>,
     /// The model, by id, and the models the agent offers (ACP's `models`).
     pub model: Option<String>,
     pub models: Vec<Mode>,
@@ -352,6 +388,8 @@ impl Default for Transcript {
             modes: Vec::new(),
             mode: None,
             commands: Vec::new(),
+            picker: None,
+            resuming: None,
             model: None,
             models: Vec::new(),
             options: Vec::new(),
@@ -531,7 +569,19 @@ impl Transcript {
             "available_commands_update" => {
                 self.commands = update["availableCommands"]
                     .as_array()
-                    .map(|c| c.iter().filter_map(|c| c["name"].as_str().map(str::to_string)).collect())
+                    .map(|commands| {
+                        commands
+                            .iter()
+                            .filter_map(|c| {
+                                Some(SlashCommand {
+                                    name: c["name"].as_str()?.trim_start_matches('/').to_string(),
+                                    description: c["description"].as_str().unwrap_or_default().to_string(),
+                                    hint: c["input"]["hint"].as_str().map(str::to_string),
+                                    builtin: false,
+                                })
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
             }
             _ => {}
@@ -612,6 +662,17 @@ impl Transcript {
         if self.turn != Turn::Exited {
             self.turn = Turn::Idle;
         }
+    }
+
+    /// Forgets the conversation (setup stays), for another session.
+    pub fn reset_conversation(&mut self) {
+        self.entries.clear();
+        self.tools.clear();
+        self.plan.clear();
+        self.permission = None;
+        self.context = None;
+        self.cost = None;
+        self.turn_start = None;
     }
 
     /// The tool running now, newest first, for the working line.
@@ -934,8 +995,15 @@ mod tests {
         t.apply(&json!({"sessionUpdate": "current_mode_update", "currentModeId": "plan"}), now);
         assert_eq!(t.mode_name(), Some("Plan"));
         assert_eq!(t.next_mode().as_deref(), Some("default"));
-        t.apply(&json!({"sessionUpdate": "available_commands_update", "availableCommands": [{"name": "init"}]}), now);
-        assert_eq!(t.commands, vec!["init"]);
+        t.apply(
+            &json!({"sessionUpdate": "available_commands_update", "availableCommands": [
+                {"name": "init", "description": "Write CLAUDE.md"},
+                {"name": "review", "description": "Review a PR", "input": {"hint": "PR number"}}]}),
+            now,
+        );
+        assert_eq!(t.commands.len(), 2);
+        assert_eq!((t.commands[0].name.as_str(), t.commands[0].description.as_str()), ("init", "Write CLAUDE.md"));
+        assert_eq!(t.commands[1].hint.as_deref(), Some("PR number"));
     }
 
     #[test]

@@ -8,6 +8,9 @@ pub struct Composer {
     pub draft: String,
     /// The caret, in chars.
     cursor: usize,
+    /// The completion highlighted, and whether Esc put the completions away.
+    pub pick: usize,
+    pub dismissed: bool,
 }
 
 impl Composer {
@@ -32,11 +35,26 @@ impl Composer {
         let at = self.byte(self.cursor);
         self.draft.insert_str(at, text);
         self.cursor += text.chars().count();
+        self.edited();
+    }
+
+    /// Replaces the draft, with the caret at its end.
+    pub fn set(&mut self, text: &str) {
+        self.draft = text.to_string();
+        self.cursor = self.len();
+        self.edited();
+    }
+
+    /// A new draft brings the completions back, from the top.
+    fn edited(&mut self) {
+        self.pick = 0;
+        self.dismissed = false;
     }
 
     /// Empties the draft and returns it.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
+        self.edited();
         std::mem::take(&mut self.draft)
     }
 
@@ -48,10 +66,12 @@ impl Composer {
                 let at = self.byte(self.cursor - 1);
                 self.draft.remove(at);
                 self.cursor -= 1;
+                self.edited();
             }
             "delete" if self.cursor < self.len() => {
                 let at = self.byte(self.cursor);
                 self.draft.remove(at);
+                self.edited();
             }
             "left" => self.cursor = self.cursor.saturating_sub(1),
             "right" => self.cursor = (self.cursor + 1).min(self.len()),
@@ -61,6 +81,7 @@ impl Composer {
                 let at = self.byte(self.cursor);
                 self.draft.drain(..at);
                 self.cursor = 0;
+                self.edited();
             }
             "paste" => self.insert(key.text.as_deref().unwrap_or_default()),
             _ => match key.typed() {

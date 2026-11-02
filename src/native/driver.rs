@@ -17,8 +17,9 @@ use serde_json::Value;
 use tern_sdk::{Input, Key, Session, Surface, SurfaceOptions, Waker};
 
 use super::client::{self, Call, Client, Incoming};
+use super::commands::{self, Builtin};
 use super::composer::Composer;
-use super::model::{Approval, Entry, Mode, Question, Setting, Transcript, Turn};
+use super::model::{Approval, Entry, Mode, Question, SessionEntry, SessionPicker, Setting, Transcript, Turn};
 use super::view::{EDITOR, Info, Msg, STYLE, view};
 use super::{ChatSpec, Command, Update};
 use crate::log::Line;
@@ -51,6 +52,11 @@ pub struct Driver {
     session: Option<String>,
     asked_mode: Option<String>,
     asked_model: Option<String>,
+    /// What the agent said it can do with sessions (`initialize`).
+    can_load: bool,
+    can_resume: bool,
+    /// The session to go back to if resuming another fails.
+    previous: Option<String>,
     /// Where the answer to the question on screen goes.
     reply: Option<Sender<Option<usize>>>,
     /// Commands, for the probes started with the chat.
@@ -83,6 +89,9 @@ impl Driver {
             session: None,
             asked_mode: None,
             asked_model: None,
+            can_load: false,
+            can_resume: false,
+            previous: None,
             reply: None,
             commands,
             waker,
@@ -362,33 +371,46 @@ impl Driver {
 
     fn response(&mut self, call: Call, result: Result<Value, String>, now: Instant) {
         match (call, result) {
-            (Call::Initialize, Ok(_)) => {
+            (Call::Initialize, Ok(result)) => {
+                let caps = &result["agentCapabilities"];
+                self.can_load = caps["loadSession"].as_bool().unwrap_or(false);
+                self.can_resume = !caps["sessionCapabilities"]["resume"].is_null();
                 let cwd = self.agent.as_ref().map(|a| a.cwd.clone()).unwrap_or_default();
                 let sent = self.client().map(|c| c.new_session(&cwd));
                 self.check(sent);
             }
             (Call::NewSession, Ok(result)) => {
                 self.session = result["sessionId"].as_str().map(str::to_string);
-                let modes = &result["modes"];
-                self.t.modes = modes["availableModes"]
-                    .as_array()
-                    .map(|modes| {
-                        modes
-                            .iter()
-                            .filter_map(|m| {
-                                let id = m["id"].as_str()?.to_string();
-                                let name = m["name"].as_str().map_or_else(|| id.clone(), str::to_string);
-                                Some(Mode { id, name })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.t.mode = modes["currentModeId"].as_str().map(str::to_string);
-                self.t.set_models(&result["models"]);
-                self.t.set_options(&result["configOptions"]);
+                self.ready(&result);
+            }
+            (Call::LoadSession | Call::ResumeSession, Ok(result)) => {
+                let title = self.t.resuming.take().unwrap_or_default();
+                self.t.entries.push(Entry::Resumed(title));
+                self.ready(&result);
+            }
+            (Call::LoadSession | Call::ResumeSession, Err(err)) => {
+                self.t.resuming = None;
+                self.session = self.previous.take();
+                self.t.error(format!("The session could not be resumed: {err}"), None);
                 self.t.turn = Turn::Idle;
-                if let Some(text) = self.t.queued.take() {
-                    self.send(text);
+            }
+            (Call::ListSessions, result) => {
+                let Some(picker) = self.t.picker.as_mut() else { return };
+                picker.loading = false;
+                match result {
+                    Ok(result) => {
+                        picker.sessions = result["sessions"]
+                            .as_array()
+                            .map(|all| all.iter().filter_map(SessionEntry::parse).collect())
+                            .unwrap_or_default();
+                        if picker.sessions.is_empty() {
+                            picker.error = Some("No sessions yet in this project".to_string());
+                        }
+                    }
+                    Err(err) => {
+                        let product = &self.info.product;
+                        picker.error = Some(format!("{product} does not list its sessions over ACP ({err})"));
+                    }
                 }
             }
             (Call::Initialize | Call::NewSession, Err(err)) => {
@@ -411,6 +433,84 @@ impl Driver {
                 self.t.error(format!("The mode could not be changed: {err}"), None);
             }
         }
+    }
+
+    /// A session is ready (new or resumed): takes its modes, models and
+    /// settings, and sends a prompt that waited for it.
+    fn ready(&mut self, result: &Value) {
+        let modes = &result["modes"];
+        if let Some(available) = modes["availableModes"].as_array() {
+            self.t.modes = available
+                .iter()
+                .filter_map(|m| {
+                    let id = m["id"].as_str()?.to_string();
+                    let name = m["name"].as_str().map_or_else(|| id.clone(), str::to_string);
+                    Some(Mode { id, name })
+                })
+                .collect();
+        }
+        if let Some(mode) = modes["currentModeId"].as_str() {
+            self.t.mode = Some(mode.to_string());
+        }
+        self.t.set_models(&result["models"]);
+        self.t.set_options(&result["configOptions"]);
+        self.t.turn = Turn::Idle;
+        if let Some(text) = self.t.queued.take() {
+            self.send(text);
+        }
+    }
+
+    fn cwd(&self) -> String {
+        self.agent.as_ref().map(|a| a.cwd.clone()).unwrap_or_default()
+    }
+
+    /// Runs one of sand's commands.
+    fn builtin(&mut self, command: Builtin) {
+        match command {
+            Builtin::Sessions | Builtin::Resume(None) => {
+                self.t.picker = Some(SessionPicker { loading: true, ..SessionPicker::default() });
+                let cwd = self.cwd();
+                let sent = self.client().map(|c| c.list_sessions(&cwd));
+                self.check(sent);
+            }
+            Builtin::Resume(Some(id)) => self.resume(SessionEntry { id, title: None, cwd: None, updated: None }),
+            Builtin::New => {
+                self.t.reset_conversation();
+                self.session = None;
+                self.t.turn = Turn::Starting;
+                let cwd = self.cwd();
+                let sent = self.client().map(|c| c.new_session(&cwd));
+                self.check(sent);
+            }
+            Builtin::Help => {
+                let agent = self.t.commands.iter().map(|c| format!("/{}", c.name)).collect::<Vec<_>>().join(" ");
+                let sand: Vec<String> =
+                    commands::builtins().map(|c| format!("/{} — {}", c.name, c.description)).collect();
+                let mut text = sand.join("\n");
+                if !agent.is_empty() {
+                    text.push_str(&format!("\n{}: {agent}", self.info.product));
+                }
+                self.t.entries.push(Entry::Notice(text));
+            }
+        }
+    }
+
+    /// Leaves this session for `session`, which the agent loads (replaying
+    /// its conversation) or resumes.
+    fn resume(&mut self, session: SessionEntry) {
+        self.t.picker = None;
+        if !self.can_load && !self.can_resume {
+            let product = &self.info.product;
+            self.t.error(format!("{product} cannot resume sessions over ACP"), None);
+            return;
+        }
+        self.previous = self.session.replace(session.id.clone());
+        self.t.reset_conversation();
+        self.t.resuming = Some(session.label());
+        self.t.turn = Turn::Starting;
+        let (cwd, load) = (session.cwd.unwrap_or_else(|| self.cwd()), self.can_load);
+        let sent = self.client().map(|c| c.open_session(&session.id, &cwd, load));
+        self.check(sent);
     }
 
     fn send(&mut self, text: String) {
@@ -437,7 +537,47 @@ impl Driver {
             return;
         }
         let text = self.composer.take();
-        self.send(text);
+        match commands::parse(&text) {
+            Some(command) if self.t.turn == Turn::Idle => self.builtin(command),
+            // sand's commands wait for the session; the agent's go as a prompt.
+            Some(_) => self.composer.set(&text),
+            None => self.send(text),
+        }
+    }
+
+    /// The commands completing the draft, unless dismissed.
+    fn completions(&self) -> Vec<commands::SlashCommand> {
+        if self.composer.dismissed {
+            return Vec::new();
+        }
+        commands::complete(&self.composer.draft, &self.t.commands)
+    }
+
+    /// Takes the completion `index`: a command that takes nothing runs, the
+    /// rest wait for what follows its name.
+    fn accept(&mut self, index: usize, run: bool) {
+        let Some(command) = self.completions().into_iter().nth(index) else { return };
+        if run && command.hint.is_none() {
+            self.composer.set(&format!("/{}", command.name));
+            self.submit();
+        } else {
+            self.composer.set(&format!("/{} ", command.name));
+        }
+    }
+
+    fn picker_key(&mut self, key: &Key) {
+        let Some(picker) = self.t.picker.as_mut() else { return };
+        let count = picker.sessions.len();
+        if key.is("escape") || key.is("ctrl+c") {
+            self.t.picker = None;
+        } else if key.is("up") && count > 0 {
+            picker.selected = (picker.selected + count - 1) % count;
+        } else if key.is("down") && count > 0 {
+            picker.selected = (picker.selected + 1) % count;
+        } else if key.is("enter") && count > 0 {
+            let session = picker.sessions[picker.selected.min(count - 1)].clone();
+            self.resume(session);
+        }
     }
 
     fn answer(&mut self, approval: Approval) {
@@ -482,11 +622,42 @@ impl Driver {
             Msg::Answer(approval) => self.answer(approval),
             Msg::Choose(choice) => self.choose(Some(choice)),
             Msg::Pick(setting, value) => self.pick(setting, &value),
+            Msg::Complete(index) => self.accept(index, true),
+            Msg::Session(index) => {
+                if let Some(session) = self.t.picker.as_ref().and_then(|p| p.sessions.get(index)).cloned() {
+                    self.resume(session);
+                }
+            }
+            Msg::HoverSession(index) => {
+                if let Some(picker) = self.t.picker.as_mut() {
+                    picker.selected = index;
+                }
+            }
+            Msg::ClosePicker => self.t.picker = None,
             Msg::Focus => {}
         }
     }
 
     pub fn key(&mut self, key: &Key) {
+        if self.t.picker.is_some() {
+            return self.picker_key(key);
+        }
+        let completions = self.completions();
+        if !completions.is_empty() {
+            let count = completions.len();
+            if key.is("escape") {
+                self.composer.dismissed = true;
+                return;
+            } else if key.is("up") {
+                self.composer.pick = (self.composer.pick + count - 1) % count;
+                return;
+            } else if key.is("down") {
+                self.composer.pick = (self.composer.pick + 1) % count;
+                return;
+            } else if key.is("tab") || key.is("enter") {
+                return self.accept(self.composer.pick.min(count - 1), key.is("enter"));
+            }
+        }
         if let Some(question) = &self.t.question {
             let count = question.options.len();
             if key.is("escape") {

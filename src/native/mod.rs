@@ -13,6 +13,7 @@
 //! through a log sink.
 
 mod client;
+mod commands;
 mod composer;
 mod driver;
 mod model;
@@ -254,10 +255,41 @@ mod tests {
         input: Rc<RefCell<VecDeque<Vec<u8>>>>,
         output: Rc<RefCell<String>>,
         frames: u64,
-        step: usize,
+        /// The person's steps: each looks at what was drawn since the last
+        /// step and answers with input once what it waits for is there.
+        script: VecDeque<Step>,
         mark: usize,
         deadline: Instant,
         waker: Waker,
+    }
+
+    type Step = Box<dyn Fn(&str) -> Option<Vec<u8>>>;
+
+    /// A step that types `input` once `seen` was drawn.
+    fn after(seen: &'static str, input: impl Into<Vec<u8>>) -> Step {
+        let input = input.into();
+        Box::new(move |since: &str| since.contains(seen).then(|| input.clone()))
+    }
+
+    impl Pane {
+        fn new(output: &Rc<RefCell<String>>, script: Vec<Step>) -> Self {
+            Self {
+                input: Rc::default(),
+                output: Rc::clone(output),
+                frames: 0,
+                script: script.into(),
+                mark: 0,
+                deadline: Instant::now() + Duration::from_secs(20),
+                waker: Waker::new().unwrap(),
+            }
+        }
+    }
+
+    fn session(pane: Pane) -> Session<Msg> {
+        // `TERN_TSP_RECORD=<file>` keeps the frames, for Tern's `surface-play`.
+        let record = env::var_os("TERN_TSP_RECORD").map(PathBuf::from);
+        let options = Options::new().app("sand").record(record).timeout(Duration::from_secs(5));
+        Session::<Msg>::with_terminal(pane, options).unwrap().expect("TSP answers")
     }
 
     fn event(body: Value) -> Vec<u8> {
@@ -268,26 +300,9 @@ mod tests {
         fn play(&mut self) {
             let out = self.output.borrow().clone();
             let since = &out[self.mark.min(out.len())..];
-            let mut input = self.input.borrow_mut();
-            match self.step {
-                // Setup asks; the second answer is picked with its key.
-                0 if since.contains("How do you want to continue?") => input.push_back(b"2".to_vec()),
-                // The model chip is a picker of the agent's models.
-                1 if since.contains(r#""sendable":true"#) => input.push_back(event(json!({"ev": "change", "sf": "s1",
-                    "id": "dock.composer.bar.model", "value": "haiku"}))),
-                2 if since.contains("Haiku 5.5") && since.contains(r#""value":"haiku""#) => {
-                    input.push_back(b"hi\r".to_vec())
-                }
-                3 if since.contains(r#""status":"ask""#) => {
-                    let at = since.find(r#""k":"tool""#).expect("a tool node");
-                    let start = since[..at].rfind(r#""id":""#).expect("its id") + 6;
-                    let id = &since[start..start + since[start..].find('"').unwrap()];
-                    input.push_back(event(json!({"ev": "action", "sf": "s1", "id": id, "act": "allow"})));
-                }
-                4 if since.contains("this turn") => input.push_back(vec![0x04]),
-                _ => return,
-            }
-            self.step += 1;
+            let Some(input) = self.script.front().and_then(|step| step(since)) else { return };
+            self.script.pop_front();
+            self.input.borrow_mut().push_back(input);
             self.mark = out.len();
         }
     }
@@ -393,19 +408,27 @@ mod tests {
     #[test]
     fn a_native_session_shows_setup_asks_then_chats() {
         let output = Rc::new(RefCell::new(String::new()));
-        let pane = Pane {
-            input: Rc::default(),
-            output: Rc::clone(&output),
-            frames: 0,
-            step: 0,
-            mark: 0,
-            deadline: Instant::now() + Duration::from_secs(20),
-            waker: Waker::new().unwrap(),
-        };
-        // `TERN_TSP_RECORD=<file>` keeps the frames, for Tern's `surface-play`.
-        let record = env::var_os("TERN_TSP_RECORD").map(PathBuf::from);
-        let options = Options::new().app("sand").record(record).timeout(Duration::from_secs(5));
-        let mut session = Session::<Msg>::with_terminal(pane, options).unwrap().expect("TSP answers");
+        let pane = Pane::new(
+            &output,
+            vec![
+                // Setup asks; the second answer is picked with its key.
+                after("How do you want to continue?", "2"),
+                // The model chip is a picker of the agent's models.
+                after(
+                    r#""sendable":true"#,
+                    event(json!({"ev": "change", "sf": "s1", "id": "dock.composer.bar.model", "value": "haiku"})),
+                ),
+                after(r#""value":"haiku""#, "hi\r"),
+                Box::new(|since: &str| {
+                    let at = since.find(r#""k":"tool""#).filter(|_| since.contains(r#""status":"ask""#))?;
+                    let start = since[..at].rfind(r#""id":""#).expect("its id") + 6;
+                    let id = &since[start..start + since[start..].find('"').unwrap()];
+                    Some(event(json!({"ev": "action", "sf": "s1", "id": id, "act": "allow"})))
+                }),
+                after("this turn", [0x04]),
+            ],
+        );
+        let mut session = session(pane);
         let info = Info {
             harness: "claude".into(),
             product: "Claude Code".into(),
@@ -476,5 +499,97 @@ mod tests {
         has("Haiku 5.5");
         has(r#""label":"25%""#);
         has("$0.12");
+    }
+
+    #[test]
+    fn commands_complete_and_sessions_resume() {
+        let output = Rc::new(RefCell::new(String::new()));
+        let pane = Pane::new(
+            &output,
+            vec![
+                // `/he` completes to `/help` with Tab; Enter runs it.
+                after(r#""sendable":true"#, "/he"),
+                after(r#""role":"omp.autocomplete""#, "\t\r"),
+                after("/sessions — Browse", "/sessions\r"),
+                // The second session, with the arrow keys.
+                after("Fix the build", "\x1b[B\r"),
+                after("Resumed · Add a parser", [0x04]),
+            ],
+        );
+        let mut session = session(pane);
+        let info = Info { product: "Claude Code".into(), sandbox: "claude-w".into(), ..Info::default() };
+        let sf = driver::open(&mut session, &info).unwrap();
+        let waker = session.waker().unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        let (from_sand, client_out) = io::pipe().unwrap();
+        let (agent_in, mut to_sand) = io::pipe().unwrap();
+        let fake = thread::spawn(move || {
+            let mut lines = io::BufReader::new(from_sand).lines();
+            let mut seen: Vec<Value> = Vec::new();
+            let mut next = || -> Option<Value> { serde_json::from_str(&lines.next()?.ok()?).ok() };
+            let mut say = |message: Value| writeln!(to_sand, "{message}").unwrap();
+            let answer = |id: &Value, result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
+            let update = |update: Value| {
+                json!({"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "S2", "update": update}})
+            };
+            while let Some(message) = next() {
+                let id = &message["id"];
+                match message["method"].as_str() {
+                    Some("initialize") => {
+                        say(answer(id, json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}})))
+                    }
+                    Some("session/new") => {
+                        say(answer(id, json!({"sessionId": "S1"})));
+                        say(json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "S1",
+                            "update": {"sessionUpdate": "available_commands_update",
+                                "availableCommands": [{"name": "init", "description": "Write CLAUDE.md"}]}}}));
+                    }
+                    Some("session/list") => say(answer(
+                        id,
+                        json!({"sessions": [
+                        {"sessionId": "S9", "cwd": "/w", "title": "Fix the build", "updatedAt": "2026-11-02T10:00:00Z"},
+                        {"sessionId": "S2", "cwd": "/w", "title": "Add a parser", "updatedAt": "2026-11-01T09:00:00Z"}]}),
+                    )),
+                    Some("session/load") => {
+                        say(update(
+                            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "parse it"}}),
+                        ));
+                        say(update(
+                            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Parsed."}}),
+                        ));
+                        say(answer(id, json!({})));
+                    }
+                    _ => {}
+                }
+                seen.push(message);
+            }
+            seen
+        });
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let wake = waker.clone();
+        client::read(io::BufReader::new(agent_in), None, agent_tx, move || wake.wake());
+        tx.send(Command::Agent(client::Client::new(Box::new(client_out), None), agent_rx)).unwrap();
+
+        let mut driver = Driver::new(info, tx, Some(waker));
+        let code = driver.run(&mut session, sf, &rx).unwrap();
+        session.close().unwrap();
+        let seen = fake.join().unwrap();
+
+        assert_eq!(code, 0);
+        let methods: Vec<&str> = seen.iter().filter_map(|m| m["method"].as_str()).collect();
+        assert_eq!(methods, ["initialize", "session/new", "session/list", "session/load"]);
+        assert_eq!(seen[2]["params"], json!({"cwd": "/w"}));
+        assert_eq!(seen[3]["params"], json!({"sessionId": "S2", "cwd": "/w", "mcpServers": []}));
+        assert!(!seen.iter().any(|m| m["method"] == "session/prompt"), "sand's commands never reach the agent");
+
+        let output = output.borrow();
+        let has = |text: &str| assert!(output.contains(text), "{text} in {output}");
+        has("/sessions — Browse this project");
+        has("Write CLAUDE.md");
+        has(r#""role":"sand.sessions""#);
+        has("parse it");
+        has("Parsed.");
     }
 }

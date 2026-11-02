@@ -20,6 +20,9 @@ pub enum Call {
     SetMode,
     SetModel,
     SetConfig,
+    ListSessions,
+    LoadSession,
+    ResumeSession,
 }
 
 impl Call {
@@ -31,6 +34,9 @@ impl Call {
             Self::SetMode => "session/set_mode",
             Self::SetModel => "session/set_model",
             Self::SetConfig => "session/set_config_option",
+            Self::ListSessions => "session/list",
+            Self::LoadSession => "session/load",
+            Self::ResumeSession => "session/resume",
         }
     }
 }
@@ -179,6 +185,17 @@ impl Client {
 
     pub fn set_config(&mut self, session: &str, option: &str, value: &str) -> io::Result<()> {
         self.request(Call::SetConfig, json!({"sessionId": session, "configId": option, "value": value}))
+    }
+
+    pub fn list_sessions(&mut self, cwd: &str) -> io::Result<()> {
+        self.request(Call::ListSessions, json!({"cwd": cwd}))
+    }
+
+    /// Resumes `session`: `session/load` replays its conversation,
+    /// `session/resume` (for an agent that cannot load) does not.
+    pub fn open_session(&mut self, session: &str, cwd: &str, load: bool) -> io::Result<()> {
+        let call = if load { Call::LoadSession } else { Call::ResumeSession };
+        self.request(call, json!({"sessionId": session, "cwd": cwd, "mcpServers": []}))
     }
 
     pub fn cancel(&mut self, session: &str) -> io::Result<()> {
