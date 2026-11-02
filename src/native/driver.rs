@@ -87,7 +87,8 @@ pub struct Driver {
     /// A message forced past the running turn: sent once its stop is confirmed.
     forced: Option<Prompt>,
     can_resume: bool,
-    /// The session to go back to if resuming another fails.
+    can_fork: bool,
+    /// The session to go back to if resuming (or forking) another fails.
     previous: Option<String>,
     /// Where the answer to the question on screen goes.
     reply: Option<Sender<Option<usize>>>,
@@ -135,6 +136,7 @@ impl Driver {
             pasted_count: 0,
             forced: None,
             can_resume: false,
+            can_fork: false,
             previous: None,
             reply: None,
             commands,
@@ -498,6 +500,7 @@ impl Driver {
                 self.can_image = caps["promptCapabilities"]["image"].as_bool().unwrap_or(false);
                 self.can_embed = caps["promptCapabilities"]["embeddedContext"].as_bool().unwrap_or(false);
                 self.can_resume = !caps["sessionCapabilities"]["resume"].is_null();
+                self.can_fork = !caps["sessionCapabilities"]["fork"].is_null();
                 let cwd = self.agent.as_ref().map(|a| a.cwd.clone()).unwrap_or_default();
                 let sent = self.client().map(|c| c.new_session(&cwd));
                 self.check(sent);
@@ -515,6 +518,19 @@ impl Driver {
                 self.t.resuming = None;
                 self.session = self.previous.take();
                 self.t.error(format!("The session could not be resumed: {err}"), None);
+                self.t.turn = Turn::Idle;
+            }
+            (Call::ForkSession, Ok(result)) => {
+                let original = self.previous.take().unwrap_or_default();
+                self.session = result["sessionId"].as_str().map(str::to_string);
+                self.t.entries.push(Entry::Notice(format!(
+                    "Forked: this conversation goes on in a new session; /resume {original} returns to the original"
+                )));
+                self.ready(&result);
+            }
+            (Call::ForkSession, Err(err)) => {
+                self.previous = None;
+                self.t.error(format!("The session could not be forked: {err}"), None);
                 self.t.turn = Turn::Idle;
             }
             (Call::ListSessions, result) => {
@@ -737,6 +753,7 @@ impl Driver {
                 let sent = self.client().map(|c| c.new_session(&cwd));
                 self.check(sent);
             }
+            Builtin::Fork => self.fork(),
             Builtin::Mount(None) => {
                 self.t.error("Say which directory: /mount <dir>, or <dir>:ro for read-only".to_string(), None);
             }
@@ -776,6 +793,24 @@ impl Driver {
         self.t.turn = Turn::Starting;
         let (cwd, load) = (session.cwd.unwrap_or_else(|| self.cwd()), self.can_load);
         let sent = self.client().map(|c| c.open_session(&session.id, &cwd, load));
+        self.check(sent);
+    }
+
+    /// Goes on in a copy of this session, its conversation kept on screen.
+    fn fork(&mut self) {
+        let product = &self.info.product;
+        if !self.can_fork {
+            self.t.error(format!("{product} cannot fork sessions over ACP"), None);
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            self.t.error("There is no session to fork yet".to_string(), None);
+            return;
+        };
+        self.previous = Some(session.clone());
+        self.t.turn = Turn::Starting;
+        let cwd = self.cwd();
+        let sent = self.client().map(|c| c.fork_session(&session, &cwd));
         self.check(sent);
     }
 
@@ -1524,5 +1559,27 @@ mod tests {
         // A failed turn keeps a forced message at the head of the paused queue.
         d.response(Call::Prompt, Err("overloaded".into()), Instant::now());
         assert_eq!((d.t.queue.first(), d.t.queue_paused), (Some(&Prompt::text("now again")), true));
+    }
+
+    #[test]
+    fn fork_goes_on_in_a_copy_and_keeps_the_conversation() {
+        let mut d = working();
+        type_and_send(&mut d, "/fork");
+        assert!(matches!(d.t.entries.last(), Some(Entry::Error { .. })), "only an agent that can fork");
+        assert_eq!(d.session.as_deref(), Some("S"));
+
+        d.can_fork = true;
+        d.t.entries.clear();
+        d.t.entries.push(Entry::Notice("earlier".into()));
+        type_and_send(&mut d, "/fork");
+        assert_eq!((d.t.turn, d.previous.as_deref()), (Turn::Starting, Some("S")));
+        d.response(Call::ForkSession, Ok(serde_json::json!({"sessionId": "F"})), Instant::now());
+        assert_eq!((d.session.as_deref(), d.t.turn), (Some("F"), Turn::Idle));
+        assert!(matches!(&d.t.entries[0], Entry::Notice(t) if t == "earlier"), "the conversation stays");
+        assert!(matches!(d.t.entries.last(), Some(Entry::Notice(t)) if t.contains("/resume S")));
+
+        type_and_send(&mut d, "/fork");
+        d.response(Call::ForkSession, Err("no".into()), Instant::now());
+        assert_eq!((d.session.as_deref(), d.t.turn, d.previous.as_deref()), (Some("F"), Turn::Idle, None));
     }
 }

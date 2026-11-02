@@ -1,6 +1,6 @@
 //! Slash commands: the agent's own (ACP's `available_commands_update`, run by
 //! sending them as a prompt) and sand's, which ACP offers as methods rather
-//! than as commands: listing and resuming sessions, starting a new one.
+//! than as commands: listing, resuming and forking sessions, starting a new one.
 
 /// A command the composer completes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +22,8 @@ pub enum Builtin {
     Resume(Option<String>),
     /// Leave this session for a new one.
     New,
+    /// Go on in a copy of this session, leaving it as it is.
+    Fork,
     /// Mount a host directory into the sandbox (`DIR`, `DIR:ro`, `DIR:rw`).
     Mount(Option<String>),
     Help,
@@ -31,6 +33,7 @@ const BUILTINS: &[(&str, &str, Option<&str>)] = &[
     ("sessions", "Browse this project's sessions and resume one", None),
     ("resume", "Resume a session (the picker without an id)", Some("[session id]")),
     ("new", "Start a new session", None),
+    ("fork", "Go on in a copy of this session, leaving the original as it is", None),
     ("mount", "Mount a directory of this computer into the sandbox", Some("<dir>[:ro|:rw]")),
     ("help", "List the commands", None),
 ];
@@ -53,6 +56,7 @@ pub fn parse(text: &str) -> Option<Builtin> {
         "sessions" => Builtin::Sessions,
         "resume" => Builtin::Resume((!args.is_empty()).then(|| args.to_string())),
         "new" | "clear" => Builtin::New,
+        "fork" => Builtin::Fork,
         "mount" => Builtin::Mount((!args.is_empty()).then(|| args.to_string())),
         "help" => Builtin::Help,
         _ => return None,
@@ -90,6 +94,7 @@ mod tests {
         assert_eq!(parse(" /resume  abc-123 "), Some(Builtin::Resume(Some("abc-123".into()))));
         assert_eq!(parse("/resume"), Some(Builtin::Resume(None)));
         assert_eq!(parse("/new"), Some(Builtin::New));
+        assert_eq!(parse("/fork"), Some(Builtin::Fork));
         assert_eq!(parse("/mount ~/notes:ro"), Some(Builtin::Mount(Some("~/notes:ro".into()))));
         assert_eq!(parse("/mount"), Some(Builtin::Mount(None)));
         assert_eq!(parse("/init"), None);
@@ -101,7 +106,7 @@ mod tests {
         let agent = [agent("review"), agent("resume"), agent("release-notes")];
         let names = |draft: &str| complete(draft, &agent).into_iter().map(|c| c.name).collect::<Vec<_>>();
         assert_eq!(names("/re"), ["resume", "review", "release-notes"]);
-        assert_eq!(names("/"), ["sessions", "resume", "new", "mount", "help", "review", "release-notes"]);
+        assert_eq!(names("/"), ["sessions", "resume", "new", "fork", "mount", "help", "review", "release-notes"]);
         assert!(names("/resume").is_empty(), "a command typed whole needs no completion");
         assert!(names("/review x").is_empty());
         assert!(names("hi").is_empty());

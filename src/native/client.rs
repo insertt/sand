@@ -24,6 +24,7 @@ pub enum Call {
     ListSessions,
     LoadSession,
     ResumeSession,
+    ForkSession,
 }
 
 impl Call {
@@ -38,6 +39,7 @@ impl Call {
             Self::ListSessions => "session/list",
             Self::LoadSession => "session/load",
             Self::ResumeSession => "session/resume",
+            Self::ForkSession => "session/fork",
         }
     }
 }
@@ -225,6 +227,11 @@ impl Client {
     pub fn open_session(&mut self, session: &str, cwd: &str, load: bool) -> io::Result<()> {
         let call = if load { Call::LoadSession } else { Call::ResumeSession };
         self.request(call, json!({"sessionId": session, "cwd": cwd, "mcpServers": self.servers}))
+    }
+
+    /// Copies `session`, its conversation so far, into a new session.
+    pub fn fork_session(&mut self, session: &str, cwd: &str) -> io::Result<()> {
+        self.request(Call::ForkSession, json!({"sessionId": session, "cwd": cwd, "mcpServers": self.servers}))
     }
 
     pub fn cancel(&mut self, session: &str) -> io::Result<()> {
