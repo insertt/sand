@@ -23,6 +23,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -170,7 +171,7 @@ fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-fn is_deny(choice: &Choice) -> bool {
+pub fn is_deny(choice: &Choice) -> bool {
     let text = format!("{} {}", choice.id, choice.label).to_ascii_lowercase();
     ["deny", "reject", "block", "decline"].iter().any(|word| text.contains(word))
 }
@@ -329,6 +330,22 @@ pub struct Summary {
 /// Mounts a directory into the running sandbox; answers whether anything changed.
 type Mounter = Box<dyn Fn(&Mount) -> anyhow::Result<bool> + Send>;
 
+/// Asks the person on the host whether to allow something.
+pub type Confirm = Box<dyn Fn(&str) -> Answer + Send>;
+
+/// Told the approvals sbx has pending for the sandbox, whenever they change.
+pub type Watch = Box<dyn Fn(&[Approval]) + Send>;
+
+/// How a session that draws its own UI takes part: it asks the questions in
+/// place of the host dialog, sees the approvals sbx has pending for the
+/// sandbox, and answers them (approval id, option id), already confirmed by
+/// the person in that UI.
+pub struct Hooks {
+    pub confirm: Confirm,
+    pub pending: Watch,
+    pub answers: Receiver<(String, String)>,
+}
+
 /// Answers the requests of one sandbox while its session runs.
 pub struct Bridge {
     stop: Arc<AtomicBool>,
@@ -337,6 +354,11 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn start(sbx: Sbx, dirs: Dirs, sandbox: String) -> Self {
+        Self::start_with(sbx, dirs, sandbox, None)
+    }
+
+    /// Like `start`, asking and showing through `hooks` when given.
+    pub fn start_with(sbx: Sbx, dirs: Dirs, sandbox: String, hooks: Option<Hooks>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let summary = Arc::new(Mutex::new(Summary::default()));
         let mounter: Mounter = {
@@ -355,7 +377,14 @@ impl Bridge {
             declined: HashMap::new(),
             summary: summary.clone(),
             confirm: Box::new(confirm),
+            watch: None,
+            answers: None,
         };
+        if let Some(hooks) = hooks {
+            worker.confirm = hooks.confirm;
+            worker.watch = Some(hooks.pending);
+            worker.answers = Some(hooks.answers);
+        }
         let flag = stop.clone();
         // Not joined: it may be waiting on a dialog nobody answers.
         thread::spawn(move || {
@@ -385,8 +414,12 @@ struct Worker {
     pending_at: Option<Instant>,
     declined: HashMap<String, Instant>,
     summary: Arc<Mutex<Summary>>,
-    confirm: Box<dyn Fn(&str) -> Answer + Send>,
+    confirm: Confirm,
     mounter: Mounter,
+    /// Told whenever the pending approvals change.
+    watch: Option<Watch>,
+    /// Approvals answered in the session's own UI.
+    answers: Option<Receiver<(String, String)>>,
 }
 
 impl Worker {
@@ -401,6 +434,21 @@ impl Worker {
     fn round(&mut self, stop: &AtomicBool) {
         if self.pending_at.is_none_or(|at| at.elapsed() >= PENDING_EVERY) {
             self.refresh_pending();
+        }
+        let answered: Vec<(String, String)> =
+            self.answers.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for (id, option) in answered {
+            let outcome = self.answer_approval(&id, Some(&option), true);
+            let request = Request {
+                kind: Some("approval".into()),
+                host: String::new(),
+                approval: Some(id),
+                option: Some(option),
+                path: None,
+                mode: None,
+                reason: None,
+            };
+            self.record(&request, &outcome);
         }
         for (id, path) in self.requests().into_iter().take(PER_ROUND) {
             if stop.load(Ordering::Relaxed) {
@@ -417,6 +465,9 @@ impl Worker {
         let listed = self.sbx.capture(args!["policy", "approval", "ls", "--json"]).ok().flatten();
         // An sbx without approvals leaves the list out: the mod then offers allow rules alone.
         if let Some(approvals) = listed.and_then(|json| parse_approvals(&json, &self.sandbox)) {
+            if let Some(watch) = self.watch.as_ref().filter(|_| approvals != self.pending) {
+                watch(&approvals);
+            }
             self.pending = approvals;
             let _ = write_json(&self.dir.join("pending.json"), &json!({ "approvals": self.pending }));
         }
@@ -469,7 +520,7 @@ impl Worker {
             return self.answer_mount(path, request.mode.as_deref(), request.reason.as_deref());
         }
         match &request.approval {
-            Some(approval) => self.answer_approval(approval, request.option.as_deref()),
+            Some(approval) => self.answer_approval(approval, request.option.as_deref(), false),
             None => self.answer_allow(&request.host),
         }
     }
@@ -539,7 +590,9 @@ impl Worker {
         }
     }
 
-    fn answer_approval(&mut self, id: &str, option: Option<&str>) -> Outcome {
+    /// Answers approval `id` with `option`; `confirmed` when the person chose
+    /// it in a UI the agent cannot reach, which needs no second question.
+    fn answer_approval(&mut self, id: &str, option: Option<&str>, confirmed: bool) -> Outcome {
         self.refresh_pending();
         // The host and options come from sbx, not from the request.
         let Some(approval) = self.pending.iter().find(|a| a.id == id).cloned() else {
@@ -553,7 +606,7 @@ impl Worker {
         };
         let host = &approval.host;
         // Refusing needs no confirmation: it can only take access away.
-        if !is_deny(&choice) {
+        if !is_deny(&choice) && !confirmed {
             let question = format!(
                 "Sandbox '{}' asks for network access to {host}.\n\nAnswer: {}\n\nAllow it?",
                 self.sandbox, choice.label
@@ -565,7 +618,13 @@ impl Worker {
             }
         }
         let respond = args!["policy", "approval", "respond", &approval.id, "--option", &choice.id];
-        match self.sbx_quiet(respond) {
+        let responded = self.sbx_quiet(respond);
+        // Answered: it is no longer pending, wherever it shows.
+        self.pending.retain(|a| a.id != approval.id);
+        if let Some(watch) = &self.watch {
+            watch(&self.pending);
+        }
+        match responded {
             Ok(()) if is_deny(&choice) => Outcome::done(format!("{host}: {}", choice.label)),
             Ok(()) => {
                 self.allowed(host);
@@ -790,9 +849,36 @@ mod tests {
                 seen.lock().unwrap().push(q.to_string());
                 answer.lock().unwrap().take().unwrap_or(Answer::Deny)
             }),
+            watch: None,
+            answers: None,
         };
         worker.reset();
         (worker, asked)
+    }
+
+    #[test]
+    fn approvals_answered_in_the_native_ui_are_not_asked_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let watched = seen.clone();
+        worker.watch = Some(Box::new(move |pending: &[Approval]| {
+            watched.lock().unwrap().push(pending.iter().map(|a| a.id.clone()).collect::<Vec<_>>());
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.answers = Some(rx);
+        let choice = |id: &str, label: &str| Choice { id: id.into(), label: label.into() };
+        worker.pending = vec![
+            Approval { id: "a1".into(), host: "api.github.com".into(), options: vec![choice("allow", "Allow")] },
+            Approval { id: "a2".into(), host: "pypi.org".into(), options: vec![choice("allow", "Allow")] },
+        ];
+        worker.pending_at = Some(Instant::now());
+        tx.send(("a1".into(), "allow".into())).unwrap();
+        worker.round(&AtomicBool::new(false));
+        assert!(asked.lock().unwrap().is_empty(), "the person chose in the pane; no host dialog");
+        assert_eq!(seen.lock().unwrap().last().unwrap(), &vec!["a2".to_string()], "a1 is no longer pending");
+        let log = fs::read_to_string(tmp.path().join("log")).unwrap();
+        assert!(log.contains("\"approval\":\"a1\""), "{log}");
     }
 
     #[test]
@@ -868,7 +954,7 @@ mod tests {
         let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
         assert!(!worker.answer_allow("*.example.com").ok);
         assert!(!worker.answer_allow("a.com,b.com").ok);
-        assert!(!worker.answer_approval("made-up", Some("once")).ok);
+        assert!(!worker.answer_approval("made-up", Some("once"), false).ok);
         assert!(asked.lock().unwrap().is_empty());
     }
 

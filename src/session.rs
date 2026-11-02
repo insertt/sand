@@ -1138,6 +1138,8 @@ fn attach_native(
     keep_alive: KeepAlive,
 ) -> Result<i32> {
     log::step(format!("Starting {}", crate::tern::product_name(&profile.name)));
+    // Mounts and hosts the agent asks for, and sbx's network approvals, show in the pane.
+    let hooks = native::bridge_hooks();
     let spec = native::ChatSpec {
         sbx: sbx.clone(),
         launch: acp_launch(profile, state),
@@ -1154,7 +1156,8 @@ fn attach_native(
         mcp: state.mcp.clone(),
         workspace: state.mounts.primary.as_ref().map(|m| m.path.clone()),
     };
-    let bridge = profile.network_prompts.then(|| Bridge::start(sbx.clone(), dirs.clone(), state.name.clone()));
+    let bridge = (hooks.is_some() || profile.network_prompts)
+        .then(|| Bridge::start_with(sbx.clone(), dirs.clone(), state.name.clone(), hooks));
     IN_SESSION.store(true, Ordering::SeqCst);
     let code = native::chat(spec).unwrap_or_else(|| Err(anyhow::anyhow!("the native session is gone")));
     IN_SESSION.store(false, Ordering::SeqCst);

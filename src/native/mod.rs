@@ -56,6 +56,14 @@ pub enum Command {
     Chat(Box<ChatSpec>),
     /// Setup ended without a chat: close the surface.
     Close,
+    /// Something only the person may allow (a mount, a network host): the
+    /// answer goes to `reply`.
+    Confirm {
+        question: String,
+        reply: Sender<bool>,
+    },
+    /// Where answers to sbx's pending network approvals go.
+    Approvals(Sender<(String, String)>),
     /// Talk to this agent (tests stand one in for `sbx exec`).
     #[cfg(test)]
     Agent(client::Client, Receiver<client::Incoming>),
@@ -67,6 +75,8 @@ pub enum Update {
     Mcp(Vec<McpStatus>),
     Branch(Option<String>),
     Mounts(Vec<String>),
+    /// The network approvals sbx has pending for the sandbox.
+    Pending(Vec<crate::network::Approval>),
 }
 
 /// How to start the agent, and what to keep looking at while it runs.
@@ -192,6 +202,49 @@ fn surface(
     let code = code?;
     closed?;
     Ok(code)
+}
+
+/// How long a question to the person waits before it counts as declined.
+const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The network bridge's hooks into the native surface: its questions become
+/// cards there instead of host dialogs, and sbx's pending network approvals
+/// show there with their options. `None` without a native surface.
+pub fn bridge_hooks() -> Option<crate::network::Hooks> {
+    use crate::network::Answer;
+
+    let (tx, waker) = {
+        let host = host();
+        let host = host.as_ref()?;
+        (host.tx.clone(), host.waker.clone())
+    };
+    let send = move |command: Command| {
+        let sent = tx.send(command).is_ok();
+        waker.wake();
+        sent
+    };
+    let (answers_tx, answers) = mpsc::channel();
+    if !send(Command::Approvals(answers_tx)) {
+        return None;
+    }
+    let ask = send.clone();
+    let confirm = Box::new(move |question: &str| {
+        let (reply, answer) = mpsc::channel();
+        if !ask(Command::Confirm { question: question.to_string(), reply }) {
+            return Answer::Unavailable("the native session has ended".to_string());
+        }
+        match answer.recv_timeout(CONFIRM_TIMEOUT) {
+            Ok(true) => Answer::Allow,
+            Ok(false) | Err(mpsc::RecvTimeoutError::Timeout) => Answer::Deny,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Answer::Unavailable("the native session has ended".to_string())
+            }
+        }
+    });
+    let pending = Box::new(move |approvals: &[crate::network::Approval]| {
+        send(Command::Update(Update::Pending(approvals.to_vec())));
+    });
+    Some(crate::network::Hooks { confirm, pending, answers })
 }
 
 /// Whether a native surface shows the session (setup has not handed it over yet).

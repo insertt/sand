@@ -144,6 +144,10 @@ pub enum Msg {
     /// The welcome card's Continue, and its suggested prompts.
     ContinueLast,
     Suggest(String),
+    /// An option of one of sbx's network approvals (approval id, option id).
+    Network(String, String),
+    /// The person's answer to question `index` (a mount, a host).
+    Confirm(usize, bool),
 }
 
 /// What the session runs in: what the status line shows besides the agent's own facts.
@@ -758,6 +762,12 @@ fn dock(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
     if let Some(question) = &t.question {
         nodes.push(question_card(t, question));
     }
+    for (i, question) in t.confirms.iter().enumerate() {
+        nodes.push(confirm_card(i, question));
+    }
+    for approval in &t.network {
+        nodes.push(network_card(approval, info));
+    }
     if !t.plan.is_empty() {
         nodes.push(plan(t));
     }
@@ -837,6 +847,59 @@ fn queue(t: &Transcript) -> Node<Msg> {
         );
     }
     col.into()
+}
+
+/// A question only the person may answer: sand asks it here instead of in a
+/// host dialog, where the agent cannot click either.
+fn confirm_card(index: usize, question: &str) -> Node<Msg> {
+    let mut paragraphs = question.split("\n\n");
+    let head = paragraphs.next().unwrap_or_default().to_string();
+    let icon = if head.contains("mount") { "folder-plus" } else { "globe" };
+    let body: Vec<&str> = paragraphs.collect();
+    let mut card =
+        ui::card().key(format!("confirm{index}")).role("agent.request").tone("warning").icon(icon).head(head);
+    if !body.is_empty() {
+        card = card.child(ui::md(body.join("\n\n")).key("body"));
+    }
+    card.child(
+        ui::row()
+            .key("answers")
+            .gap("sm")
+            .child(ui::button("Allow").key("allow").variant("primary").size("sm").on_click(Msg::Confirm(index, true)))
+            .child(ui::button("Deny").key("deny").size("sm").on_click(Msg::Confirm(index, false))),
+    )
+    .into()
+}
+
+/// Network access sbx blocked and holds for the person, with its own options.
+fn network_card(approval: &crate::network::Approval, info: &Info) -> Node<Msg> {
+    let mut answers = ui::row().key("answers").gap("sm").wrap(true);
+    let mut first_allow = true;
+    for (i, choice) in approval.options.iter().enumerate() {
+        let mut button = ui::button(choice.label.clone()).key(i).size("sm");
+        if crate::network::is_deny(choice) {
+            button = button.variant("quiet");
+        } else if first_allow {
+            button = button.variant("primary");
+            first_allow = false;
+        }
+        answers = answers.child(button.on_click(Msg::Network(approval.id.clone(), choice.id.clone())));
+    }
+    ui::card()
+        .key(format!("net-{}", approval.id))
+        .role("agent.request")
+        .tone("warning")
+        .icon("globe")
+        .head(format!("Network access to {}", approval.host))
+        .child(
+            ui::text(spans(&[(
+                &format!("The sandbox {} was blocked from reaching this host. sbx asks what to do.", info.sandbox),
+                "muted",
+            )]))
+            .key("why"),
+        )
+        .child(answers)
+        .into()
 }
 
 /// Setup's question, with what led to it and a button per answer.
@@ -1450,6 +1513,34 @@ mod tests {
         assert_eq!(labels[0], "Continue “Fix the build”");
         assert_eq!(labels.len(), 1 + SUGGESTIONS.len());
         assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn network_and_mount_questions_show_as_cards() {
+        let mut t = Transcript::default();
+        t.turn = Turn::Working;
+        t.confirms =
+            vec!["Sandbox 'claude-app' asks to mount a directory of this computer:\n\n/src/lib\n\nMount it?".into()];
+        t.network = vec![crate::network::Approval {
+            id: "a1".into(),
+            host: "api.github.com".into(),
+            options: vec![
+                crate::network::Choice { id: "deny".into(), label: "Deny".into() },
+                crate::network::Choice { id: "once".into(), label: "Allow once".into() },
+            ],
+        }];
+        let v = view(&t, &Composer::default(), &info());
+        let dock = region(&v, 1);
+        let (mount, network) = (&dock[0], &dock[1]);
+        assert_eq!(mount.props()["head"], "Sandbox 'claude-app' asks to mount a directory of this computer:");
+        assert_eq!(mount.props()["icon"], "folder-plus");
+        assert_eq!(mount.child_nodes()[0].props()["text"], "/src/lib\n\nMount it?");
+        assert_eq!(network.props()["head"], "Network access to api.github.com");
+        let answers = &network.child_nodes()[1].child_nodes();
+        assert_eq!(
+            (answers[0].props()["variant"].as_str(), answers[1].props()["variant"].as_str()),
+            (Some("quiet"), Some("primary"))
+        );
     }
 
     #[test]

@@ -74,6 +74,10 @@ pub struct Driver {
     commands: Sender<Command>,
     waker: Option<Waker>,
     stop_probes: Arc<AtomicBool>,
+    /// Where the answers to the person's questions go, oldest first.
+    confirm_replies: Vec<Sender<bool>>,
+    /// Where answers to sbx's network approvals go.
+    approvals: Option<Sender<(String, String)>>,
     quit: bool,
     /// The person pressed Ctrl+C during setup.
     pub interrupted: bool,
@@ -107,6 +111,8 @@ impl Driver {
             commands,
             waker,
             stop_probes: Arc::new(AtomicBool::new(false)),
+            confirm_replies: Vec::new(),
+            approvals: None,
             quit: false,
             interrupted: false,
             by_person: false,
@@ -257,6 +263,13 @@ impl Driver {
             Command::Update(update) => self.update(update),
             Command::Chat(spec) => self.start(*spec, now),
             Command::Close => self.closed = true,
+            Command::Confirm { question, reply } => {
+                let first = question.lines().next().unwrap_or_default().to_string();
+                self.t.note(first, "warning");
+                self.t.confirms.push(question);
+                self.confirm_replies.push(reply);
+            }
+            Command::Approvals(answers) => self.approvals = Some(answers),
             #[cfg(test)]
             Command::Agent(client, rx) => self.attach(client, rx, None, None, "/w".to_string()),
         }
@@ -268,6 +281,17 @@ impl Driver {
             Update::Mcp(mcp) => self.info.mcp = mcp,
             Update::Branch(branch) => self.info.branch = branch,
             Update::Mounts(mounts) => self.info.mounts = mounts,
+            Update::Pending(pending) => {
+                let new: Vec<String> = pending
+                    .iter()
+                    .filter(|a| !self.t.network.iter().any(|n| n.id == a.id))
+                    .map(|a| a.host.clone())
+                    .collect();
+                for host in new {
+                    self.t.note(format!("The sandbox asks for network access to {host}"), "warning");
+                }
+                self.t.network = pending;
+            }
         }
     }
 
@@ -773,6 +797,19 @@ impl Driver {
                 self.t.queue_paused = false;
             }
             Msg::DismissNotes => self.t.notes.clear(),
+            Msg::Network(id, option) => {
+                if let Some(answers) = &self.approvals {
+                    let _ = answers.send((id.clone(), option));
+                }
+                // Gone at once; the bridge says so too once sbx took the answer.
+                self.t.network.retain(|a| a.id != id);
+            }
+            Msg::Confirm(index, allow) => {
+                if index < self.t.confirms.len() {
+                    self.t.confirms.remove(index);
+                    let _ = self.confirm_replies.remove(index).send(allow);
+                }
+            }
             Msg::ContinueLast => {
                 if let Some(session) = self.t.last_session.take() {
                     self.resume(session);
@@ -1061,5 +1098,36 @@ mod tests {
         let gone = serde_json::from_value(serde_json::json!({"ids": ["s1"]})).unwrap();
         d.event(&Event::Gone(gone), "s1");
         assert!(d.quit && d.by_person);
+    }
+
+    #[test]
+    fn the_persons_questions_and_network_approvals_are_answered_in_the_pane() {
+        let mut d = working();
+        d.t.hidden = true;
+        let (reply, answer) = std::sync::mpsc::channel();
+        d.command(Command::Confirm {
+            question: "Sandbox 'x' asks to mount a directory:\n\n/src/lib\n\nMount it?".into(),
+            reply,
+        });
+        assert_eq!(d.t.confirms.len(), 1);
+        assert_eq!(d.t.notes[0].text, "Sandbox 'x' asks to mount a directory:");
+        d.msg(Msg::Confirm(0, true));
+        assert!(answer.recv().unwrap());
+        assert!(d.t.confirms.is_empty());
+
+        let (answers, answered) = std::sync::mpsc::channel();
+        d.command(Command::Approvals(answers));
+        let approval = crate::network::Approval {
+            id: "a1".into(),
+            host: "api.github.com".into(),
+            options: vec![crate::network::Choice { id: "once".into(), label: "Allow once".into() }],
+        };
+        d.command(Command::Update(Update::Pending(vec![approval.clone()])));
+        d.command(Command::Update(Update::Pending(vec![approval])));
+        let asked: Vec<&str> = d.t.notes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(asked.iter().filter(|n| n.contains("api.github.com")).count(), 1, "noted once");
+        d.msg(Msg::Network("a1".into(), "once".into()));
+        assert_eq!(answered.recv().unwrap(), ("a1".to_string(), "once".to_string()));
+        assert!(d.t.network.is_empty());
     }
 }

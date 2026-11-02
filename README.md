@@ -486,6 +486,12 @@ pane is hidden, what happens (a finished turn, a permission request, the agent
 exiting) is noted above the composer for when you come back. Each turn ends
 with its time, tokens and cost.
 
+Network access the sandbox was blocked from shows above the composer as a
+card with sbx's own options (allow once, always, deny…), answered with a
+click, for any harness; requests from sand's Claude Code mod to mount a
+directory or allow a host ask there too, instead of in a host dialog. Both are
+noted when they come in while the pane is hidden.
+
 You can type during setup; the first message is sent once the agent is ready.
 Enter sends, Shift+Enter starts a new line and Esc stops a turn. As in
 Claude Code, Ctrl+C stops a turn or clears the draft first, and otherwise

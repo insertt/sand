@@ -366,6 +366,10 @@ pub struct Transcript {
     pub notes: Vec<Note>,
     /// The session before this one, for the welcome card's Continue.
     pub last_session: Option<SessionEntry>,
+    /// Network access the sandbox was blocked from, waiting for the person.
+    pub network: Vec<crate::network::Approval>,
+    /// Questions only the person may answer (a mount, a host), oldest first.
+    pub confirms: Vec<String>,
     pub entries: Vec<Entry>,
     /// Tool call id to its index in `entries`.
     tools: HashMap<String, usize>,
@@ -402,6 +406,8 @@ impl Default for Transcript {
             hidden: false,
             notes: Vec::new(),
             last_session: None,
+            network: Vec::new(),
+            confirms: Vec::new(),
             entries: Vec::new(),
             tools: HashMap::new(),
             plan: Vec::new(),
