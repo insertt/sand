@@ -540,25 +540,39 @@ fn no_attach_sets_the_sandbox_up_without_running_the_agent() {
 }
 
 #[test]
-fn recreate_preserves_history_unless_told_otherwise() {
+fn recreate_asks_what_to_keep_and_force_recreate_keeps_nothing() {
     let env = Env::new();
-    env.ok(&["codex"]);
+    env.register_mcp(&["atlassian"]);
+    env.ok(&["codex", ".", "../other:ro", "--mcp", "atlassian"]);
     let history = env.sandbox_dir("codex-proj").join("history/.codex_sessions");
-    fs::write(history.join("rollout.jsonl"), "conversation").unwrap();
     env.take_log();
 
-    let out = env.ok(&["codex", "--recreate"]);
+    // Nothing beyond the command line to keep: nothing to ask.
+    env.ok(&["codex", ".", "../other:ro", "--mcp", "atlassian", "--recreate"]);
     let log = env.take_log();
     assert_eq!(starting(&log, "rm"), vec!["rm --force codex-proj"]);
     assert_eq!(starting(&log, "create").len(), 1);
-    assert_eq!(fs::read_to_string(history.join("rollout.jsonl")).unwrap(), "conversation");
-    // The history mount is re-established on the new sandbox.
-    assert!(has(&log, &format!("mount codex-proj {}:/home/agent/.codex/sessions:rw", env.p(&history))));
-    assert!(stderr(&out).contains("history is preserved"));
 
-    env.ok(&["codex", "--recreate", "--no-preserve-history"]);
+    // History, a mount and a server the command line leaves out: --recreate asks, and
+    // without a terminal it stops before removing anything.
+    fs::write(history.join("rollout.jsonl"), "conversation").unwrap();
+    let err = env.fails(&["codex", "--recreate"]);
+    let other = env.p(&env.other);
+    assert!(err.contains("--recreate asks what to keep"), "{err}");
+    assert!(err.contains(&format!("conversation history; mounts: {other} (ro); MCP servers: atlassian")), "{err}");
+    assert!(err.contains("--force-recreate"), "{err}");
+    assert!(starting(&env.take_log(), "rm").is_empty());
+
+    // --force-recreate asks nothing and keeps only the command line.
+    let out = env.ok(&["codex", "--force-recreate"]);
+    let log = env.take_log();
+    assert_eq!(starting(&log, "rm"), vec!["rm --force codex-proj"]);
+    assert_eq!(starting(&log, "create"), vec![format!("create --name codex-proj codex {}", env.p(&env.proj))]);
+    assert!(stderr(&out).contains("including its conversation history"));
     assert!(!history.join("rollout.jsonl").exists());
     assert!(history.is_dir(), "a fresh history directory is mounted");
+    // The history mount is re-established on the new sandbox.
+    assert!(has(&log, &format!("mount codex-proj {}:/home/agent/.codex/sessions:rw", env.p(&history))));
 }
 
 #[test]

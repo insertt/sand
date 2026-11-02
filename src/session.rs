@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use console::Term;
-use dialoguer::Select;
+use dialoguer::{MultiSelect, Select};
 
 use crate::acp;
 use crate::args;
@@ -349,6 +349,101 @@ fn reconcile_unmanaged(req: &Request, args: &RunArgs) -> Result<Decision> {
             })
         }
     }
+}
+
+/// What `--recreate` can carry over to the new sandbox, beyond the command line.
+#[derive(Debug, PartialEq)]
+enum Keep {
+    History,
+    /// Extra mounts the sandbox has and the command line does not name.
+    Mounts(Vec<Mount>),
+    /// MCP servers the sandbox has and the command line does not name.
+    Mcp(Vec<String>),
+}
+
+impl Keep {
+    fn label(&self) -> String {
+        match self {
+            Keep::History => "conversation history".to_string(),
+            Keep::Mounts(mounts) => {
+                format!("mounts: {}", mounts.iter().map(Mount::to_string).collect::<Vec<_>>().join(", "))
+            }
+            Keep::Mcp(servers) => format!("MCP servers: {}", servers.join(", ")),
+        }
+    }
+}
+
+/// What there is to keep when recreating `current` for `req`; only what the
+/// command line does not already ask for.
+fn keepable(req: &Request, current: Option<&SandboxState>, has_history: bool) -> Vec<Keep> {
+    let mut offered = Vec::new();
+    if has_history {
+        offered.push(Keep::History);
+    }
+    let Some(state) = current else { return offered };
+    let mounts: Vec<Mount> =
+        state.mounts.extras.iter().filter(|m| req.mounts.all().all(|r| r.path != m.path)).cloned().collect();
+    if !mounts.is_empty() {
+        offered.push(Keep::Mounts(mounts));
+    }
+    let servers: Vec<String> = state.mcp.iter().filter(|m| !req.mcp.contains(m)).cloned().collect();
+    if !servers.is_empty() {
+        offered.push(Keep::Mcp(servers));
+    }
+    offered
+}
+
+/// Asks which of `offered` to keep, all of it by default; `None` when the person aborts.
+fn choose_kept(name: &str, offered: Vec<Keep>, acp: bool) -> Result<Option<Vec<Keep>>> {
+    if offered.is_empty() {
+        return Ok(Some(offered));
+    }
+    let labels: Vec<String> = offered.iter().map(Keep::label).collect();
+    let picked: Vec<bool> = if native::active() {
+        // The surface asks one question at a time.
+        let mut picked = Vec::new();
+        for label in &labels {
+            match select(&format!("Recreating '{name}': keep its {label}?"), &["Keep", "Drop"])? {
+                Some(answer) => picked.push(answer == 0),
+                None => return Ok(None),
+            }
+        }
+        picked
+    } else if acp || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(
+            "--recreate asks what to keep of '{name}' ({}), but there is no terminal to ask on; \
+             pass --force-recreate to recreate it from the command line alone",
+            labels.join("; ")
+        );
+    } else {
+        let Some(chosen) = MultiSelect::new()
+            .with_prompt(format!("Recreating '{name}': keep (space toggles, enter confirms)"))
+            .items(&labels)
+            .defaults(&vec![true; labels.len()])
+            .interact_on_opt(&Term::stderr())?
+        else {
+            return Ok(None);
+        };
+        (0..labels.len()).map(|i| chosen.contains(&i)).collect()
+    };
+    let mut kept = Vec::new();
+    for (keep, keep_it) in offered.into_iter().zip(picked) {
+        log::info(format!("{} {}", if keep_it { "keeping" } else { "dropping" }, keep.label()));
+        if keep_it {
+            kept.push(keep);
+        }
+    }
+    Ok(Some(kept))
+}
+
+/// Whether there is any file below `dir`.
+fn has_files(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    entries.flatten().any(|e| match e.file_type() {
+        Ok(t) if t.is_dir() => has_files(&e.path()),
+        Ok(_) => true,
+        Err(_) => false,
+    })
 }
 
 fn remove_sandbox(sbx: &Sbx, dirs: &Dirs, name: &str, keep_history: bool) -> Result<()> {
@@ -885,12 +980,32 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         };
         bail!("nothing to resume: there is no sandbox named '{}'. Run without --resume to create it{hint}.", req.name);
     }
-    if args.recreate && exists {
-        remove_sandbox(&sbx, dirs, &req.name, !args.no_preserve_history)?;
+    if args.force_recreate || args.recreate {
+        let kept = if args.recreate {
+            let offered = keepable(&req, current.as_ref(), has_files(&dirs.history_dir(&req.name)));
+            let Some(kept) = choose_kept(&req.name, offered, args.acp)? else {
+                log::info("aborted; nothing was changed");
+                return Ok(1);
+            };
+            kept
+        } else {
+            Vec::new()
+        };
+        let mut keep_history = false;
+        for keep in kept {
+            match keep {
+                Keep::History => keep_history = true,
+                Keep::Mounts(extras) => req.mounts.extras.extend(extras),
+                Keep::Mcp(servers) => req.mcp.extend(servers),
+            }
+        }
+        if exists {
+            remove_sandbox(&sbx, dirs, &req.name, keep_history)?;
+        } else if !keep_history {
+            state::forget(dirs, &req.name, false)?;
+        }
         exists = false;
         current = None;
-    } else if args.recreate && args.no_preserve_history {
-        state::forget(dirs, &req.name, false)?;
     }
 
     // ACP mode cannot ask about a newer image, so it does not look for one.
@@ -1425,6 +1540,57 @@ mod tests {
         assert_eq!(split(&["./codex"]), (None, s(&["./codex"])));
         assert_eq!(split(&["my-kit", "."]), (Some("my-kit".into()), s(&["."])));
         assert_eq!(split(&["../missing"]), (None, s(&["../missing"])));
+    }
+
+    #[test]
+    fn recreate_offers_only_what_the_command_line_leaves_out() {
+        let mount = |path: &str, mode| Mount { path: path.into(), mode };
+        let req = Request {
+            profile: Profile::resolve("codex", &Config::default()).unwrap(),
+            name: "codex-proj".into(),
+            kind: Kind::Project,
+            mounts: MountSet { primary: Some(mount("/p", Mode::Rw)), extras: vec![mount("/lib", Mode::Rw)] },
+            explicit_mounts: true,
+            mcp: vec!["gitlab".into()],
+            template: None,
+        };
+        let mut state = SandboxState {
+            name: "codex-proj".into(),
+            harness: "codex".into(),
+            agent: "codex".into(),
+            kind: Kind::Project,
+            mounts: MountSet {
+                primary: Some(mount("/p", Mode::Rw)),
+                extras: vec![mount("/lib", Mode::Ro), mount("/docs", Mode::Ro)],
+            },
+            mcp: vec!["gitlab".into(), "atlassian".into()],
+            template: None,
+            image_digest: None,
+            declined_digest: None,
+            internal_mounts: vec![],
+            vertex_secret: None,
+            created_at: 0,
+        };
+        assert_eq!(
+            keepable(&req, Some(&state), true),
+            [Keep::History, Keep::Mounts(vec![mount("/docs", Mode::Ro)]), Keep::Mcp(vec!["atlassian".into()])]
+        );
+        assert_eq!(Keep::Mounts(vec![mount("/docs", Mode::Ro)]).label(), "mounts: /docs (ro)");
+        // A sandbox sand did not create has only its history to keep.
+        assert_eq!(keepable(&req, None, true), [Keep::History]);
+        state.mounts.extras.truncate(1);
+        state.mcp.truncate(1);
+        assert!(keepable(&req, Some(&state), false).is_empty());
+    }
+
+    #[test]
+    fn history_counts_when_it_holds_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        assert!(!has_files(dir.path()));
+        fs::write(dir.path().join("a/b/s.jsonl"), "").unwrap();
+        assert!(has_files(dir.path()));
+        assert!(!has_files(&dir.path().join("missing")));
     }
 
     #[test]

@@ -60,8 +60,8 @@ the same.
 | `--mcp a,b` | Expose these MCP servers (names from `sbx mcp ls`). |
 | `--resume` | Attach to the existing sandbox without the "different setup" question: mounts and MCP servers on the command line are added, nothing is removed. Fails if there is none. |
 | `--no-attach` | Create or update the sandbox and start it, then exit without opening the agent. `sand [HARNESS] --resume` attaches later. |
-| `--recreate` | Remove the sandbox and create it again. Conversation history is kept. |
-| `--no-preserve-history` | With `--recreate`: discard the history too. |
+| `--recreate` | Remove the sandbox and create it again, asking what to keep of its conversation history, mounts and MCP servers (see [Recreating a sandbox](#recreating-a-sandbox)). |
+| `--force-recreate` | Remove the sandbox and create it again from the command line alone, without asking: its history, and mounts and MCP servers the command line does not name, are dropped. |
 | `--scratch` | No project: use the shared scratch directory, which persists and is shared by all harnesses. |
 | `--dedicated-scratch` | No project: a throwaway mountless sandbox, removed when the agent exits. |
 | `--name NAME` | Sandbox name. The default is `<harness>-<directory>`. |
@@ -100,6 +100,27 @@ has, `sand` shows both and asks:
 Adding MCP servers is never a conflict; they are attached live with
 `sbx mcp load`. Without a terminal, pass `--on-conflict`. In `--acp` mode,
 `sand` merges.
+
+### Recreating a sandbox
+
+`--recreate` removes the sandbox and creates it again from the command line.
+Before it does, it lists what the command line would lose and asks what to keep,
+everything ticked:
+
+- the conversation history, when there is any;
+- mounts the sandbox has and the command line does not name;
+- MCP servers the sandbox has and the command line does not name.
+
+So `sand claude --recreate` rebuilds the sandbox with its history, mounts and
+MCP servers, and unticking an item leaves it out. When there is nothing to keep, it does not ask. It needs a
+terminal (or Tern's native surface, which asks one item at a time); without one
+it fails before removing anything. `--force-recreate` asks nothing and keeps
+nothing the command line does not name, history included:
+
+```console
+$ sand claude --recreate            # rebuild, choosing what to keep
+$ sand claude --force-recreate      # rebuild from the command line alone
+```
 
 ### Adding mounts later
 
@@ -176,7 +197,8 @@ configuration (use `--mcp`).
 
 **History.** Conversation history directories are backed by host directories
 under sand's data directory and bind-mounted into the sandbox, so they survive
-`--recreate` and even a manual `sbx rm`.
+`--recreate` (unless you choose not to keep them) and even a manual `sbx rm`;
+`--force-recreate` discards them.
 
 **Status.** For Claude Code, `sand` installs a status line with the sandbox,
 the git branch, agent API and MCP server status, and below it the model, the

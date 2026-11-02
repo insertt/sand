@@ -13,7 +13,8 @@ Examples:
   sand claude --resume . ../lib:ro           attach, adding ../lib to the sandbox
   sand mount ../lib:ro                       add ../lib to this directory's sandbox, even mid-session
   sand umount ../lib                         remove it again
-  sand claude --recreate                     rebuild the sandbox, keeping history
+  sand claude --recreate                     rebuild the sandbox, asking what to keep
+  sand claude --force-recreate               rebuild it from the command line alone
   sand codex --no-attach                     set the sandbox up without opening the agent
   sand codex --scratch                       shared scratch space, no project
   sand --acp                                 ACP agent on stdio (for editors)
@@ -101,16 +102,16 @@ pub struct RunArgs {
     pub mcp: Vec<String>,
 
     /// Attach to the existing sandbox, adding any mounts and MCP servers given; fail if there is none
-    #[arg(long, conflicts_with_all = ["recreate", "dedicated_scratch"])]
+    #[arg(long, conflicts_with_all = ["recreate", "force_recreate", "dedicated_scratch"])]
     pub resume: bool,
 
-    /// Recreate the sandbox from scratch (conversation history is kept)
-    #[arg(long)]
+    /// Recreate the sandbox, asking whether to keep its history, mounts and MCP servers
+    #[arg(long, conflicts_with = "force_recreate")]
     pub recreate: bool,
 
-    /// With --recreate: also discard the conversation history
-    #[arg(long, requires = "recreate")]
-    pub no_preserve_history: bool,
+    /// Recreate the sandbox without asking: history, mounts and MCP servers not on the command line are dropped
+    #[arg(long)]
+    pub force_recreate: bool,
 
     /// Use the shared, persistent scratch workspace instead of a project
     #[arg(long, conflicts_with = "dedicated_scratch")]
@@ -276,6 +277,8 @@ mod tests {
             &["codex", "--resume", "--recreate"],
             &["codex", "--scratch", "--dedicated-scratch"],
             &["codex", "--no-preserve-history"],
+            &["codex", "--recreate", "--force-recreate"],
+            &["codex", "--resume", "--force-recreate"],
             &["codex", "--install-acp", "vim"],
             &["codex", "--install-editor", "zed"],
             &["codex", "--resume", "--dedicated-scratch"],
@@ -286,7 +289,7 @@ mod tests {
         for args in bad {
             assert!(Cli::try_parse_from(std::iter::once("sand").chain(args.iter().copied())).is_err(), "{args:?}");
         }
-        assert!(run(&["codex", "--recreate", "--no-preserve-history"]).no_preserve_history);
+        assert!(run(&["codex", "--force-recreate"]).force_recreate);
     }
 
     #[test]
