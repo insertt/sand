@@ -158,6 +158,11 @@ fn item_index(item: &str) -> usize {
 /// What floats over the session: the completions of a `/command` being
 /// typed, under the caret, and the session picker.
 fn layer(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
+    if let Some((_, key)) = &t.exit_armed {
+        let what = if t.turn == Turn::Setup { "stop setting up" } else { "exit" };
+        // As long as the second press is awaited.
+        return vec![ui::toast(format!("Press {key} again to {what}")).key("exit").ttl(2000u64).into()];
+    }
     if let Some(picker) = &t.picker {
         return vec![session_picker(picker, info)];
     }
@@ -405,7 +410,7 @@ fn welcome(t: &Transcript, info: &Info) -> Node<Msg> {
         facts = facts.item(if i == 0 { "mounts" } else { "" }, Span::new(mount.clone()).style("path"));
     }
     facts = facts.item("API", api_spans(info)).item("MCP", mcp_spans(&info.mcp));
-    let tips: Vec<Span> = [("⇧Enter", "new line"), ("⇧Tab", "mode"), ("Esc", "stop"), ("Ctrl+D", "quit")]
+    let tips: Vec<Span> = [("⇧Enter", "new line"), ("⇧Tab", "mode"), ("Esc", "stop"), ("Ctrl+C ×2", "quit")]
         .iter()
         .enumerate()
         .flat_map(|(i, (key, text))| {

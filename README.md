@@ -476,8 +476,10 @@ starts a new session; and `/help` lists them all. Resuming needs an agent that
 supports ACP's session listing and loading.
 
 You can type during setup; the first message is sent once the agent is ready.
-Enter sends, Shift+Enter starts a new line, Esc stops a turn, Ctrl+C stops
-setup (or a turn), and Ctrl+D quits. This needs no setup in Tern and works for
+Enter sends, Shift+Enter starts a new line and Esc stops a turn. As in
+Claude Code, Ctrl+C stops a turn or clears the draft first, and otherwise
+quits (or stops setup) only when pressed twice in a row; a toast asks for the
+second press. Ctrl+D twice quits too. This needs no setup in Tern and works for
 every kind of sandbox, but not with agent arguments, which open the terminal
 UI. The subscription limits (5h, 7d) the terminal status line shows are not
 reported over ACP, so the native composer leaves them out. If setup fails or is

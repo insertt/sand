@@ -328,7 +328,7 @@ mod tests {
         fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> io::Result<Option<usize>> {
             if Instant::now() > self.deadline {
                 // A stuck session still ends.
-                self.input.borrow_mut().push_back(vec![0x04]);
+                self.input.borrow_mut().push_back(vec![0x04, 0x04]);
             }
             let Some(chunk) = self.input.borrow_mut().pop_front() else {
                 thread::sleep(timeout.unwrap_or(Duration::ZERO).min(Duration::from_millis(1)));
@@ -425,7 +425,8 @@ mod tests {
                     let id = &since[start..start + since[start..].find('"').unwrap()];
                     Some(event(json!({"ev": "action", "sf": "s1", "id": id, "act": "allow"})))
                 }),
-                after("this turn", [0x04]),
+                // Ctrl+D twice in a row quits.
+                after("this turn", [0x04, 0x04]),
             ],
         );
         let mut session = session(pane);
@@ -513,7 +514,7 @@ mod tests {
                 after("/sessions — Browse", "/sessions\r"),
                 // The second session, with the arrow keys.
                 after("Fix the build", "\x1b[B\r"),
-                after("Resumed · Add a parser", [0x04]),
+                after("Resumed · Add a parser", [0x03, 0x03]),
             ],
         );
         let mut session = session(pane);

@@ -362,6 +362,8 @@ pub struct Transcript {
     pub picker: Option<SessionPicker>,
     /// A session being resumed: the working line says so until the agent answers.
     pub resuming: Option<String>,
+    /// A first press of an exit key (when, and which), waiting for the second.
+    pub exit_armed: Option<(Instant, String)>,
     /// The model, by id, and the models the agent offers (ACP's `models`).
     pub model: Option<String>,
     pub models: Vec<Mode>,
@@ -390,6 +392,7 @@ impl Default for Transcript {
             commands: Vec::new(),
             picker: None,
             resuming: None,
+            exit_armed: None,
             model: None,
             models: Vec::new(),
             options: Vec::new(),

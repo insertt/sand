@@ -24,6 +24,14 @@ use super::view::{EDITOR, Info, Msg, STYLE, view};
 use super::{ChatSpec, Command, Update};
 use crate::log::Line;
 
+/// How long a first Ctrl+C (or Ctrl+D) waits for the second that quits.
+const EXIT_WINDOW: Duration = Duration::from_secs(2);
+
+/// Ctrl+C, and ⌘C when the terminal hands it over rather than copying.
+fn is_interrupt(key: &Key) -> bool {
+    key.is("ctrl+c") || key.is("meta+c")
+}
+
 /// How long the agent may take to exit once its input is closed.
 const EXIT_GRACE: Duration = Duration::from_secs(3);
 
@@ -161,12 +169,15 @@ impl Driver {
             match session.next(poll)? {
                 None => continue,
                 Some(Input::Key(key)) => {
-                    // Ctrl+C stops setup, as it would on a terminal.
-                    if key.is("ctrl+c") && self.t.turn == Turn::Setup {
-                        self.interrupted = true;
-                        return Ok(());
+                    // Ctrl+C twice stops setup, as one would on a terminal.
+                    if is_interrupt(&key) && self.t.turn == Turn::Setup && self.t.question.is_none() {
+                        if self.confirm_exit("Ctrl+C") {
+                            self.interrupted = true;
+                            return Ok(());
+                        }
+                    } else {
+                        self.key(&key);
                     }
-                    self.key(&key);
                 }
                 Some(Input::Msg(Msg::Focus, _)) => {
                     session.focus(sf, Some(EDITOR))?;
@@ -609,6 +620,19 @@ impl Driver {
         self.check(sent);
     }
 
+    /// Whether an exit key was pressed twice in a row: the first press
+    /// only says to press it again, and lasts `EXIT_WINDOW`.
+    fn confirm_exit(&mut self, key: &str) -> bool {
+        let now = Instant::now();
+        match &self.t.exit_armed {
+            Some((armed, pressed)) if pressed == key && now.duration_since(*armed) < EXIT_WINDOW => true,
+            _ => {
+                self.t.exit_armed = Some((now, key.to_string()));
+                false
+            }
+        }
+    }
+
     fn quit(&mut self) {
         self.by_person = self.t.turn != Turn::Exited;
         self.quit = true;
@@ -639,6 +663,10 @@ impl Driver {
     }
 
     pub fn key(&mut self, key: &Key) {
+        // Any other key takes back a first press of the exit keys.
+        if !is_interrupt(key) && !key.is("ctrl+d") {
+            self.t.exit_armed = None;
+        }
         if self.t.picker.is_some() {
             return self.picker_key(key);
         }
@@ -689,16 +717,18 @@ impl Driver {
             if working {
                 self.cancel();
             }
-        } else if key.is("ctrl+c") {
+        } else if is_interrupt(key) {
+            // As Claude Code: a turn stops, a draft goes, and only then a
+            // second press in a row quits.
             if working {
                 self.cancel();
             } else if !self.composer.is_empty() {
                 self.composer.take();
-            } else {
+            } else if self.confirm_exit("Ctrl+C") {
                 self.quit();
             }
         } else if key.is("ctrl+d") {
-            if self.composer.is_empty() && !working && self.t.turn != Turn::Setup {
+            if self.composer.is_empty() && !working && self.t.turn != Turn::Setup && self.confirm_exit("Ctrl+D") {
                 self.quit();
             }
         } else if key.is("shift+tab") {
@@ -779,4 +809,63 @@ fn branch(dir: &Path) -> Option<String> {
         (out.status.success() && !text.is_empty()).then_some(text)
     };
     git(&["symbolic-ref", "--quiet", "--short", "HEAD"]).or_else(|| git(&["rev-parse", "--short", "HEAD"]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle() -> Driver {
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut driver = Driver::new(Info::default(), tx, None);
+        driver.t.turn = Turn::Idle;
+        driver
+    }
+
+    fn ctrl(name: &str) -> Key {
+        Key { ctrl: true, ..Key::named(name) }
+    }
+
+    #[test]
+    fn ctrl_c_quits_only_when_pressed_twice_in_a_row() {
+        let mut d = idle();
+        d.key(&ctrl("c"));
+        assert!(!d.quit, "the first press only arms");
+        assert_eq!(d.t.exit_armed.as_ref().map(|(_, k)| k.as_str()), Some("Ctrl+C"));
+        d.key(&ctrl("c"));
+        assert!(d.quit && d.by_person);
+
+        // Another key in between takes the first press back.
+        let mut d = idle();
+        d.key(&ctrl("c"));
+        d.key(&Key { text: Some("x".into()), ..Key::named("x") });
+        d.composer.take();
+        d.key(&ctrl("c"));
+        assert!(!d.quit);
+
+        // A first press past the window starts over.
+        let mut d = idle();
+        d.t.exit_armed = Some((Instant::now() - EXIT_WINDOW, "Ctrl+C".into()));
+        d.key(&ctrl("c"));
+        assert!(!d.quit);
+
+        // Ctrl+C and Ctrl+D do not count for each other.
+        let mut d = idle();
+        d.key(&ctrl("c"));
+        d.key(&ctrl("d"));
+        assert!(!d.quit);
+        d.key(&ctrl("d"));
+        assert!(d.quit);
+    }
+
+    #[test]
+    fn ctrl_c_clears_a_draft_before_it_arms() {
+        let mut d = idle();
+        d.composer.insert("half a thought");
+        d.key(&ctrl("c"));
+        assert!(d.composer.is_empty() && d.t.exit_armed.is_none() && !d.quit);
+        d.key(&Key { meta: true, ..Key::named("c") });
+        d.key(&Key { meta: true, ..Key::named("c") });
+        assert!(d.quit, "⌘C counts as Ctrl+C when it reaches sand");
+    }
 }
