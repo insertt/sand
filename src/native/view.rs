@@ -50,12 +50,23 @@ pub const STYLE: &str = r#"
 	box-shadow: none !important;
 }
 [data-role='sand.composer.context'] { margin: 0 4px; }
-[data-role='sand.composer.bar'] { gap: 10px; min-width: 0; font: 14px/1.3 var(--sans); }
-[data-role='sand.composer.bar'] > * { flex: none; }
+[data-role='sand.composer.bar'] { gap: 10px; min-width: 0; align-items: center !important; font: 14px/1.3 var(--sans); }
+/* Every chip on one centre line: a select keeps align-self: flex-start of its own. */
+[data-role='sand.composer.bar'] > * { flex: none; align-self: center !important; margin-top: 0 !important; margin-bottom: 0 !important; }
+[data-role='sand.composer.bar'] .sf-select {
+	display: inline-flex !important;
+	align-items: center;
+	align-self: center !important;
+	height: 34px;
+	margin: 0 !important;
+}
 /* Model, effort and mode: pills with a hairline ring, as Tern's own chat draws them. */
 :is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']) :is(.sf-select-btn, .sf-menu-trigger),
 :is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']).sf-row {
-	height: 34px;
+	height: 34px !important;
+	box-sizing: border-box;
+	display: inline-flex;
+	align-items: center;
 	padding: 0 14px !important;
 	gap: 8px;
 	border-radius: 999px !important;
@@ -69,9 +80,17 @@ pub const STYLE: &str = r#"
 }
 [data-role='sand.composer.bar'] .sf-select-label { display: none; }
 /* The effort pill holds Tern's ring and a borderless picker. */
-.sf-row[data-role='sand.composer.effort'] { padding: 0 6px 0 12px !important; gap: 2px !important; }
+.sf-row[data-role='sand.composer.effort'] {
+	height: 34px !important;
+	min-height: 0 !important;
+	box-sizing: border-box;
+	align-items: center !important;
+	padding: 0 6px 0 12px !important;
+	gap: 2px !important;
+}
+.sf-row[data-role='sand.composer.effort'] .sf-select { height: 32px; }
 .sf-row[data-role='sand.composer.effort'] .sf-select-btn {
-	height: 32px;
+	height: 32px !important;
 	padding: 0 8px 0 6px !important;
 	box-shadow: none !important;
 	background: transparent !important;
