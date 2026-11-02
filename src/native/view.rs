@@ -66,6 +66,16 @@ pub const STYLE: &str = r#"
 	border-radius: 8px;
 	background: var(--l2);
 }
+[data-role='sand.notes'], [data-role='sand.queue'] {
+	width: calc(100% - 24px);
+	max-width: 736px;
+	margin: 0 auto 6px !important;
+	padding: 6px 10px;
+	box-sizing: border-box;
+	border-radius: 10px;
+	background: var(--l2);
+	font: 12.5px/1.4 var(--sans);
+}
 /* Room under the last turn: its footer and tooltips clear the floating composer. */
 .sf-spacer[data-role='sand.tail'] { height: calc(5 * var(--sf-lh, 18px)) !important; }
 /* A tool's head: its label centered on its icon, however many lines it takes. */
@@ -110,6 +120,23 @@ pub enum Msg {
     Session(usize),
     HoverSession(usize),
     ClosePicker,
+    /// Native editing: UTF-16 `[from, to)` of the draft replaced with `text`.
+    Edit {
+        from: usize,
+        to: usize,
+        text: String,
+        cursor: usize,
+        len: usize,
+    },
+    Undo,
+    /// A queued follow-up taken back, and the paused queue's two choices.
+    Unqueue(usize),
+    QueueContinue,
+    QueueDiscard,
+    DismissNotes,
+    /// The welcome card's Continue, and its suggested prompts.
+    ContinueLast,
+    Suggest(String),
 }
 
 /// What the session runs in: what the status line shows besides the agent's own facts.
@@ -265,6 +292,19 @@ fn compact(n: u64) -> String {
     }
 }
 
+/// `18000` as `18,000`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn cost(usd: f64) -> String {
     if usd < 0.005 { "<$0.01".to_string() } else { format!("${usd:.2}") }
 }
@@ -291,7 +331,7 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
         let key = format!("e{i}");
         if let Entry::User(text) = entry {
             flush(&mut nodes, &mut turn, &mut turn_key);
-            nodes.push(user(key, text, false));
+            nodes.push(user(key, text));
             continue;
         }
         if let Entry::Resumed(title) = entry {
@@ -329,9 +369,6 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
         });
     }
     flush(&mut nodes, &mut turn, &mut turn_key);
-    if let Some(text) = &t.queued {
-        nodes.push(user("queued".to_string(), text, true));
-    }
     // Room under the last turn, so that its end and its tooltips clear the floating composer.
     // (A spacer: Tern hides an empty row, whatever its size.)
     nodes.push(ui::node("spacer").key("tail").role("sand.tail").prop("size", "lg"));
@@ -436,8 +473,31 @@ fn welcome(t: &Transcript, info: &Info) -> Node<Msg> {
         )
         .child(ui::text(where_).key("where").role("agent.where"))
         .child(facts)
+        .child(starters(t))
         .child(ui::text(tips).key("tips").role("omp.welcome.tip"))
         .into()
+}
+
+/// Prompts to start with, and the last conversation to continue.
+const SUGGESTIONS: &[&str] = &["Explain this codebase", "Find and fix a bug", "Review my uncommitted changes"];
+
+fn starters(t: &Transcript) -> Node<Msg> {
+    let mut row = ui::row().key("starters").role("agent.starters").gap("sm").wrap(true);
+    if let Some(last) = &t.last_session {
+        let label: String = last.label().chars().take(48).collect();
+        row = row.child(
+            ui::button(format!("Continue “{label}”"))
+                .key("continue")
+                .variant("primary")
+                .size("sm")
+                .icon("history")
+                .on_click(Msg::ContinueLast),
+        );
+    }
+    for (i, prompt) in SUGGESTIONS.iter().enumerate() {
+        row = row.child(ui::button(*prompt).key(i).size("sm").on_click(Msg::Suggest(prompt.to_string())));
+    }
+    row.into()
 }
 
 fn api_spans(info: &Info) -> Vec<Span> {
@@ -481,18 +541,8 @@ fn mcp_mark(state: McpState) -> (&'static str, &'static str) {
 }
 
 /// A sent message, as omp's user card.
-fn user(key: String, text: &str, queued: bool) -> Node<Msg> {
-    let mut card = ui::card().key(key).role("omp.user");
-    if queued {
-        card = card.child(
-            ui::row()
-                .key("badges")
-                .role("omp.user.badges")
-                .justify("end")
-                .child(ui::badge("queued · sent once the agent is ready").tone("accent").key("queued")),
-        );
-    }
-    card.child(ui::md(text.to_string()).key("text")).into()
+fn user(key: String, text: &str) -> Node<Msg> {
+    ui::card().key(key).role("omp.user").child(ui::md(text.to_string()).key("text")).into()
 }
 
 fn error(key: String, text: &str, detail: Option<&str>) -> Node<Msg> {
@@ -510,24 +560,14 @@ fn error(key: String, text: &str, detail: Option<&str>) -> Node<Msg> {
 /// The quiet line under a finished turn: time, tokens, cost, and why it stopped early.
 fn usage_footer(key: String, usage: &TurnUsage) -> Node<Msg> {
     let mut parts = vec![duration(usage.took)];
-    parts.extend(usage.tokens.map(|n| format!("{} tok", compact(n))));
+    parts.extend(usage.tokens.map(|n| format!("{} tokens", thousands(n))));
     parts.extend(usage.cost.map(cost));
     let mut text = vec![Span::new(format!("{} this turn", parts.join(" · "))).style("muted")];
     if let Some(stopped) = &usage.stopped {
         text.push(Span::new(" · ").style("muted"));
         text.push(Span::new(stopped.clone()).style("warning"));
     }
-    let mut detail = vec![duration(usage.took)];
-    detail.extend(usage.tokens.map(|n| format!("{n} tokens")));
-    detail.extend(usage.cost.map(cost));
-    ui::row()
-        .key(key)
-        .role("omp.turn.usage")
-        .title(format!("This turn: {}", detail.join(" · ")))
-        .gap("xs")
-        .align("center")
-        .child(ui::text(text).key("t"))
-        .into()
+    ui::row().key(key).role("omp.turn.usage").gap("xs").align("center").child(ui::text(text).key("t")).into()
 }
 
 /// The `tool` icon names Tern knows, by ACP tool kind.
@@ -714,11 +754,82 @@ fn dock(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
     if !t.plan.is_empty() {
         nodes.push(plan(t));
     }
+    if !t.notes.is_empty() {
+        nodes.push(notes(t));
+    }
+    if !t.queue.is_empty() {
+        nodes.push(queue(t));
+    }
     if let Some(working) = working(t, info) {
         nodes.push(working);
     }
     nodes.push(composer_node(t, composer, info));
     nodes
+}
+
+/// What happened while the pane was hidden, until the next message or a dismissal.
+fn notes(t: &Transcript) -> Node<Msg> {
+    let rows = t.notes.iter().enumerate().map(|(i, note)| {
+        let icon = match note.tone {
+            "success" => "check",
+            "error" => "x-circle",
+            _ => "bell",
+        };
+        ui::row()
+            .key(i)
+            .gap("xs")
+            .align("center")
+            .child(ui::icon(icon).tone(note.tone).key("i"))
+            .child(ui::text(note.text.clone()).key("t"))
+    });
+    ui::row()
+        .key("notes")
+        .role("sand.notes")
+        .align("center")
+        .gap("md")
+        .child(ui::col().key("list").gap("xs").grow(1.0).children(rows))
+        .child(ui::button("Dismiss").key("dismiss").variant("quiet").size("sm").on_click(Msg::DismissNotes))
+        .into()
+}
+
+/// The follow-ups waiting for the agent, each with its ✕; paused, a choice.
+fn queue(t: &Transcript) -> Node<Msg> {
+    let total = t.queue.len();
+    let mut col = ui::col().key("queue").role("sand.queue").gap("xs");
+    for (i, text) in t.queue.iter().enumerate() {
+        let line: String = text.lines().next().unwrap_or_default().chars().take(120).collect();
+        col = col.child(
+            ui::row()
+                .key(i)
+                .role("sand.queued")
+                .gap("sm")
+                .align("center")
+                .child(ui::text(spans(&[("queued · ", "muted"), (&line, "")])).key("t").grow(1.0))
+                .child(ui::text(spans(&[(&format!("{}/{total}", i + 1), "muted mono")])).key("n"))
+                .child(
+                    ui::button("✕")
+                        .key("drop")
+                        .variant("quiet")
+                        .size("sm")
+                        .title("Take back")
+                        .on_click(Msg::Unqueue(i)),
+                ),
+        );
+    }
+    if t.queue_paused {
+        col = col.child(
+            ui::row()
+                .key("paused")
+                .gap("sm")
+                .align("center")
+                .child(ui::text(spans(&[("Queue paused after the turn stopped", "warning")])).key("t").grow(1.0))
+                .child(
+                    ui::button("Continue queue").key("go").variant("primary").size("sm").on_click(Msg::QueueContinue),
+                )
+                .child(ui::button("Discard").key("drop").variant("quiet").size("sm").on_click(Msg::QueueDiscard)),
+        );
+    }
+    col.into()
 }
 
 /// Setup's question, with what led to it and a button per answer.
@@ -817,10 +928,10 @@ fn working(t: &Transcript, info: &Info) -> Option<Node<Msg>> {
 fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> {
     let placeholder = match t.turn {
         _ if t.question.is_some() => "Answer the question above".to_string(),
-        Turn::Setup | Turn::Starting if t.queued.is_some() => format!("Setting up {}…", info.sandbox),
+        _ if !t.queue.is_empty() && t.turn != Turn::Idle => "Another follow-up? It waits its turn".to_string(),
         Turn::Setup | Turn::Starting => format!("Ask {} anything — it is sent once the agent is ready", info.product),
         Turn::Working if t.permission.is_some() => "Enter allows · Esc denies".to_string(),
-        Turn::Working => format!("Esc stops {}", info.product),
+        Turn::Working => format!("Esc stops {} · Enter queues a follow-up", info.product),
         Turn::Idle => format!("Ask {} anything — / for commands", info.product),
         Turn::Exited => "Enter closes".to_string(),
     };
@@ -834,7 +945,18 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
         .min(Bound::h(Extent::Lines(2.0)))
         .max_lines(12u32)
         .on_send(|text| Msg::Send(text.to_owned()))
+        .on_edit(|e| Msg::Edit { from: e.from, to: e.to, text: e.text.clone(), cursor: e.cursor, len: e.len })
+        .on_undo(Msg::Undo)
         .on_focus(Msg::Focus);
+    // The rest of the highlighted command, faint after the caret.
+    let completions = if composer.dismissed { Vec::new() } else { commands::complete(&composer.draft, &t.commands) };
+    let editor = match completions.get(composer.pick.min(completions.len().saturating_sub(1))) {
+        Some(command) if composer.at_end() => {
+            let typed = composer.draft.trim_start_matches('/').len();
+            editor.ghost(command.name.get(typed..).unwrap_or_default().to_string())
+        }
+        _ => editor,
+    };
     let mut col = ui::col().key("composer").role("sand.composer");
     if let Some((used, size)) = t.context.filter(|(_, size)| *size > 0) {
         let fraction = (used as f64 / size as f64).min(1.0);
@@ -1150,7 +1272,7 @@ mod tests {
         assert_eq!(edit.props()["collapsed"], false);
         assert_eq!(
             find(turn.child_nodes(), "omp.turn.usage").unwrap().child_nodes()[0].props()["spans"][0]["t"],
-            "8.0s · 18k tok · $0.04 this turn"
+            "8.0s · 18,000 tokens · $0.04 this turn"
         );
 
         let dock = region(&v, 1);
@@ -1279,6 +1401,48 @@ mod tests {
         assert_eq!(item.props()["detail"], "2026-11-02 10:00 · /w");
         assert_eq!(item.props()["value"], "abcdef12");
         assert_eq!(item_index("layer.sessions.list.s12"), 12);
+    }
+
+    #[test]
+    fn the_composer_shows_the_rest_of_a_command_and_whats_waiting() {
+        let mut t = Transcript::default();
+        t.turn = Turn::Working;
+        let mut composer = Composer::default();
+        composer.insert("/ses");
+        let v = view(&t, &composer, &info());
+        let editor = &find(region(&v, 1), "sand.composer").unwrap().child_nodes()[0];
+        assert_eq!(editor.props()["ghost"], "sions");
+
+        t.queue = vec!["then the docs".into(), "and the changelog".into()];
+        t.queue_paused = true;
+        t.hidden = true;
+        t.note("Claude Code finished", "success");
+        let v = view(&t, &Composer::default(), &info());
+        let dock = region(&v, 1);
+        let notes = find(dock, "sand.notes").expect("notes");
+        assert_eq!(notes.child_nodes()[0].child_nodes()[0].child_nodes()[1].props()["text"], "Claude Code finished");
+        let queue = find(dock, "sand.queue").expect("the queue");
+        assert_eq!(queue.child_nodes().len(), 3, "two follow-ups and the paused choice");
+        assert_eq!(queue.child_nodes()[0].child_nodes()[0].props()["spans"][1]["t"], "then the docs");
+        assert_eq!(queue.child_nodes()[2].child_nodes()[1].props()["text"], "Continue queue");
+    }
+
+    #[test]
+    fn the_welcome_offers_the_last_session_and_starters() {
+        let mut t = Transcript::default();
+        t.turn = Turn::Idle;
+        t.last_session = Some(super::super::model::SessionEntry {
+            id: "S9".into(),
+            title: Some("Fix the build".into()),
+            cwd: None,
+            updated: None,
+        });
+        let v = view(&t, &Composer::default(), &info());
+        let starters = find(region(&v, 0), "agent.starters").unwrap();
+        let labels: Vec<&str> = starters.child_nodes().iter().map(|b| b.props()["text"].as_str().unwrap()).collect();
+        assert_eq!(labels[0], "Continue “Fix the build”");
+        assert_eq!(labels.len(), 1 + SUGGESTIONS.len());
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     #[test]

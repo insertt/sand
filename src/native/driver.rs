@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::Value;
-use tern_sdk::{Input, Key, Session, Surface, SurfaceOptions, Waker};
+use tern_sdk::{Event, Input, Key, Session, Surface, SurfaceOptions, Waker};
 
 use super::client::{self, Call, Client, Incoming};
 use super::commands::{self, Builtin};
@@ -23,6 +23,9 @@ use super::model::{Approval, Entry, Mode, Question, SessionEntry, SessionPicker,
 use super::view::{EDITOR, Info, Msg, STYLE, view};
 use super::{ChatSpec, Command, Update};
 use crate::log::Line;
+
+/// Follow-ups that can wait for the agent at once.
+const QUEUE: usize = 8;
 
 /// How long a first Ctrl+C (or Ctrl+D) waits for the second that quits.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -188,7 +191,12 @@ impl Driver {
                     // A click on a button never leaves the composer without the keys.
                     session.focus(sf, Some(EDITOR))?;
                 }
-                Some(Input::Event(_) | Input::Clipboard(_)) => continue,
+                Some(Input::Event(event)) => {
+                    if !self.event(&event, session.surface_id(sf)) {
+                        continue;
+                    }
+                }
+                Some(Input::Clipboard(_)) => continue,
             }
             session.render(sf, view(&self.t, &self.composer, &self.info))?;
         }
@@ -210,6 +218,28 @@ impl Driver {
             changed = true;
         }
         changed
+    }
+
+    /// Tern's own events: the pane hidden or shown, the surface gone, an
+    /// error in what sand sent. True when the view changed.
+    fn event(&mut self, event: &Event, surface: &str) -> bool {
+        match event {
+            Event::Visible(visible) => {
+                self.t.hidden = !visible.visible;
+                true
+            }
+            // The pane was cleared, or the session scrolled out of its history.
+            Event::Gone(gone) if gone.ids.iter().any(|id| id == surface) => {
+                self.by_person = true;
+                self.quit = true;
+                false
+            }
+            Event::Error(error) => {
+                self.t.entries.push(Entry::Notice(format!("Tern: {}", error.msg)));
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn command(&mut self, command: Command) {
@@ -360,6 +390,8 @@ impl Driver {
                     self.check(sent);
                 } else {
                     self.t.ask(id, &params, now);
+                    let title = params["toolCall"]["title"].as_str().unwrap_or("a tool").to_string();
+                    self.t.note(format!("{} asks to run {title}", self.info.product), "warning");
                 }
             }
             Incoming::Unsupported { id, method } => {
@@ -375,6 +407,7 @@ impl Driver {
                 if self.t.turn != Turn::Exited {
                     let detail = log_tail(self.agent.as_ref().and_then(|a| a.log.as_deref()));
                     self.t.exited(format!("{} exited", self.info.product), detail, now);
+                    self.t.note(format!("{} exited", self.info.product), "error");
                 }
             }
         }
@@ -406,7 +439,18 @@ impl Driver {
                 self.t.turn = Turn::Idle;
             }
             (Call::ListSessions, result) => {
-                let Some(picker) = self.t.picker.as_mut() else { return };
+                let Some(picker) = self.t.picker.as_mut() else {
+                    // The quiet lookup for the welcome card: the newest session but this one.
+                    let current = self.session.clone();
+                    self.t.last_session = result.ok().and_then(|r| {
+                        r["sessions"]
+                            .as_array()?
+                            .iter()
+                            .filter_map(SessionEntry::parse)
+                            .find(|s| Some(&s.id) != current.as_ref())
+                    });
+                    return;
+                };
                 picker.loading = false;
                 match result {
                     Ok(result) => {
@@ -427,10 +471,26 @@ impl Driver {
             (Call::Initialize | Call::NewSession, Err(err)) => {
                 self.t.exited(format!("{} could not start a session: {err}", self.info.product), None, now);
             }
-            (Call::Prompt, Ok(result)) => self.t.turn_ended(result["stopReason"].as_str(), &result["usage"], now),
+            (Call::Prompt, Ok(result)) => {
+                let stop = result["stopReason"].as_str();
+                self.t.turn_ended(stop, &result["usage"], now);
+                let product = self.info.product.clone();
+                match stop {
+                    Some("end_turn") | None => {
+                        self.t.note(format!("{product} finished"), "success");
+                        self.flush_queue();
+                    }
+                    Some(reason) => {
+                        self.t.note(format!("{product} stopped ({})", reason.replace('_', " ")), "warning");
+                        self.pause_queue();
+                    }
+                }
+            }
             (Call::Prompt, Err(err)) => {
+                self.t.note(format!("{} failed: {err}", self.info.product), "error");
                 self.t.error(err, None);
                 self.t.turn_ended(None, &Value::Null, now);
+                self.pause_queue();
             }
             (Call::SetMode, Ok(_)) => self.t.mode = self.asked_mode.take().or(self.t.mode.take()),
             (Call::SetModel, Ok(_)) => self.t.model = self.asked_model.take().or(self.t.model.take()),
@@ -444,6 +504,11 @@ impl Driver {
                 self.t.error(format!("The mode could not be changed: {err}"), None);
             }
         }
+    }
+
+    /// A stop or a failure holds the follow-ups until the person says.
+    fn pause_queue(&mut self) {
+        self.t.queue_paused = !self.t.queue.is_empty();
     }
 
     /// A session is ready (new or resumed): takes its modes, models and
@@ -466,9 +531,22 @@ impl Driver {
         self.t.set_models(&result["models"]);
         self.t.set_options(&result["configOptions"]);
         self.t.turn = Turn::Idle;
-        if let Some(text) = self.t.queued.take() {
-            self.send(text);
+        // A new session's welcome offers to continue the one before.
+        if self.t.entries.is_empty() && self.t.last_session.is_none() {
+            let cwd = self.cwd();
+            let sent = self.client().map(|c| c.list_sessions(&cwd));
+            self.check(sent);
         }
+        self.flush_queue();
+    }
+
+    /// Sends the next follow-up, when the agent is free and the queue runs.
+    fn flush_queue(&mut self) {
+        if self.t.turn != Turn::Idle || self.t.queue_paused || self.t.queue.is_empty() {
+            return;
+        }
+        let text = self.t.queue.remove(0);
+        self.prompt(text);
     }
 
     fn cwd(&self) -> String {
@@ -524,27 +602,36 @@ impl Driver {
         self.check(sent);
     }
 
-    fn send(&mut self, text: String) {
+    /// Sends `text` now, or queues it while the agent works or starts.
+    /// False when it can go nowhere (the queue is full).
+    fn send(&mut self, text: String) -> bool {
         if text.trim().is_empty() {
-            return;
+            return true;
         }
-        let (Turn::Idle, Some(session)) = (self.t.turn, self.session.clone()) else {
-            // Before the agent is ready, one prompt waits for it.
-            if matches!(self.t.turn, Turn::Setup | Turn::Starting) && self.t.queued.is_none() {
-                self.t.queued = Some(text);
+        match self.t.turn {
+            Turn::Idle if self.t.queue.is_empty() || self.t.queue_paused => {
+                self.prompt(text);
+                true
             }
-            return;
-        };
+            Turn::Idle | Turn::Setup | Turn::Starting | Turn::Working if self.t.queue.len() < QUEUE => {
+                self.t.queue.push(text);
+                self.flush_queue();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn prompt(&mut self, text: String) {
+        let Some(session) = self.session.clone() else { return };
+        self.t.notes.clear();
         self.t.prompt(&text, Instant::now());
         let sent = self.client().map(|c| c.prompt(&session, &text));
         self.check(sent);
     }
 
     fn submit(&mut self) {
-        if self.composer.is_empty() || matches!(self.t.turn, Turn::Working | Turn::Exited) {
-            return;
-        }
-        if self.t.turn != Turn::Idle && self.t.queued.is_some() {
+        if self.composer.is_empty() || self.t.turn == Turn::Exited {
             return;
         }
         let text = self.composer.take();
@@ -552,7 +639,13 @@ impl Driver {
             Some(command) if self.t.turn == Turn::Idle => self.builtin(command),
             // sand's commands wait for the session; the agent's go as a prompt.
             Some(_) => self.composer.set(&text),
-            None => self.send(text),
+            None => {
+                if !self.send(text.clone()) {
+                    self.composer.set(&text);
+                    self.t
+                        .error(format!("{QUEUE} follow-ups are waiting already; this one stays in the composer"), None);
+                }
+            }
         }
     }
 
@@ -618,6 +711,7 @@ impl Driver {
         }
         let sent = self.client().map(|c| c.cancel(&session));
         self.check(sent);
+        self.pause_queue();
     }
 
     /// Whether an exit key was pressed twice in a row: the first press
@@ -640,7 +734,11 @@ impl Driver {
 
     pub fn msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Send(text) => self.send(text),
+            // Tern's own send runs what the composer would: a command, or a prompt.
+            Msg::Send(text) => {
+                self.composer.set(&text);
+                self.submit();
+            }
             Msg::Submit => self.submit(),
             Msg::Stop => self.cancel(),
             Msg::Answer(approval) => self.answer(approval),
@@ -658,6 +756,32 @@ impl Driver {
                 }
             }
             Msg::ClosePicker => self.t.picker = None,
+            Msg::Edit { from, to, text, cursor, len } => self.composer.edit(from, to, &text, cursor, len),
+            Msg::Undo => self.composer.undo(),
+            Msg::Unqueue(index) => {
+                if index < self.t.queue.len() {
+                    self.t.queue.remove(index);
+                }
+                self.t.queue_paused &= !self.t.queue.is_empty();
+            }
+            Msg::QueueContinue => {
+                self.t.queue_paused = false;
+                self.flush_queue();
+            }
+            Msg::QueueDiscard => {
+                self.t.queue.clear();
+                self.t.queue_paused = false;
+            }
+            Msg::DismissNotes => self.t.notes.clear(),
+            Msg::ContinueLast => {
+                if let Some(session) = self.t.last_session.take() {
+                    self.resume(session);
+                }
+            }
+            Msg::Suggest(prompt) => {
+                self.composer.set(&prompt);
+                self.submit();
+            }
             Msg::Focus => {}
         }
     }
@@ -867,5 +991,75 @@ mod tests {
         d.key(&Key { meta: true, ..Key::named("c") });
         d.key(&Key { meta: true, ..Key::named("c") });
         assert!(d.quit, "⌘C counts as Ctrl+C when it reaches sand");
+    }
+
+    fn working() -> Driver {
+        let mut d = idle();
+        d.session = Some("S".into());
+        d.t.turn = Turn::Idle;
+        d
+    }
+
+    fn type_and_send(d: &mut Driver, text: &str) {
+        d.composer.set(text);
+        d.key(&Key::named("enter"));
+    }
+
+    fn end_turn(d: &mut Driver, stop: &str) {
+        d.response(Call::Prompt, Ok(serde_json::json!({"stopReason": stop})), Instant::now());
+    }
+
+    #[test]
+    fn follow_ups_queue_while_the_agent_works_and_go_in_order() {
+        let mut d = working();
+        type_and_send(&mut d, "first");
+        assert_eq!(d.t.turn, Turn::Working);
+        type_and_send(&mut d, "second");
+        type_and_send(&mut d, "third");
+        assert_eq!(d.t.queue, ["second", "third"]);
+        assert!(d.composer.is_empty());
+        end_turn(&mut d, "end_turn");
+        assert_eq!((d.t.queue.as_slice(), d.t.turn), (&["third".to_string()][..], Turn::Working));
+        assert!(matches!(d.t.entries.last(), Some(Entry::User(text)) if text == "second"));
+
+        // A stop holds the rest until the person says.
+        d.msg(Msg::Stop);
+        end_turn(&mut d, "cancelled");
+        assert!(d.t.queue_paused && d.t.turn == Turn::Idle && d.t.queue.len() == 1);
+        d.msg(Msg::QueueContinue);
+        assert!(d.t.queue.is_empty() && d.t.turn == Turn::Working);
+
+        // At most eight wait; the ninth stays in the composer.
+        for i in 0..8 {
+            type_and_send(&mut d, &format!("q{i}"));
+        }
+        type_and_send(&mut d, "one too many");
+        assert_eq!((d.t.queue.len(), d.composer.draft.as_str()), (QUEUE, "one too many"));
+        d.msg(Msg::Unqueue(0));
+        assert_eq!(d.t.queue[0], "q1");
+        d.msg(Msg::QueueDiscard);
+        assert!(d.t.queue.is_empty());
+    }
+
+    #[test]
+    fn a_hidden_pane_hears_what_happened_and_a_gone_surface_ends_it() {
+        let mut d = working();
+        d.info.product = "Claude Code".into();
+        type_and_send(&mut d, "go");
+        assert!(d.event(&Event::Visible(serde_json::from_value(serde_json::json!({"visible": false})).unwrap()), "s1"));
+        end_turn(&mut d, "end_turn");
+        assert_eq!(d.t.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["Claude Code finished"]);
+        d.event(&Event::Visible(serde_json::from_value(serde_json::json!({"visible": true})).unwrap()), "s1");
+        type_and_send(&mut d, "next");
+        assert!(d.t.notes.is_empty(), "the next message clears the notes");
+        end_turn(&mut d, "end_turn");
+        assert!(d.t.notes.is_empty(), "a shown pane needs no notes");
+
+        let error = serde_json::from_value(serde_json::json!({"msg": "unknown id x"})).unwrap();
+        d.event(&Event::Error(error), "s1");
+        assert!(matches!(d.t.entries.last(), Some(Entry::Notice(text)) if text == "Tern: unknown id x"));
+        let gone = serde_json::from_value(serde_json::json!({"ids": ["s1"]})).unwrap();
+        d.event(&Event::Gone(gone), "s1");
+        assert!(d.quit && d.by_person);
     }
 }

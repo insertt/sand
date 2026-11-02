@@ -122,7 +122,12 @@ pub fn eligible(acp: bool, no_attach: bool, profile: &Profile, agent_args: &[Str
 /// is off with `TERN_TSP=0`, or sand runs inside screen, zellij or a tmux
 /// session Tern does not draw).
 fn connect() -> Option<Session<Msg>> {
-    let options = Options::new().app("sand").version(env!("CARGO_PKG_VERSION")).feature(feature::SEND);
+    let options = Options::new()
+        .app("sand")
+        .version(env!("CARGO_PKG_VERSION"))
+        .feature(feature::SEND)
+        .feature(feature::EDIT)
+        .feature(feature::UNDO);
     Session::connect(options).ok().flatten()
 }
 
@@ -349,10 +354,23 @@ mod tests {
         thread::spawn(move || {
             let mut lines = io::BufReader::new(from_sand).lines();
             let mut seen = Vec::new();
+            let mut answer = to_sand.try_clone().unwrap();
             let mut next = |seen: &mut Vec<Value>| -> Option<Value> {
-                let message: Value = serde_json::from_str(&lines.next()?.ok()?).ok()?;
-                seen.push(message.clone());
-                Some(message)
+                loop {
+                    let message: Value = serde_json::from_str(&lines.next()?.ok()?).ok()?;
+                    // The welcome card's quiet lookup: no earlier sessions here.
+                    if message["method"] == "session/list" {
+                        writeln!(
+                            answer,
+                            "{}",
+                            json!({"jsonrpc": "2.0", "id": message["id"], "result": {"sessions": []}})
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    seen.push(message.clone());
+                    return Some(message);
+                }
             };
             let mut say = |message: Value| {
                 writeln!(to_sand, "{message}").unwrap();
@@ -580,9 +598,10 @@ mod tests {
 
         assert_eq!(code, 0);
         let methods: Vec<&str> = seen.iter().filter_map(|m| m["method"].as_str()).collect();
-        assert_eq!(methods, ["initialize", "session/new", "session/list", "session/load"]);
-        assert_eq!(seen[2]["params"], json!({"cwd": "/w"}));
-        assert_eq!(seen[3]["params"], json!({"sessionId": "S2", "cwd": "/w", "mcpServers": []}));
+        // The first list is the welcome card's quiet lookup, the second the picker's.
+        assert_eq!(methods, ["initialize", "session/new", "session/list", "session/list", "session/load"]);
+        assert_eq!(seen[3]["params"], json!({"cwd": "/w"}));
+        assert_eq!(seen[4]["params"], json!({"sessionId": "S2", "cwd": "/w", "mcpServers": []}));
         assert!(!seen.iter().any(|m| m["method"] == "session/prompt"), "sand's commands never reach the agent");
 
         let output = output.borrow();
@@ -590,6 +609,7 @@ mod tests {
         has("/sessions — Browse this project");
         has("Write CLAUDE.md");
         has(r#""role":"sand.sessions""#);
+        has("Continue “Fix the build”");
         has("parse it");
         has("Parsed.");
     }

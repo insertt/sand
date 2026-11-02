@@ -1,7 +1,12 @@
 //! The draft in the composer. Tern draws the editor and its caret, but the
-//! text is sand's: keys arrive on the pty and are applied here.
+//! text is sand's: keys arrive on the pty, and with native editing on,
+//! selections Tern keeps come back as edit events (in UTF-16 units) and the
+//! undo key as an undo event, both applied here.
 
 use tern_sdk::Key;
+
+/// Undo steps kept.
+const HISTORY: usize = 200;
 
 #[derive(Debug, Default)]
 pub struct Composer {
@@ -11,6 +16,10 @@ pub struct Composer {
     /// The completion highlighted, and whether Esc put the completions away.
     pub pick: usize,
     pub dismissed: bool,
+    /// Drafts (and carets) before each change, newest last.
+    history: Vec<(String, usize)>,
+    /// The last change typed a word character, so the next one joins its undo step.
+    typing: bool,
 }
 
 impl Composer {
@@ -22,6 +31,22 @@ impl Composer {
         self.draft.chars().count()
     }
 
+    fn len_utf16(&self) -> usize {
+        self.draft.chars().map(char::len_utf16).sum()
+    }
+
+    /// The char index at `units` UTF-16 units in.
+    fn char_at(&self, units: usize) -> usize {
+        let mut seen = 0;
+        for (i, c) in self.draft.chars().enumerate() {
+            if seen >= units {
+                return i;
+            }
+            seen += c.len_utf16();
+        }
+        self.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.draft.is_empty()
     }
@@ -31,18 +56,20 @@ impl Composer {
         self.draft.chars().take(self.cursor).map(char::len_utf16).sum()
     }
 
-    pub fn insert(&mut self, text: &str) {
-        let at = self.byte(self.cursor);
-        self.draft.insert_str(at, text);
-        self.cursor += text.chars().count();
-        self.edited();
+    /// Whether the caret sits at the end of the draft.
+    pub fn at_end(&self) -> bool {
+        self.cursor == self.len()
     }
 
-    /// Replaces the draft, with the caret at its end.
-    pub fn set(&mut self, text: &str) {
-        self.draft = text.to_string();
-        self.cursor = self.len();
-        self.edited();
+    /// Remembers the draft before a change; typing a word joins one step.
+    fn remember(&mut self, typing: bool) {
+        if !(typing && self.typing) {
+            self.history.push((self.draft.clone(), self.cursor));
+            if self.history.len() > HISTORY {
+                self.history.remove(0);
+            }
+        }
+        self.typing = typing;
     }
 
     /// A new draft brings the completions back, from the top.
@@ -51,11 +78,61 @@ impl Composer {
         self.dismissed = false;
     }
 
-    /// Empties the draft and returns it.
+    fn insert_typed(&mut self, text: &str, typing: bool) {
+        self.remember(typing);
+        let at = self.byte(self.cursor);
+        self.draft.insert_str(at, text);
+        self.cursor += text.chars().count();
+        self.edited();
+    }
+
+    pub fn insert(&mut self, text: &str) {
+        self.insert_typed(text, false);
+    }
+
+    /// Replaces the draft, with the caret at its end.
+    pub fn set(&mut self, text: &str) {
+        self.remember(false);
+        self.draft = text.to_string();
+        self.cursor = self.len();
+        self.edited();
+    }
+
+    /// Empties the draft and returns it (undo brings it back).
     pub fn take(&mut self) -> String {
+        if !self.draft.is_empty() {
+            self.remember(false);
+        }
         self.cursor = 0;
         self.edited();
         std::mem::take(&mut self.draft)
+    }
+
+    /// Applies a native edit: UTF-16 `[from, to)` replaced with `text`, the
+    /// caret then at `cursor`. Ignored when the draft changed since Tern saw
+    /// it (`len`), as keys in flight would have.
+    pub fn edit(&mut self, from: usize, to: usize, text: &str, cursor: usize, len: usize) {
+        if len != self.len_utf16() || from > to || to > len {
+            return;
+        }
+        if from != to || !text.is_empty() {
+            self.remember(false);
+            let (start, end) = (self.char_at(from), self.char_at(to));
+            let (start, end) = (self.byte(start), self.byte(end));
+            self.draft.replace_range(start..end, text);
+            self.edited();
+        }
+        self.cursor = self.char_at(cursor);
+    }
+
+    /// Takes the last change back.
+    pub fn undo(&mut self) {
+        if let Some((draft, cursor)) = self.history.pop() {
+            self.draft = draft;
+            self.cursor = cursor;
+            self.typing = false;
+            self.edited();
+        }
     }
 
     /// Applies an editing key; false for a key that edits nothing.
@@ -63,12 +140,14 @@ impl Composer {
         match key.name.as_str() {
             "enter" if key.shift || key.alt => self.insert("\n"),
             "backspace" if self.cursor > 0 => {
+                self.remember(false);
                 let at = self.byte(self.cursor - 1);
                 self.draft.remove(at);
                 self.cursor -= 1;
                 self.edited();
             }
             "delete" if self.cursor < self.len() => {
+                self.remember(false);
                 let at = self.byte(self.cursor);
                 self.draft.remove(at);
                 self.edited();
@@ -78,14 +157,19 @@ impl Composer {
             "home" => self.cursor = 0,
             "end" => self.cursor = self.len(),
             "u" if key.ctrl => {
+                self.remember(false);
                 let at = self.byte(self.cursor);
                 self.draft.drain(..at);
                 self.cursor = 0;
                 self.edited();
             }
+            "z" if key.ctrl || key.meta => self.undo(),
             "paste" => self.insert(key.text.as_deref().unwrap_or_default()),
             _ => match key.typed() {
-                Some(text) => self.insert(text),
+                Some(text) => {
+                    let word = text.chars().all(char::is_alphanumeric);
+                    self.insert_typed(text, word);
+                }
                 None => return false,
             },
         }
@@ -99,6 +183,10 @@ mod tests {
 
     fn key(name: &str) -> Key {
         Key::named(name)
+    }
+
+    fn typed(text: &str) -> Key {
+        Key { text: Some(text.into()), ..Key::named(text) }
     }
 
     #[test]
@@ -132,5 +220,45 @@ mod tests {
         assert_eq!(c.draft, "one\ntwo");
         assert!(c.key(&Key { ctrl: true, ..key("u") }));
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn native_edits_replace_utf16_ranges() {
+        let mut c = Composer::default();
+        c.insert("hi 😀 there");
+        // Tern's selection over "😀 " (UTF-16 3..6) replaced with "you ".
+        c.edit(3, 6, "you ", 7, 11);
+        assert_eq!((c.draft.as_str(), c.cursor_utf16()), ("hi you there", 7));
+        // A caret move alone changes nothing else and is no undo step.
+        c.edit(0, 0, "", 0, 12);
+        assert_eq!(c.cursor_utf16(), 0);
+        // An edit made against an older draft is dropped.
+        c.edit(0, 2, "", 0, 99);
+        assert_eq!(c.draft, "hi you there");
+        c.undo();
+        assert_eq!(c.draft, "hi 😀 there");
+    }
+
+    #[test]
+    fn undo_takes_back_words_edits_and_a_sent_draft() {
+        let mut c = Composer::default();
+        for ch in ["f", "i", "x"] {
+            c.key(&typed(ch));
+        }
+        c.key(&typed(" "));
+        for ch in ["i", "t"] {
+            c.key(&typed(ch));
+        }
+        assert_eq!(c.draft, "fix it");
+        c.undo();
+        assert_eq!(c.draft, "fix ");
+        c.undo();
+        assert_eq!(c.draft, "fix");
+        c.undo();
+        assert_eq!(c.draft, "");
+        c.set("draft");
+        assert_eq!(c.take(), "draft");
+        c.key(&Key { ctrl: true, ..key("z") });
+        assert_eq!((c.draft.as_str(), c.cursor_utf16()), ("draft", 5), "a sent draft comes back");
     }
 }

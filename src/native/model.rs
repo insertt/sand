@@ -30,6 +30,14 @@ pub enum Entry {
     Resumed(String),
 }
 
+/// A note above the composer about something that happened while the pane was hidden.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    pub text: String,
+    /// `success`, `warning` or `error`.
+    pub tone: &'static str,
+}
+
 /// A session the agent can resume (ACP's `session/list`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionEntry {
@@ -348,8 +356,16 @@ pub enum Setting {
 pub struct Transcript {
     pub setup: Setup,
     pub question: Option<Question>,
-    /// A prompt sent before the agent was ready, sent once it is.
-    pub queued: Option<String>,
+    /// Follow-ups written while the agent works (or starts), sent in order
+    /// as each turn ends; paused after a stop or a failure.
+    pub queue: Vec<String>,
+    pub queue_paused: bool,
+    /// The pane is hidden (another tab): what happens meanwhile is noted.
+    pub hidden: bool,
+    /// Notes for the person, about what happened while the pane was hidden.
+    pub notes: Vec<Note>,
+    /// The session before this one, for the welcome card's Continue.
+    pub last_session: Option<SessionEntry>,
     pub entries: Vec<Entry>,
     /// Tool call id to its index in `entries`.
     tools: HashMap<String, usize>,
@@ -381,7 +397,11 @@ impl Default for Transcript {
         Self {
             setup: Setup::new(Instant::now()),
             question: None,
-            queued: None,
+            queue: Vec::new(),
+            queue_paused: false,
+            hidden: false,
+            notes: Vec::new(),
+            last_session: None,
             entries: Vec::new(),
             tools: HashMap::new(),
             plan: Vec::new(),
@@ -664,6 +684,13 @@ impl Transcript {
         }
         if self.turn != Turn::Exited {
             self.turn = Turn::Idle;
+        }
+    }
+
+    /// Notes `text` for later, if the pane is hidden now.
+    pub fn note(&mut self, text: impl Into<String>, tone: &'static str) {
+        if self.hidden {
+            self.notes.push(Note { text: text.into(), tone });
         }
     }
 

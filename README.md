@@ -475,6 +475,17 @@ conversation when the agent can; `/resume <id>` resumes one directly; `/new`
 starts a new session; and `/help` lists them all. Resuming needs an agent that
 supports ACP's session listing and loading.
 
+The composer edits like a native text field (select with the mouse or
+Shift+arrows, ⌘A, ⌘Z to undo, even a sent draft) and shows the rest of a
+command being typed faintly after the caret. Messages written while the agent
+works (or starts) wait above the composer, up to eight, each with a ✕ to take
+it back, and go in order as each turn ends; after a stop or a failure the
+queue pauses until you continue or discard it. A new session's welcome offers
+to continue the last conversation, and a few prompts to start with. While the
+pane is hidden, what happens (a finished turn, a permission request, the agent
+exiting) is noted above the composer for when you come back. Each turn ends
+with its time, tokens and cost.
+
 You can type during setup; the first message is sent once the agent is ready.
 Enter sends, Shift+Enter starts a new line and Esc stops a turn. As in
 Claude Code, Ctrl+C stops a turn or clears the draft first, and otherwise
