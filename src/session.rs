@@ -1237,6 +1237,7 @@ fn native_info(req: &Request, dirs: &Dirs) -> native::Info {
         mcp: req.mcp.iter().map(|name| mcp::McpStatus { name: name.clone(), state: mcp::McpState::Unknown }).collect(),
         api: None,
         api_host,
+        vertex: profile.vertex.is_some(),
         branch: None,
         model,
         effort,

@@ -62,9 +62,10 @@ pub fn check_api(sbx: &Sbx, sandbox: &str, profile: &Profile) -> ApiState {
 pub fn write_info(runtime: &Path, sandbox: &str, profile: &Profile) -> Result<()> {
     fs::create_dir_all(runtime).with_context(|| format!("creating {}", runtime.display()))?;
     let info = format!(
-        "sandbox={sandbox}\nharness={}\napi_url={}\n",
+        "sandbox={sandbox}\nharness={}\napi_url={}\nauth={}\n",
         profile.name,
-        profile.api_check_url.as_deref().unwrap_or("")
+        profile.api_check_url.as_deref().unwrap_or(""),
+        if profile.vertex.is_some() { "vertex" } else { "sbx" }
     );
     fs::write(runtime.join("info"), info)?;
     fs::write(runtime.join("statusline.sh"), statusline_script())?;
@@ -262,7 +263,13 @@ if [ -n "$api_url" ]; then
     down) api="${{red}}✗${{reset}}" ;;
     *) api="${{dim}}…${{reset}}" ;;
   esac
-  line="${{line}}${{sep}}API ${{api}}"
+  # What the agent signs in with: Vertex AI and API keys are APIs; Claude Code
+  # reports 5h/7d limits only for Pro and Max subscriptions, after its first response.
+  if [ "$(value auth)" = vertex ]; then kind="API (Vertex)"
+  elif percent five_hour >/dev/null || percent seven_day >/dev/null; then kind="Subscription"
+  elif percent context_window >/dev/null; then kind="API"
+  else kind="${{dim}}…${{reset}}"; fi
+  line="${{line}}${{sep}}${{kind}} ${{api}}"
 fi
 
 if [ -s "$DIR/mcp-status" ]; then
@@ -379,6 +386,32 @@ mod tests {
         let input = r#"{"model":{"id":"x","display_name":"Sonnet"},"context_window":{"used_percentage":null}}"#;
         assert_eq!(run_statusline(tmp.path(), input), "📦 claude-proj │ MCP none\n🤖 Sonnet\n");
         assert_eq!(run_statusline(tmp.path(), ""), "📦 claude-proj │ MCP none\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn statusline_names_how_the_agent_signs_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = Profile::resolve("claude", &crate::config::Config::default()).unwrap();
+        let profile = Profile { api_check_url: Some("http://127.0.0.1:9/".into()), ..profile };
+        write_info(&tmp.path().join(RUNTIME_DIR_NAME), "p", &profile).unwrap();
+        let first = |input: &str| run_statusline(tmp.path(), input).lines().next().unwrap().to_string();
+        let limits = r#"{"context_window":{"used_percentage":5},"rate_limits":{"five_hour":{"used_percentage":1}}}"#;
+        assert!(first(limits).contains("Subscription"));
+        assert!(first(r#"{"context_window":{"used_percentage":5}}"#).contains("│ API "));
+        assert!(!first("{}").contains("API") && !first("{}").contains("Subscription"));
+        let vertex = Profile {
+            vertex: Some(crate::vertex::Vertex {
+                project: "p".into(),
+                region: "global".into(),
+                hosts: vec![],
+                token_command: String::new(),
+                refresh: String::new(),
+            }),
+            ..profile
+        };
+        write_info(&tmp.path().join(RUNTIME_DIR_NAME), "p", &vertex).unwrap();
+        assert!(first(limits).contains("API (Vertex)"));
     }
 
     #[cfg(unix)]
