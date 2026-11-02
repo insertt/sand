@@ -79,6 +79,16 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
 
+      # Every target builds on a runner of its own architecture, so the fresh
+      # executable can run; a broken one fails here instead of in users' hands.
+      - name: Smoke test
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          exe=sand
+          if [ "$RUNNER_OS" = Windows ]; then exe=sand.exe; fi
+          "target/$TARGET/release/$exe" --version
+
       # Asset names carry no version, so
       # releases/latest/download/<asset> always resolves to the newest one.
       - name: Package
