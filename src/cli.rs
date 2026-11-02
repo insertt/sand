@@ -124,6 +124,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub acp: bool,
 
+    /// Draw the session natively in Tern, whatever `tern_native` and SAND_TERN_NATIVE say
+    #[arg(long, conflicts_with_all = ["no_native", "acp", "no_attach", "agent_args"])]
+    pub native: bool,
+
+    /// Open the agent's terminal UI, even in Tern with `tern_native` on
+    #[arg(long)]
+    pub no_native: bool,
+
     /// Create or update the sandbox and start it, but do not open the agent
     #[arg(long, conflicts_with_all = ["acp", "dedicated_scratch", "agent_args"])]
     pub no_attach: bool,
@@ -147,6 +155,19 @@ pub struct RunArgs {
     /// Answer for "the sandbox exists with a different setup" instead of asking
     #[arg(long, value_enum, value_name = "CHOICE")]
     pub on_conflict: Option<ConflictChoice>,
+}
+
+impl RunArgs {
+    /// `--native` or `--no-native`: wins over the environment and the config.
+    pub fn forced_native(&self) -> Option<bool> {
+        if self.native {
+            Some(true)
+        } else if self.no_native {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -250,6 +271,7 @@ mod tests {
         assert_eq!(run(&["--install-acp", "jetbrains"]).install_acp, Some(AcpClient::Jetbrains));
         assert_eq!(run(&["claude", "--install-acp", "tern"]).install_acp, Some(AcpClient::Tern));
         assert!(run(&["--open-config"]).open_config && !run(&["codex"]).open_config);
+        assert!(run(&["codex", "--native"]).native && run(&["codex", "--no-native"]).no_native);
     }
 
     #[test]
@@ -273,6 +295,9 @@ mod tests {
             &["codex", "--no-attach", "--acp"],
             &["codex", "--no-attach", "--dedicated-scratch"],
             &["codex", "--no-attach", "--", "--continue"],
+            &["codex", "--native", "--no-native"],
+            &["codex", "--native", "--acp"],
+            &["codex", "--native", "--", "--continue"],
         ];
         for args in bad {
             assert!(Cli::try_parse_from(std::iter::once("sand").chain(args.iter().copied())).is_err(), "{args:?}");

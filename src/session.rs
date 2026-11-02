@@ -939,6 +939,9 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let (sbx, listed) = Sbx::connect_listing(!args.acp)?;
     // From here on, a Tern pane shows setup natively; sbx no longer gets the terminal then.
     let sbx = if native && native::start(native_info(&req, dirs)) { sbx.quiet() } else { sbx };
+    if args.native && !native::active() {
+        log::warn("--native: this terminal does not speak the Tern Surface Protocol; opening the terminal UI");
+    }
     log::step(format!("sand: {} in sandbox '{}'", profile.name, req.name));
     if profile.is_basic() {
         log::info(format!(
@@ -1205,8 +1208,12 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
 /// turn out to speak the Tern Surface Protocol.
 fn native_eligible(args: &RunArgs, profile: &Profile, config: &Config) -> bool {
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let eligible = tty
-        && native::eligible(args.acp, args.no_attach, profile, &args.agent_args, config.tern_native.unwrap_or(true));
+    let forced = args.forced_native();
+    let configured = config.tern_native.unwrap_or(true);
+    let eligible = tty && native::eligible(args.acp, args.no_attach, profile, &args.agent_args, forced, configured);
+    if forced == Some(true) && !eligible {
+        log::warn("--native: not drawing natively (it needs a terminal and an agent with an ACP command)");
+    }
     if tty && !eligible && !args.agent_args.is_empty() && env::var("TERM_PROGRAM").is_ok_and(|t| t == "tern") {
         log::info("opening the terminal UI: Tern draws sessions natively only without agent arguments");
     }

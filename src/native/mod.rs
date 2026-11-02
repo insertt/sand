@@ -140,12 +140,20 @@ fn host() -> std::sync::MutexGuard<'static, Option<Host>> {
 
 /// Whether this session may be drawn natively; the terminal decides in
 /// [`start`]. Agent arguments are for the terminal UI, which ACP has no
-/// place for. `configured` is `tern_native` from the config.
-pub fn eligible(acp: bool, no_attach: bool, profile: &Profile, agent_args: &[String], configured: bool) -> bool {
+/// place for. `forced` is `--native`/`--no-native`, which wins over
+/// `SAND_TERN_NATIVE`, which wins over `configured` (`tern_native`).
+pub fn eligible(
+    acp: bool,
+    no_attach: bool,
+    profile: &Profile,
+    agent_args: &[String],
+    forced: Option<bool>,
+    configured: bool,
+) -> bool {
     !acp && !no_attach
         && !profile.acp_command.is_empty()
         && agent_args.is_empty()
-        && env::var(OPT_OUT).map_or(configured, |v| v != "0")
+        && forced.unwrap_or_else(|| env::var(OPT_OUT).map_or(configured, |v| v != "0"))
 }
 
 /// Asks the terminal whether it speaks TSP; `None` when it does not (or TSP
@@ -500,6 +508,16 @@ mod tests {
         })
     }
 
+
+    #[test]
+    fn the_command_line_forces_native_sessions_on_or_off() {
+        let profile = Profile::resolve("claude", &crate::config::Config::default()).unwrap();
+        assert!(eligible(false, false, &profile, &[], Some(true), false));
+        assert!(!eligible(false, false, &profile, &[], Some(false), true));
+        // What ACP cannot carry still opens the terminal UI.
+        assert!(!eligible(false, false, &profile, &["--continue".into()], Some(true), true));
+        assert!(!eligible(true, false, &profile, &[], Some(true), true));
+    }
     #[test]
     fn a_native_session_shows_setup_asks_then_chats() {
         let output = Rc::new(RefCell::new(String::new()));
