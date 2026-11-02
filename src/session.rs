@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -1277,6 +1277,13 @@ fn attach_native(
             serde_json::json!([])
         },
         workspace: state.mounts.primary.as_ref().map(|m| m.path.clone()),
+        mounts: {
+            let (dirs, name) = (dirs.clone(), state.name.clone());
+            Arc::new(move || {
+                let state = state::load(&dirs, &name).ok().flatten();
+                state.map(|s| s.mounts.all().map(|m| m.path.clone()).collect()).unwrap_or_default()
+            })
+        },
     };
     let bridge = (hooks.is_some() || profile.network_prompts)
         .then(|| Bridge::start_with(sbx.clone(), dirs.clone(), state.name.clone(), hooks));

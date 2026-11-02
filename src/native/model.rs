@@ -433,6 +433,8 @@ pub struct Transcript {
     pub commands: Vec<SlashCommand>,
     /// The workspace's files and directories, for `@` mentions.
     pub files: Vec<String>,
+    /// A directory above the workspace an `@../` mention reaches, and what is in it.
+    pub above: Option<(String, Vec<String>)>,
     pub picker: Option<SessionPicker>,
     /// A session being resumed: the working line says so until the agent answers.
     pub resuming: Option<String>,
@@ -471,6 +473,7 @@ impl Default for Transcript {
             mode: None,
             commands: Vec::new(),
             files: Vec::new(),
+            above: None,
             blocked: Vec::new(),
             blocked_seen: HashSet::new(),
             picker: None,

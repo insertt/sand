@@ -4,7 +4,11 @@
 
 use std::fs;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::args;
+use crate::paths::container_path;
+use crate::sbx::Sbx;
 
 /// Paths listed at most, for a workspace that is a whole home directory.
 const MAX_ENTRIES: usize = 50_000;
@@ -88,6 +92,74 @@ fn walk(dir: &Path, prefix: &str, files: &mut Vec<String>) {
     }
 }
 
+/// The directory a mention reaching above the workspace lists, `../` and
+/// what follows it up to the last `/`: `../a/` for `../a/b`.
+pub fn above(query: &str) -> Option<&str> {
+    query.starts_with("../").then(|| &query[..query.rfind('/').map_or(0, |i| i + 1)])
+}
+
+/// What the sandbox has in `dir` (from [`above`], taken from `cwd`, the
+/// workspace in the sandbox), one level, as paths starting with `dir`. It
+/// sees nothing of the host but `mounts` (host paths), so outside them only
+/// a mount or a directory on the way to one is offered.
+pub fn list_above(sbx: &Sbx, sandbox: &str, cwd: &str, mounts: &[PathBuf], dir: &str) -> Vec<String> {
+    let target = sandbox_path(cwd, dir);
+    let listed = sbx.capture(args!["exec", sandbox, "ls", "-1Ap", "--", &target]).ok().flatten().unwrap_or_default();
+    let mounts: Vec<String> = mounts.iter().map(|m| container_path(&m.to_string_lossy())).collect();
+    mounted(&target, listed.lines(), &mounts, dir)
+}
+
+/// `dir` taken from `cwd`, in the sandbox's `/`-separated paths.
+fn sandbox_path(cwd: &str, dir: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in cwd.split('/').chain(dir.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// The `names` in `target` (as `ls -p` writes them, directories with a `/`)
+/// that come from the host: all of them inside a mount, else the mounts and
+/// the directories leading to one. Hidden ones are left out.
+fn mounted<'a>(target: &str, names: impl Iterator<Item = &'a str>, mounts: &[String], dir: &str) -> Vec<String> {
+    let under = |path: &str, top: &str| {
+        let top = top.trim_end_matches('/');
+        path == top || path.strip_prefix(top).is_some_and(|rest| rest.starts_with('/'))
+    };
+    let inside = mounts.iter().any(|m| under(target, m));
+    let mut found: Vec<String> = names
+        .filter(|name| !name.is_empty() && !name.starts_with('.'))
+        .filter(|name| {
+            let path = format!("{}/{}", target.trim_end_matches('/'), name.trim_end_matches('/'));
+            inside || (name.ends_with('/') && mounts.iter().any(|m| under(m, &path)))
+        })
+        .take(MAX_ENTRIES)
+        .map(|name| format!("{dir}{name}"))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The completions of a mention reaching above the workspace: `../` for
+/// `..`, else what `listed` (the entries of `dir`) holds, by name.
+pub fn complete_above(dir: &str, listed: &[String], query: &str) -> Vec<String> {
+    if query == ".." {
+        return vec!["../".to_string()];
+    }
+    let Some(typed) = above(query) else { return Vec::new() };
+    if typed != dir {
+        return Vec::new();
+    }
+    let names: Vec<String> = listed.iter().filter_map(|e| e.strip_prefix(dir)).map(str::to_string).collect();
+    complete(&names, &query[dir.len()..]).into_iter().map(|name| format!("{dir}{name}")).collect()
+}
+
 /// The mention the caret (in chars) ends, while it is typed: where its `@`
 /// is (in chars) and what follows it.
 pub fn at_caret(draft: &str, cursor: usize) -> Option<(usize, String)> {
@@ -140,10 +212,11 @@ pub fn mention(path: &str) -> String {
     if path.contains(char::is_whitespace) { format!("@\"{path}\"") } else { format!("@{path}") }
 }
 
-/// The mentions in `text` naming something under `root`: `@path` or
+/// The mentions in `text` naming something from `root` the sandbox sees
+/// (see [`resolve`]): `@path` or
 /// `@"a path"`, at the start or after a space. Trailing punctuation is the
 /// sentence's when the path without it exists.
-pub fn links(text: &str, root: &Path) -> Vec<Link> {
+pub fn links(text: &str, root: &Path, mounts: &[PathBuf]) -> Vec<Link> {
     let mut links = Vec::new();
     let mut prev = None;
     for (i, c) in text.char_indices() {
@@ -162,10 +235,7 @@ pub fn links(text: &str, root: &Path) -> Vec<Link> {
             vec![(word.len(), word), (trimmed.len(), trimmed)]
         };
         let found = candidates.into_iter().find(|(_, path)| {
-            !path.is_empty()
-                && Path::new(path).is_relative()
-                && !path.split(['/', '\\']).any(|part| part == "..")
-                && inside(root, path).is_some()
+            !path.is_empty() && Path::new(path).is_relative() && resolve(root, mounts, path).is_some()
         });
         if let Some((len, path)) = found {
             let uri = file_uri(&root.join(path.trim_end_matches('/')));
@@ -189,17 +259,19 @@ pub fn file_uri(path: &Path) -> String {
     uri
 }
 
-/// `root/path` resolved, when it exists and stays under `root`: the agent can
-/// put links in the workspace that lead to any file of the host.
-fn inside(root: &Path, path: &str) -> Option<std::path::PathBuf> {
+/// `root/path` resolved, when it exists in the workspace or another of
+/// `mounts`: what the sandbox sees of the host. The agent can put links in
+/// the workspace that lead to any file of the host, so none is followed out.
+fn resolve(root: &Path, mounts: &[PathBuf], path: &str) -> Option<PathBuf> {
     let root = dunce::canonicalize(root).ok()?;
     let resolved = dunce::canonicalize(root.join(path)).ok()?;
-    resolved.starts_with(&root).then_some(resolved)
+    let mounted = |m: &PathBuf| dunce::canonicalize(m).is_ok_and(|m| resolved.starts_with(m));
+    (resolved.starts_with(&root) || mounts.iter().any(mounted)).then_some(resolved)
 }
 
-/// The text of the file `link` names, when it is a small text file in the workspace.
-pub fn contents(root: &Path, link: &Link) -> Option<String> {
-    let path = inside(root, &link.path)?;
+/// The text of the file `link` names, when it is a small text file [`resolve`] reaches.
+pub fn contents(root: &Path, mounts: &[PathBuf], link: &Link) -> Option<String> {
+    let path = resolve(root, mounts, &link.path)?;
     let meta = fs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > MAX_EMBEDDED {
         return None;
@@ -253,13 +325,13 @@ mod tests {
         fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
         fs::write(dir.path().join("my notes.md"), "").unwrap();
         let text = "fix @src/a.rs, see @\"my notes.md\" and @src/ not @nope or me@src/a.rs";
-        let links = links(text, dir.path());
+        let links = links(text, dir.path(), &[]);
         let paths: Vec<(&str, &str)> = links.iter().map(|l| (&text[l.range.clone()], l.path.as_str())).collect();
         assert_eq!(paths, [("@src/a.rs", "src/a.rs"), ("@\"my notes.md\"", "my notes.md"), ("@src/", "src/")]);
         assert!(links[1].uri.ends_with("/my%20notes.md"));
         assert!(!links[2].uri.ends_with('/'));
-        assert_eq!(contents(dir.path(), &links[0]).as_deref(), Some("fn a() {}"));
-        assert_eq!(contents(dir.path(), &links[2]), None);
+        assert_eq!(contents(dir.path(), &[], &links[0]).as_deref(), Some("fn a() {}"));
+        assert_eq!(contents(dir.path(), &[], &links[2]), None);
     }
 
     #[cfg(unix)]
@@ -272,11 +344,49 @@ mod tests {
         fs::write(root.join("real.md"), "ok").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("notes.md")).unwrap();
         std::os::unix::fs::symlink(root.join("real.md"), root.join("alias.md")).unwrap();
-        let links = links("see @notes.md and @alias.md", &root);
+        let links = links("see @notes.md and @alias.md", &root, &[]);
         assert_eq!(links.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(), ["alias.md"]);
-        assert_eq!(contents(&root, &links[0]).as_deref(), Some("ok"));
+        assert_eq!(contents(&root, &[], &links[0]).as_deref(), Some("ok"));
         let forged = Link { range: 0..1, path: "notes.md".into(), uri: String::new(), text: None };
-        assert_eq!(contents(&root, &forged), None);
+        assert_eq!(contents(&root, &[], &forged), None);
+        // Above the workspace, only what the sandbox mounts.
+        let lib = dir.path().join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(lib.join("a.rs"), "lib").unwrap();
+        std::os::unix::fs::symlink(&outside, lib.join("leak")).unwrap();
+        let mounts = [lib.clone()];
+        let links = super::links("see @../lib/a.rs and @../secret and @../lib/leak", &root, &mounts);
+        assert_eq!(links.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(), ["../lib/a.rs"]);
+        assert_eq!(contents(&root, &mounts, &links[0]).as_deref(), Some("lib"));
+        assert!(super::links("see @../lib/a.rs", &root, &[]).is_empty(), "not mounted, not there");
+    }
+
+    #[test]
+    fn mentions_above_the_workspace_offer_what_the_sandbox_mounts() {
+        assert_eq!(above("../"), Some("../"));
+        assert_eq!(above("../../li"), Some("../../"));
+        assert_eq!(above("../lib/sr"), Some("../lib/"));
+        assert_eq!((above(".."), above("src/"), above("a/../")), (None, None, None));
+        assert_eq!(sandbox_path("/h/me/w", "../"), "/h/me");
+        assert_eq!(sandbox_path("/h/me/w", "../../../../"), "/");
+        assert_eq!(sandbox_path("/h/me/w", "../lib/src/"), "/h/me/lib/src");
+
+        let mounts = ["/h/me/w".to_string(), "/h/me/lib".to_string(), "/h/other/docs".to_string()];
+        let ls = |text: &'static str| text.lines();
+        // Beside the workspace, sbx's own files and anything not mounted are left out.
+        let listed = mounted("/h/me", ls("CLAUDE.md\nkits/\nlib/\nlibrary/\nw/\n.cache/"), &mounts, "../");
+        assert_eq!(listed, ["../lib/", "../w/"]);
+        // A directory on the way to a mount, then all of a mount.
+        assert_eq!(mounted("/h", ls("me/\nother/\nshared/"), &mounts, "../../"), ["../../me/", "../../other/"]);
+        assert_eq!(mounted("/h/me/lib", ls("a.rs\nsrc/\n.git/"), &mounts, "../lib/"), ["../lib/a.rs", "../lib/src/"]);
+        assert_eq!(mounted("/", ls("bin/\nh/\netc/"), &mounts, "../../../"), ["../../../h/"]);
+        assert!(mounted("/h/me", ls("lib/"), &mounts[..1], "../").is_empty(), "nothing else mounted");
+
+        let listed = ["../lib/".to_string(), "../w/".to_string()];
+        assert_eq!(complete_above("", &[], ".."), ["../"]);
+        assert_eq!(complete_above("../", &listed, "../"), ["../w/", "../lib/"]);
+        assert_eq!(complete_above("../", &listed, "../l"), ["../lib/"]);
+        assert!(complete_above("../", &listed, "../lib/s").is_empty(), "not listed yet");
     }
 
     #[test]

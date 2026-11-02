@@ -74,6 +74,9 @@ pub enum Command {
     Pasted(std::result::Result<(Vec<u8>, &'static str), String>),
     /// The workspace's files, listed for `@` mentions.
     Files(Vec<String>),
+    /// What the sandbox has in a directory above the workspace (`../`),
+    /// listed for an `@` mention, and the host directories it mounts.
+    Above(String, Vec<String>, Vec<PathBuf>),
     /// Talk to this agent (tests stand one in for `sbx exec`).
     #[cfg(test)]
     Agent(client::Client, Receiver<client::Incoming>),
@@ -106,7 +109,12 @@ pub struct ChatSpec {
     pub servers: serde_json::Value,
     /// The primary workspace on the host, for the git branch.
     pub workspace: Option<PathBuf>,
+    /// The host directories the sandbox mounts now, for `@` mentions above the workspace.
+    pub mounts: Mounts,
 }
+
+/// Reads the host directories a sandbox mounts, as they are at the time.
+pub type Mounts = Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>;
 
 struct Host {
     tx: Sender<Command>,

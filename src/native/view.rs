@@ -297,7 +297,13 @@ pub fn completions(t: &Transcript, composer: &Composer) -> Vec<Completion> {
         return commands.into_iter().map(Completion::Command).collect();
     }
     let Some((start, query)) = composer.mention() else { return Vec::new() };
-    files::complete(&t.files, &query).into_iter().map(|path| Completion::File(path, start)).collect()
+    let found = if query == ".." || files::above(&query).is_some() {
+        let (dir, listed) = t.above.as_ref().map_or(("", &[][..]), |(dir, listed)| (dir.as_str(), &listed[..]));
+        files::complete_above(dir, listed, &query)
+    } else {
+        files::complete(&t.files, &query)
+    };
+    found.into_iter().map(|path| Completion::File(path, start)).collect()
 }
 
 /// What floats over the session: the completions of a `/command` or an

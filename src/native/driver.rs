@@ -24,9 +24,10 @@ use super::model::{
     Approval, Entry, Image, Mode, Prompt, Question, SessionEntry, SessionPicker, Setting, Transcript, Turn,
 };
 use super::view::{Completion, EDITOR, Info, Msg, STYLE, completions, view};
-use super::{ChatSpec, Command, Update};
+use super::{ChatSpec, Command, Mounts, Update};
 use crate::log::Line;
 use crate::network::{Answered, Asked, Outcome};
+use crate::sbx::Sbx;
 
 /// Follow-ups that can wait for the agent at once.
 const QUEUE: usize = 8;
@@ -82,6 +83,13 @@ pub struct Driver {
     /// its files were last listed.
     workspace: Option<PathBuf>,
     files_listed: Option<Instant>,
+    /// The directory above it last listed for an `@../` mention, and when.
+    above_listed: Option<(String, Instant)>,
+    /// Where those are listed: the sandbox, its workspace there and its mounts.
+    above_from: Option<(Sbx, String, String, Mounts)>,
+    /// The host directories the sandbox mounts: an `@` mention leaving the
+    /// workspace names something only in one of them.
+    mounts: Vec<PathBuf>,
     /// Images pasted so far, for their names.
     pasted_count: usize,
     /// A message forced past the running turn: sent once its stop is confirmed.
@@ -133,6 +141,9 @@ impl Driver {
             can_embed: false,
             workspace: None,
             files_listed: None,
+            above_listed: None,
+            above_from: None,
+            mounts: Vec::new(),
             pasted_count: 0,
             forced: None,
             can_resume: false,
@@ -322,6 +333,10 @@ impl Driver {
             Command::Told(asked, outcome) => self.told(asked, outcome),
             Command::Pasted(image) => self.pasted(image),
             Command::Files(files) => self.t.files = files,
+            Command::Above(dir, listed, mounts) => {
+                self.t.above = Some((dir, listed));
+                self.mounts = mounts;
+            }
             #[cfg(test)]
             Command::Agent(client, rx) => self.attach(client, rx, None, None, "/w".to_string()),
         }
@@ -351,8 +366,10 @@ impl Driver {
     fn start(&mut self, spec: ChatSpec, now: Instant) {
         self.t.setup.finish(now);
         self.t.turn = Turn::Starting;
-        let ChatSpec { sbx, launch, log, paths, cwd, profile, sandbox, mcp, servers, workspace } = spec;
+        let ChatSpec { sbx, launch, log, paths, cwd, profile, sandbox, mcp, servers, workspace, mounts } = spec;
         self.workspace = workspace.clone();
+        self.mounts = mounts();
+        self.above_from = Some((sbx.clone(), sandbox.clone(), cwd.clone(), mounts));
         self.list_files();
         self.probe(sbx.clone(), profile, sandbox, mcp, workspace);
         let spawned = (|| -> Result<Child> {
@@ -840,7 +857,7 @@ impl Driver {
         // The files as they are now, for a prompt that waited in the queue.
         if let Some(root) = self.workspace.as_deref().filter(|_| self.can_embed) {
             for link in &mut prompt.links {
-                link.text = files::contents(root, link);
+                link.text = files::contents(root, &self.mounts, link);
             }
         }
         self.t.notes.clear();
@@ -918,7 +935,7 @@ impl Driver {
 
     /// The files `text` mentions.
     fn links(&self, text: &str) -> Vec<files::Link> {
-        self.workspace.as_deref().map(|root| files::links(text, root)).unwrap_or_default()
+        self.workspace.as_deref().map(|root| files::links(text, root, &self.mounts)).unwrap_or_default()
     }
 
     /// Lists the workspace's files, off this thread.
@@ -934,12 +951,35 @@ impl Driver {
         });
     }
 
-    /// Lists them again while an `@` mention is typed, once the list is old.
+    /// Lists them again while an `@` mention is typed, once the list is old;
+    /// for one reaching above the workspace, the directory it names.
     fn refresh_files(&mut self) {
-        let stale = self.files_listed.is_none_or(|listed| listed.elapsed() >= FILES_EVERY);
-        if stale && self.composer.mention().is_some() {
-            self.list_files();
+        let Some((_, query)) = self.composer.mention() else { return };
+        match files::above(&query) {
+            Some(dir) => self.list_above(dir.to_string()),
+            None if self.files_listed.is_none_or(|listed| listed.elapsed() >= FILES_EVERY) => self.list_files(),
+            None => {}
         }
+    }
+
+    /// Lists what the sandbox has in `dir` above the workspace, off this
+    /// thread, unless it was just listed.
+    fn list_above(&mut self, dir: String) {
+        let Some((sbx, sandbox, cwd, mounts)) = self.above_from.clone() else { return };
+        if self.above_listed.as_ref().is_some_and(|(d, at)| *d == dir && at.elapsed() < FILES_EVERY) {
+            return;
+        }
+        self.above_listed = Some((dir.clone(), Instant::now()));
+        let (tx, waker) = (self.commands.clone(), self.waker.clone());
+        thread::spawn(move || {
+            // Mounts change mid-session (`/mount`, `sand mount`): read them each time.
+            let mounts = mounts();
+            let listed = files::list_above(&sbx, &sandbox, &cwd, &mounts, &dir);
+            let _ = tx.send(Command::Above(dir, listed, mounts));
+            if let Some(waker) = &waker {
+                waker.wake();
+            }
+        });
     }
 
     fn completions(&self) -> Vec<Completion> {
@@ -1310,6 +1350,39 @@ mod tests {
         d.key(&Key { text: Some("@".into()), ..Key::named("@") });
         d.key(&Key::named("escape"));
         assert!(d.completions().is_empty(), "Esc puts them away");
+    }
+
+    #[test]
+    fn mentions_reach_above_the_workspace_into_what_the_sandbox_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, lib) = (dir.path().join("w"), dir.path().join("lib"));
+        fs::create_dir_all(lib.join("src")).unwrap();
+        fs::write(lib.join("a.rs"), "").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let mut d = idle();
+        d.workspace = Some(root.clone());
+        d.files_listed = Some(Instant::now());
+        for ch in ["@", ".", "."] {
+            d.key(&Key { text: Some(ch.into()), ..Key::named(ch) });
+        }
+        assert_eq!(d.completions(), [Completion::File("../".into(), 0)]);
+        d.key(&Key::named("tab"));
+        assert_eq!(d.composer.draft, "@../");
+        assert!(d.completions().is_empty(), "until the sandbox lists it");
+        // What the sandbox lists, as `files::list_above` leaves it: the mounts alone.
+        let above = |listed: &[&str]| listed.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        d.command(Command::Above("../".into(), above(&["../lib/", "../w/"]), vec![root.clone(), lib.clone()]));
+        assert_eq!(d.completions()[0], Completion::File("../w/".into(), 0));
+        d.key(&Key { text: Some("l".into()), ..Key::named("l") });
+        d.key(&Key::named("tab"));
+        assert_eq!(d.composer.draft, "@../lib/", "a directory above stays open too");
+        assert!(d.completions().is_empty(), "until it is listed");
+        d.command(Command::Above("../lib/".into(), above(&["../lib/a.rs", "../lib/src/"]), vec![root, lib]));
+        d.key(&Key::named("tab"));
+        assert_eq!(d.composer.draft, "@../lib/a.rs ");
+        assert_eq!(d.links(&d.composer.draft)[0].path, "../lib/a.rs", "a mounted file goes as a link");
+        d.mounts.pop();
+        assert!(d.links(&d.composer.draft).is_empty(), "once unmounted, the sandbox has no such file");
     }
 
     #[test]
