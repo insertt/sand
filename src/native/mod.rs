@@ -465,6 +465,9 @@ mod tests {
         let output = output.borrow();
         let has = |text: &str| assert!(output.contains(text), "{text} in {output}");
         has(r#""role":"sand.session""#);
+        has("tsp;s;");
+        has(r#""role":"sand.composer""#);
+        assert!(!output.contains("omp.editor"), "Tern folds omp's composer when the pane is not typed in");
         has("Looking for an existing sandbox");
         has(r#""variant":"summary""#);
         has(r#""append","lo"]"#);

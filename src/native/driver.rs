@@ -19,7 +19,7 @@ use tern_sdk::{Input, Key, Session, Surface, SurfaceOptions, Waker};
 use super::client::{self, Call, Client, Incoming};
 use super::composer::Composer;
 use super::model::{Approval, Entry, Mode, Question, Setting, Transcript, Turn};
-use super::view::{EDITOR, Info, Msg, view};
+use super::view::{EDITOR, Info, Msg, STYLE, view};
 use super::{ChatSpec, Command, Update};
 use crate::log::Line;
 
@@ -65,10 +65,12 @@ pub struct Driver {
     closed: bool,
 }
 
-/// The surface's look: Tern's chat skin keys on these roles.
+/// Opens the surface, with sand's stylesheet for the composer.
 pub fn open(session: &mut Session<Msg>, info: &Info) -> Result<Surface> {
-    Ok(session
-        .open(SurfaceOptions::inline().title(format!("{} · {}", info.product, info.sandbox)).role("sand.session"))?)
+    let title = format!("{} · {}", info.product, info.sandbox);
+    let sf = session.open(SurfaceOptions::inline().title(title).role("sand.session"))?;
+    session.stylesheet(sf, "sand", Some(STYLE))?;
+    Ok(sf)
 }
 
 impl Driver {

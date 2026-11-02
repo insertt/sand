@@ -23,6 +23,50 @@ use super::model::{
 use crate::mcp::{McpState, McpStatus};
 use crate::runtime::ApiState;
 
+/// The composer's look, after omp's floating composer: a card at the bottom of
+/// the column, the editor over a bar of chips. Tern scopes it to the surface.
+pub const STYLE: &str = r#"
+[data-role='sand.composer'] {
+	width: calc(100% - 24px);
+	max-width: 736px;
+	margin: 0 auto 10px !important;
+	padding: 8px 10px 6px;
+	box-sizing: border-box;
+	gap: 6px;
+	border-radius: 14px;
+	background: var(--card);
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t1) 12%, transparent), 0 10px 30px -18px rgba(0, 0, 0, 0.35);
+	font-family: var(--sans);
+}
+[data-role='sand.composer'] > .sf-editor {
+	min-height: calc(2 * var(--sf-lh));
+	background: transparent;
+	box-shadow: none;
+}
+[data-role='sand.composer.context'] { margin: 0 4px; }
+[data-role='sand.composer.bar'] { gap: 8px; min-width: 0; font: 12.5px/1.3 var(--sans); }
+[data-role='sand.composer.bar'] > * { flex: none; }
+[data-role='sand.composer.bar'] > [data-role='sand.composer.extras'] { flex: 1 1 auto !important; min-width: 0; overflow: hidden; }
+:is([data-role='sand.composer.model'], [data-role='sand.composer.effort']).sf-row {
+	padding: 2px 8px;
+	border-radius: 999px;
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t1) 12%, transparent);
+}
+[data-role='sand.composer.usage'] { font-family: var(--mono); }
+:is([data-role='sand.composer.send'], [data-role='sand.composer.stop']) {
+	padding: 3px 8px;
+	border-radius: 8px;
+	background: var(--l2);
+}
+.sf-row[data-role='omp.working'] {
+	width: calc(100% - 24px);
+	max-width: 736px;
+	margin: 0 auto 6px !important;
+	padding: 0 4px !important;
+	box-sizing: border-box;
+}
+"#;
+
 /// The composer's id: region `dock`, then `composer`, then `input`.
 pub const EDITOR: &str = "dock.composer.input";
 
@@ -646,7 +690,10 @@ fn working(t: &Transcript, info: &Info) -> Option<Node<Msg>> {
     )
 }
 
-/// The floating composer: the context bar, the editor, and a bar of the session's facts.
+/// The floating composer: the context bar, the editor, and a bar of the
+/// session's facts. Its roles are sand's own: Tern folds a composer with omp's
+/// roles to one row whenever the pane is not typed in, and this one stays put
+/// (`STYLE` draws it).
 fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> {
     let placeholder = match t.turn {
         _ if t.question.is_some() => "Answer the question above".to_string(),
@@ -668,13 +715,13 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
         .max_lines(12u32)
         .on_send(|text| Msg::Send(text.to_owned()))
         .on_focus(Msg::Focus);
-    let mut col = ui::col().key("composer").role("omp.editor");
+    let mut col = ui::col().key("composer").role("sand.composer");
     if let Some((used, size)) = t.context.filter(|(_, size)| *size > 0) {
         let fraction = (used as f64 / size as f64).min(1.0);
         col = col.child(
             ui::meter()
                 .key("context")
-                .role("omp.composer.context")
+                .role("sand.composer.context")
                 .title(format!("{} of {} tokens of context", compact(used), compact(size)))
                 .value(fraction)
                 .thresholds(Thresholds { warn: Some(0.75), bad: Some(0.9) })
@@ -728,13 +775,13 @@ fn chip(t: &Transcript, key: &str, role: &str, icon: &str, text: &str, label: &s
 
 /// The status line's facts, in the composer's bar.
 fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
-    let mut row = ui::row().key("bar").role("omp.composer.bar").align("center");
-    row = row.child(chip(t, "model", "omp.composer.model", "sparkle", info.model(t), "Model", Setting::Model));
+    let mut row = ui::row().key("bar").role("sand.composer.bar").align("center");
+    row = row.child(chip(t, "model", "sand.composer.model", "sparkle", info.model(t), "Model", Setting::Model));
     if let Some(effort) = info.effort(t) {
-        row = row.child(chip(t, "effort", "omp.composer.effort", "brain", effort, "Effort", Setting::Effort));
+        row = row.child(chip(t, "effort", "sand.composer.effort", "brain", effort, "Effort", Setting::Effort));
     }
 
-    let mut status = ui::status().key("extras").role("omp.composer.extras").transparent(true).grow(1.0);
+    let mut status = ui::status().key("extras").role("sand.composer.extras").transparent(true).grow(1.0);
     let state = match t.turn {
         Turn::Setup if t.setup.failed() => Some(("setup failed", "error", "x-circle")),
         Turn::Setup => Some(("setting up", "pending", "box")),
@@ -786,13 +833,13 @@ fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
 
     if let Some(usd) = t.cost {
         row = row.child(
-            ui::text(spans(&[(&cost(usd), "muted")])).key("usage").role("omp.composer.usage").title("Session cost"),
+            ui::text(spans(&[(&cost(usd), "muted")])).key("usage").role("sand.composer.usage").title("Session cost"),
         );
     }
     let action = if t.turn == Turn::Working {
         ui::row()
             .key("stop")
-            .role("omp.composer.stop")
+            .role("sand.composer.stop")
             .title("Stop (Esc)")
             .gap("xs")
             .align("center")
@@ -801,7 +848,7 @@ fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
     } else {
         ui::row()
             .key("send")
-            .role("omp.composer.send")
+            .role("sand.composer.send")
             .title("Send")
             .gap("xs")
             .align("center")
@@ -860,7 +907,7 @@ mod tests {
         assert_eq!(setup.props()["lines"][0]["status"], "running");
         let working = find(region(&v, 1), "omp.working").expect("a working line");
         assert_eq!(find(working.child_nodes(), "omp.working.label").unwrap().props()["text"], "Starting the sandbox");
-        assert_eq!(find(region(&v, 1), "omp.composer.extras").unwrap().child_nodes()[0].props()["text"], "setting up");
+        assert_eq!(find(region(&v, 1), "sand.composer.extras").unwrap().child_nodes()[0].props()["text"], "setting up");
 
         t.setup.finish(now + Duration::from_secs(12));
         t.turn = Turn::Idle;
@@ -937,16 +984,16 @@ mod tests {
         );
 
         let dock = region(&v, 1);
-        let context = find(dock, "omp.composer.context").expect("a context bar");
+        let context = find(dock, "sand.composer.context").expect("a context bar");
         assert_eq!((context.props()["value"].as_f64(), context.props()["label"].as_str()), (Some(0.4), Some("40%")));
-        let extras = find(dock, "omp.composer.extras").unwrap();
+        let extras = find(dock, "sand.composer.extras").unwrap();
         let segs: Vec<(&str, &str)> = extras
             .child_nodes()
             .iter()
             .map(|s| (s.props()["text"].as_str().unwrap(), s.props().get("tone").and_then(Value::as_str).unwrap_or("")))
             .collect();
         assert_eq!(segs, [("claude-app", "accent"), ("main", ""), ("API ✓", "success"), ("github ⚠ auth", "warning")]);
-        assert_eq!(find(dock, "omp.composer.usage").unwrap().props()["spans"][0]["t"], "$0.04");
+        assert_eq!(find(dock, "sand.composer.usage").unwrap().props()["spans"][0]["t"], "$0.04");
         assert_eq!(main.last().unwrap().props()["role"], "sand.tail");
         assert_eq!(main.last().unwrap().props()["min"], json!({"h": "3lines"}));
     }
@@ -956,14 +1003,14 @@ mod tests {
         let mut t = Transcript::default();
         // Before the agent says, the host's settings name them; nothing can be changed yet.
         let v = view(&t, &Composer::default(), &info());
-        let composer = find(region(&v, 1), "omp.editor").unwrap();
+        let composer = find(region(&v, 1), "sand.composer").unwrap();
         assert_eq!(composer.child_nodes()[0].props()["min"], json!({"h": "2lines"}));
         let text = |role: &str, v: &View<Msg>| {
             let chip = find(region(v, 1), role).unwrap();
             (chip.child_nodes()[1].props()["text"].as_str().unwrap().to_string(), chip.child_nodes().len())
         };
-        assert_eq!(text("omp.composer.model", &v), ("opus".into(), 2));
-        assert_eq!(text("omp.composer.effort", &v), ("high".into(), 2));
+        assert_eq!(text("sand.composer.model", &v), ("opus".into(), 2));
+        assert_eq!(text("sand.composer.effort", &v), ("high".into(), 2));
 
         t.turn = Turn::Exited;
         t.set_options(&json!([
@@ -973,11 +1020,11 @@ mod tests {
              "options": [{"value": "low", "name": "low"}, {"value": "max", "name": "max"}]}]));
         let v = view(&t, &Composer::default(), &info());
         let picker = |role: &str| find(region(&v, 1), role).unwrap().props().clone();
-        let model = picker("omp.composer.model");
+        let model = picker("sand.composer.model");
         assert_eq!((model["value"].as_str(), model["variant"].as_str()), (Some("sonnet"), Some("quiet")));
         assert_eq!(model["options"][1], json!({"value": "opus", "label": "Opus 5.5", "icon": "sparkle"}));
-        assert_eq!(picker("omp.composer.effort")["options"].as_array().map(Vec::len), Some(2));
-        let composer = find(region(&v, 1), "omp.editor").unwrap();
+        assert_eq!(picker("sand.composer.effort")["options"].as_array().map(Vec::len), Some(2));
+        let composer = find(region(&v, 1), "sand.composer").unwrap();
         assert!(composer.child_nodes()[0].props().get("readonly").is_none());
     }
 
@@ -996,7 +1043,7 @@ mod tests {
         assert_eq!(tool.props()["ask"], json!({"allow": "Allow", "deny": "Reject", "always": false}));
         let dock = region(&v, 1);
         assert!(find(dock, "omp.working").is_none());
-        let composer = find(dock, "omp.editor").unwrap();
+        let composer = find(dock, "sand.composer").unwrap();
         assert_eq!(composer.child_nodes()[0].props()["placeholder"], "Enter allows · Esc denies");
     }
 
