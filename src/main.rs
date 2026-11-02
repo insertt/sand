@@ -3,7 +3,6 @@
 mod acp;
 mod cli;
 mod config;
-mod describe;
 mod editor;
 mod harness;
 mod lock;
@@ -19,6 +18,7 @@ mod runtime;
 mod sbx;
 mod session;
 mod state;
+mod status;
 mod sync;
 mod template;
 mod tern;
@@ -45,8 +45,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
     let config = Config::load(&dirs)?;
     match cli.command {
         None => session::run(cli.run, &dirs, &config),
-        Some(Command::Status(args)) => session::status(args, &dirs, &config),
-        Some(Command::Describe(args)) => describe::describe(args, &dirs, &config),
+        Some(Command::Status(args)) => status::status(args, &dirs, &config),
         Some(Command::Allow(args)) => policy::allow(args, &dirs, &config),
         Some(Command::Mount(args)) => session::change_mounts(args, true, &dirs, &config),
         Some(Command::Umount(args)) => session::change_mounts(args, false, &dirs, &config),

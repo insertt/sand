@@ -50,10 +50,9 @@ pub enum Command {
         #[command(subcommand)]
         action: TemplateCommand,
     },
-    /// Show a sandbox's mounts, agent API connectivity and MCP server status
+    /// Show a sandbox: what sand recorded about it, whether it is running, and agent API and MCP server status
+    #[command(alias = "describe")]
     Status(StatusArgs),
-    /// Describe a sandbox: what sand recorded about it and whether it is running
-    Describe(DescribeArgs),
     /// Allow a sandbox network access to hosts its policy blocked
     Allow(AllowArgs),
     /// Mount directories into an existing sandbox, also while a session runs
@@ -163,25 +162,14 @@ pub struct StatusArgs {
     /// Look at the shared scratch sandbox
     #[arg(long)]
     pub scratch: bool,
-}
 
-#[derive(Debug, Args)]
-pub struct DescribeArgs {
-    /// Harness and project directory identifying the sandbox (default: current directory)
-    #[arg(value_name = "HARNESS] [DIR")]
-    pub targets: Vec<String>,
-
-    /// Sandbox name
-    #[arg(long, value_name = "NAME")]
-    pub name: Option<String>,
-
-    /// Look at the shared scratch sandbox
-    #[arg(long)]
-    pub scratch: bool,
-
-    /// Print the description as JSON on stdout
+    /// Print the status as JSON on stdout
     #[arg(long)]
     pub json: bool,
+
+    /// Skip the live checks (agent API from inside the sandbox, MCP gateway); report only what is recorded
+    #[arg(long)]
+    pub no_probe: bool,
 }
 
 #[derive(Debug, Args)]
@@ -302,8 +290,8 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Command::Status(ref s)) if s.targets == ["codex"] && s.name.as_deref() == Some("x"))
         );
-        let cli = Cli::try_parse_from(["sand", "describe", "claude", "--json"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Describe(ref d)) if d.targets == ["claude"] && d.json));
+        let cli = Cli::try_parse_from(["sand", "describe", "claude", "--json", "--no-probe"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Status(ref s)) if s.targets == ["claude"] && s.json && s.no_probe));
         let cli = Cli::try_parse_from(["sand", "allow", "codex", "--host", "a.com,b.com:443", "--global"]).unwrap();
         assert!(
             matches!(cli.command, Some(Command::Allow(ref a)) if a.targets == ["codex"] && a.host == ["a.com", "b.com:443"] && a.global)
