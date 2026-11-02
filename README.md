@@ -440,18 +440,36 @@ The first start of a new sandbox takes a while. If the editor times out, run
 ### Tern
 
 In a [Tern](https://docs.stencil.so/tern/) pane, `sand <harness>` draws the
-session natively: once the sandbox is set up, sand asks the terminal whether it
-speaks the Tern Surface Protocol and, if it does, starts the harness's ACP
-server in the sandbox and becomes its client. The conversation is an inline Tern
-surface: replies stream as Markdown messages, tool calls are cards
-with their command or file, output and diffs (a call that needs permission asks
-in its card: Enter allows, Esc denies), thoughts fold once done, and the plan
-sits above the composer. Enter sends, Shift+Enter starts a new line, Shift+Tab
-switches the agent's mode, Esc or Ctrl+C stops a turn, and Ctrl+D quits.
-This needs no setup in Tern and works for every kind of sandbox, but not with
-agent arguments, which open the terminal UI. The agent's stderr goes to
-`acp-agent.log` in the sandbox's runtime directory. Set `SAND_TERN_NATIVE=0`
-(or `TERN_TSP=0`) to keep the terminal UI.
+whole session natively, in the look of Tern's own agent chat. Right after the
+sbx sign-in check, sand asks the terminal whether it speaks the Tern Surface
+Protocol. If it does, setup shows as a live list of steps, and its questions
+(a sandbox with a different setup, a newer image) come up as cards with a
+button per answer (1–9 picks, Enter takes the first, Esc aborts). Once the
+sandbox is ready, the steps fold into one line, and sand starts the harness's
+ACP server in the sandbox and becomes its client:
+
+- your messages are cards; each agent turn groups its replies (streamed
+  Markdown), folded thoughts and tool cards (commands with their output and
+  how they ended, edits as diffs with a +/− count), and ends with its time,
+  tokens and cost;
+- a call that needs permission asks in its card: Enter allows, Esc denies;
+- above the composer: the plan, and a working line with what the agent is
+  doing and for how long;
+- the composer shows what the status line shows: a context bar (used and
+  window size), the model, the sandbox, the git branch, whether the agent's
+  API is reachable, each MCP server's state, the mode (click or Shift+Tab to
+  change it) and the session's cost. Branch, API and MCP are checked again
+  while the session runs.
+
+You can type during setup; the first message is sent once the agent is ready.
+Enter sends, Shift+Enter starts a new line, Esc stops a turn, Ctrl+C stops
+setup (or a turn), and Ctrl+D quits. This needs no setup in Tern and works for
+every kind of sandbox, but not with agent arguments, which open the terminal
+UI. The subscription limits (5h, 7d) the terminal status line shows are not
+reported over ACP, so the native composer leaves them out. If setup fails or is
+aborted, its log is printed in the terminal as usual. The agent's stderr goes
+to `acp-agent.log` in the sandbox's runtime directory. Set
+`SAND_TERN_NATIVE=0` (or `TERN_TSP=0`) to keep the terminal UI.
 
 `--install-acp tern` adds a custom agent `sand-<harness>` to Tern's
 `settings.json` (`$TERN_CONFIG_DIR` if set) and lists it in `own_tools`, so

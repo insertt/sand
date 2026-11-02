@@ -1,14 +1,70 @@
 //! Step-by-step progress output. Everything goes to stderr so that stdout stays
 //! free for the agent (and is a clean ACP stream in `--acp` mode).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use console::{Term, style};
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// One line of progress output, for a sink that shows it somewhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Line {
+    Step(String),
+    Info(String),
+    Ok(String),
+    Warn(String),
+    Error(String),
+    /// An external command (`--verbose` only).
+    Command(String),
+    /// Something slow is under way (a spinner on the terminal).
+    Wait(String),
+    /// What a failed command printed.
+    Output(String),
+}
+
+type Sink = Box<dyn Fn(Line) + Send + Sync>;
+
+/// Where progress goes instead of stderr, while a native session draws it.
+static SINK: RwLock<Option<Sink>> = RwLock::new(None);
+
+pub fn set_sink(sink: Option<Sink>) {
+    *SINK.write().unwrap_or_else(PoisonError::into_inner) = sink;
+}
+
+/// Hands `line` to the sink; false when there is none.
+fn emit(line: impl FnOnce() -> Line) -> bool {
+    match SINK.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        Some(sink) => {
+            sink(line());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Prints `line` the way it would have been printed without a sink.
+pub fn replay(line: &Line) {
+    match line {
+        Line::Step(m) => step(m),
+        Line::Info(m) | Line::Wait(m) => info(m),
+        Line::Ok(m) => ok(m),
+        Line::Warn(m) => warn(m),
+        Line::Error(m) => error(m),
+        Line::Command(m) => command(m),
+        Line::Output(m) => eprint!("{m}"),
+    }
+}
+
+/// What a failed command printed: shown where the progress goes.
+pub fn output(text: &str) {
+    if !emit(|| Line::Output(text.to_string())) {
+        eprint!("{text}");
+    }
+}
 
 /// Turns on the output of `--verbose`: echoed commands and what they print.
 pub fn set_verbose(verbose: bool) {
@@ -20,16 +76,22 @@ pub fn verbose() -> bool {
 }
 
 pub fn step(message: impl AsRef<str>) {
+    if emit(|| Line::Step(message.as_ref().to_string())) {
+        return;
+    }
     eprintln!("{} {}", style("==>").cyan().bold().for_stderr(), style(message.as_ref()).bold().for_stderr());
 }
 
 pub fn info(message: impl AsRef<str>) {
+    if emit(|| Line::Info(message.as_ref().to_string())) {
+        return;
+    }
     eprintln!("    {}", message.as_ref());
 }
 
 /// Echoes an external command before it runs (only with `--verbose`).
 pub fn command(line: impl AsRef<str>) {
-    if !verbose() {
+    if !verbose() || emit(|| Line::Command(line.as_ref().to_string())) {
         return;
     }
     eprintln!("    {} {}", style("$").dim().for_stderr(), style(line.as_ref()).dim().for_stderr());
@@ -47,6 +109,9 @@ pub struct Spinner {
 /// when stderr is not a terminal, where the line could not be redrawn.
 pub fn spinner(message: impl AsRef<str>) -> Spinner {
     let stop = Arc::new(AtomicBool::new(false));
+    if emit(|| Line::Wait(message.as_ref().to_string())) {
+        return Spinner { stop, thread: None };
+    }
     let thread = console::user_attended_stderr().then(|| {
         let (stop, message) = (Arc::clone(&stop), message.as_ref().to_string());
         thread::spawn(move || {
@@ -80,14 +145,23 @@ fn elapsed(duration: Duration) -> String {
 }
 
 pub fn ok(message: impl AsRef<str>) {
+    if emit(|| Line::Ok(message.as_ref().to_string())) {
+        return;
+    }
     eprintln!("    {} {}", style("✓").green().for_stderr(), message.as_ref());
 }
 
 pub fn warn(message: impl AsRef<str>) {
+    if emit(|| Line::Warn(message.as_ref().to_string())) {
+        return;
+    }
     eprintln!("    {} {}", style("!").yellow().bold().for_stderr(), message.as_ref());
 }
 
 pub fn error(message: impl AsRef<str>) {
+    if emit(|| Line::Error(message.as_ref().to_string())) {
+        return;
+    }
     eprintln!("{} {}", style("error:").red().bold().for_stderr(), message.as_ref());
 }
 

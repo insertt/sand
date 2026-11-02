@@ -77,7 +77,10 @@ fn main() -> ExitCode {
             std::process::exit(130);
         }
     });
-    match dispatch(cli) {
+    let result = dispatch(cli);
+    // A native surface still showing setup goes, and setup's log is printed in its place.
+    native::shutdown();
+    match result {
         Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
         Err(err) => {
             log::error(format!("{err:#}"));

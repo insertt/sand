@@ -1,11 +1,14 @@
-//! What the native session shows, built from the agent's ACP messages: the
-//! transcript, the plan, a permission waiting for an answer and where the turn
-//! is. Pure state; `view` draws it.
+//! What the native session shows: the sandbox's setup as sand reports it,
+//! then the transcript built from the agent's ACP messages, the plan, a
+//! permission waiting for an answer, usage and where the turn is. Pure state;
+//! `view` draws it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+use crate::log::Line;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
@@ -20,6 +23,120 @@ pub enum Entry {
         text: String,
         detail: Option<String>,
     },
+    /// The end of a turn: how long it took and what it cost.
+    TurnEnd(TurnUsage),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TurnUsage {
+    pub took: Duration,
+    pub tokens: Option<u64>,
+    pub cost: Option<f64>,
+    /// Why the turn ended early (`Interrupted`).
+    pub stopped: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepStatus {
+    Running,
+    Done,
+    Warned,
+    Failed,
+}
+
+/// One step of the setup, as sand's log reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Step {
+    pub title: String,
+    /// What sand said about it, in order.
+    pub notes: Vec<String>,
+    /// What a failed command printed.
+    pub output: Option<String>,
+    /// Something slow under way.
+    pub waiting: Option<String>,
+    pub status: StepStatus,
+    pub started: Instant,
+    pub took: Option<Duration>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Setup {
+    pub steps: Vec<Step>,
+    pub started: Instant,
+    /// Set once the agent starts (or setup ends otherwise).
+    pub took: Option<Duration>,
+}
+
+impl Setup {
+    pub fn new(now: Instant) -> Self {
+        Self { steps: Vec::new(), started: now, took: None }
+    }
+
+    /// The step notes go to: the running one, else the last.
+    fn current(&mut self, now: Instant) -> &mut Step {
+        if self.steps.is_empty() {
+            self.steps.push(Step::new("Preparing", StepStatus::Running, now));
+        }
+        let at = self.steps.iter().rposition(|s| s.status == StepStatus::Running).unwrap_or(self.steps.len() - 1);
+        &mut self.steps[at]
+    }
+
+    fn settle(&mut self, now: Instant) {
+        for step in &mut self.steps {
+            if step.status == StepStatus::Running {
+                step.status = StepStatus::Done;
+                step.took = Some(now.saturating_duration_since(step.started));
+                step.waiting = None;
+            }
+        }
+    }
+
+    pub fn log(&mut self, line: Line, now: Instant) {
+        match line {
+            Line::Step(title) => {
+                self.settle(now);
+                self.steps.push(Step::new(title, StepStatus::Running, now));
+            }
+            Line::Info(note) | Line::Ok(note) | Line::Command(note) => {
+                let step = self.current(now);
+                step.notes.push(note);
+                step.waiting = None;
+            }
+            Line::Wait(what) => self.current(now).waiting = Some(what),
+            Line::Warn(note) => {
+                self.steps.push(Step { took: Some(Duration::ZERO), ..Step::new(note, StepStatus::Warned, now) })
+            }
+            Line::Error(note) => {
+                let step = self.current(now);
+                step.status = StepStatus::Failed;
+                step.waiting = None;
+                step.notes.push(note);
+            }
+            Line::Output(text) => self.current(now).output.get_or_insert_default().push_str(&text),
+        }
+    }
+
+    pub fn finish(&mut self, now: Instant) {
+        self.settle(now);
+        self.took.get_or_insert(now.saturating_duration_since(self.started));
+    }
+
+    pub fn failed(&self) -> bool {
+        self.steps.iter().any(|s| s.status == StepStatus::Failed)
+    }
+}
+
+impl Step {
+    fn new(title: impl Into<String>, status: StepStatus, now: Instant) -> Self {
+        Self { title: title.into(), notes: Vec::new(), output: None, waiting: None, status, started: now, took: None }
+    }
+}
+
+/// A question setup asks, answered with one of `options`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Question {
+    pub text: String,
+    pub options: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +241,8 @@ impl Permission {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Turn {
+    /// sand is setting the sandbox up.
+    Setup,
     /// The agent is starting: `initialize` and `session/new` are under way.
     Starting,
     Idle,
@@ -140,6 +259,10 @@ pub struct Mode {
 
 #[derive(Debug)]
 pub struct Transcript {
+    pub setup: Setup,
+    pub question: Option<Question>,
+    /// A prompt sent before the agent was ready, sent once it is.
+    pub queued: Option<String>,
     pub entries: Vec<Entry>,
     /// Tool call id to its index in `entries`.
     tools: HashMap<String, usize>,
@@ -149,19 +272,33 @@ pub struct Transcript {
     pub modes: Vec<Mode>,
     pub mode: Option<String>,
     pub commands: Vec<String>,
+    pub model: Option<String>,
+    /// Context used and the window's size, in tokens.
+    pub context: Option<(u64, u64)>,
+    /// What the session has cost so far, in USD.
+    pub cost: Option<f64>,
+    /// When the turn started, and the cost then.
+    turn_start: Option<(Instant, Option<f64>)>,
 }
 
 impl Default for Transcript {
     fn default() -> Self {
         Self {
+            setup: Setup::new(Instant::now()),
+            question: None,
+            queued: None,
             entries: Vec::new(),
             tools: HashMap::new(),
             plan: Vec::new(),
             permission: None,
-            turn: Turn::Starting,
+            turn: Turn::Setup,
             modes: Vec::new(),
             mode: None,
             commands: Vec::new(),
+            model: None,
+            context: None,
+            cost: None,
+            turn_start: None,
         }
     }
 }
@@ -318,6 +455,19 @@ impl Transcript {
                     self.mode = Some(mode.to_string());
                 }
             }
+            "usage_update" => {
+                if let (Some(used), Some(size)) = (update["used"].as_u64(), update["size"].as_u64()) {
+                    self.context = Some((used, size));
+                }
+                if let Some(cost) = update["cost"]["amount"].as_f64() {
+                    self.cost = Some(cost);
+                }
+            }
+            "current_model_update" => {
+                if let Some(model) = update["currentModelId"].as_str().or(update["modelId"].as_str()) {
+                    self.model = Some(model.to_string());
+                }
+            }
             "available_commands_update" => {
                 self.commands = update["availableCommands"]
                     .as_array()
@@ -367,25 +517,49 @@ impl Transcript {
         self.settle_thought(now);
         self.entries.push(Entry::User(text.to_string()));
         self.turn = Turn::Working;
+        self.turn_start = Some((now, self.cost));
     }
 
-    /// The prompt's turn ended with ACP's `stopReason`.
-    pub fn turn_ended(&mut self, stop_reason: Option<&str>, now: Instant) {
+    /// The prompt's turn ended with ACP's `stopReason`, and the usage the
+    /// response reports (if any).
+    pub fn turn_ended(&mut self, stop_reason: Option<&str>, usage: &Value, now: Instant) {
         self.settle_thought(now);
         self.settle_tools(ToolStatus::Cancelled, now);
-        let notice = match stop_reason {
-            Some("cancelled") => Some("Cancelled"),
-            Some("max_tokens") => Some("The agent reached its token limit for this turn"),
-            Some("max_turn_requests") => Some("The agent reached its request limit for this turn"),
-            Some("refusal") => Some("The agent refused to continue"),
+        let stopped = match stop_reason {
+            Some("cancelled") => Some("Interrupted"),
+            Some("max_tokens") => Some("token limit reached"),
+            Some("max_turn_requests") => Some("request limit reached"),
+            Some("refusal") => Some("refused"),
             _ => None,
         };
-        if let Some(text) = notice {
-            self.entries.push(Entry::Notice(text.to_string()));
+        let tokens = usage["totalTokens"].as_u64().or_else(|| {
+            let (input, output) = (usage["inputTokens"].as_u64(), usage["outputTokens"].as_u64());
+            (input.is_some() || output.is_some()).then(|| input.unwrap_or(0) + output.unwrap_or(0))
+        });
+        if let Some((started, cost_before)) = self.turn_start.take() {
+            let cost = match (self.cost, cost_before) {
+                (Some(now), Some(before)) => Some(now - before),
+                (cost, None) => cost,
+                (None, Some(_)) => None,
+            };
+            self.entries.push(Entry::TurnEnd(TurnUsage {
+                took: now.saturating_duration_since(started),
+                tokens,
+                cost: cost.filter(|c| *c > 0.0),
+                stopped: stopped.map(str::to_string),
+            }));
         }
         if self.turn != Turn::Exited {
             self.turn = Turn::Idle;
         }
+    }
+
+    /// The tool running now, newest first, for the working line.
+    pub fn running_tool(&self) -> Option<&ToolCall> {
+        self.entries.iter().rev().find_map(|e| match e {
+            Entry::Tool(tool) if tool.status == ToolStatus::Running => Some(tool),
+            _ => None,
+        })
     }
 
     /// Tools still open when their turn ends never finish.
@@ -469,12 +643,6 @@ impl Transcript {
         let at = self.modes.iter().position(|m| Some(&m.id) == self.mode.as_ref());
         self.modes.get(at.map_or(0, |i| (i + 1) % self.modes.len()))
     }
-
-    /// The tail of `entries` is a turn still streaming text, which shows itself.
-    pub fn streaming(&self) -> bool {
-        matches!(self.entries.last(), Some(Entry::Agent(_)))
-            || matches!(self.entries.last(), Some(Entry::Thought(t)) if t.took.is_none())
-    }
 }
 
 #[cfg(test)]
@@ -500,7 +668,6 @@ mod tests {
         assert_eq!(thought.text, "Let me think");
         assert_eq!(thought.took, Some(Duration::from_secs(2)));
         assert_eq!(t.entries[2], Entry::Agent("Hello, world".into()));
-        assert!(t.streaming());
     }
 
     #[test]
@@ -582,12 +749,53 @@ mod tests {
         let (mut t, now) = (Transcript::default(), Instant::now());
         t.prompt("go", now);
         t.apply(&json!({"sessionUpdate": "tool_call", "toolCallId": "t", "status": "in_progress"}), now);
-        t.turn_ended(Some("cancelled"), now);
+        t.apply(&json!({"sessionUpdate": "usage_update", "used": 64000, "size": 200000, "cost": {"amount": 0.25, "currency": "USD"}}), now);
+        let later = now + Duration::from_secs(3);
+        t.turn_ended(Some("cancelled"), &json!({"inputTokens": 1000, "outputTokens": 200}), later);
         assert_eq!(t.tool("t").unwrap().status, ToolStatus::Cancelled);
-        assert_eq!(t.entries.last(), Some(&Entry::Notice("Cancelled".into())));
-        assert_eq!(t.turn, Turn::Idle);
-        t.turn_ended(Some("end_turn"), now);
+        assert_eq!(
+            t.entries.last(),
+            Some(&Entry::TurnEnd(TurnUsage {
+                took: Duration::from_secs(3),
+                tokens: Some(1200),
+                cost: Some(0.25),
+                stopped: Some("Interrupted".into())
+            }))
+        );
+        assert_eq!((t.context, t.turn), (Some((64000, 200000)), Turn::Idle));
+        // A response without a turn in flight adds nothing.
+        t.turn_ended(Some("end_turn"), &Value::Null, now);
         assert_eq!(t.entries.len(), 3);
+    }
+
+    #[test]
+    fn setup_steps_follow_the_log() {
+        let now = Instant::now();
+        let mut setup = Setup::new(now);
+        setup.log(Line::Step("Looking for an existing sandbox".into()), now);
+        setup.log(Line::Info("found 'claude-app'".into()), now);
+        setup.log(Line::Step("Starting the sandbox".into()), now + Duration::from_secs(1));
+        setup.log(Line::Wait("waiting for the sandbox".into()), now);
+        setup.log(Line::Warn("newer image".into()), now);
+        setup.log(Line::Ok("sandbox is running".into()), now + Duration::from_secs(4));
+        let titles: Vec<(&str, StepStatus)> = setup.steps.iter().map(|s| (s.title.as_str(), s.status)).collect();
+        assert_eq!(
+            titles,
+            [
+                ("Looking for an existing sandbox", StepStatus::Done),
+                ("Starting the sandbox", StepStatus::Running),
+                ("newer image", StepStatus::Warned)
+            ]
+        );
+        assert_eq!(setup.steps[0].took, Some(Duration::from_secs(1)));
+        assert_eq!(setup.steps[1].notes, ["sandbox is running"]);
+        assert_eq!(setup.steps[1].waiting, None);
+        setup.log(Line::Output("boom\n".into()), now);
+        setup.log(Line::Error("`sbx run` failed".into()), now);
+        assert!(setup.failed());
+        assert_eq!(setup.steps[1].output.as_deref(), Some("boom\n"));
+        setup.finish(now + Duration::from_secs(5));
+        assert_eq!(setup.took, Some(Duration::from_secs(5)));
     }
 
     #[test]

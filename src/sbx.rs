@@ -91,6 +91,12 @@ impl Sbx {
         Ok((sbx, listed))
     }
 
+    /// The same sbx, never handing the terminal to a command: while a native
+    /// session draws the pane, sand reads its input.
+    pub fn quiet(&self) -> Self {
+        Self { bin: self.bin.clone(), interactive: false }
+    }
+
     /// For a session whose sandbox another sand session has just set up, and
     /// so signed in for: it skips the login probe.
     pub fn prepared(interactive: bool) -> Self {
@@ -191,8 +197,8 @@ impl Sbx {
         drop(spinner);
         let output = output.map_err(|e| self.spawn_error(e))?;
         if !output.status.success() {
-            let mut err = io::stderr().lock();
-            let _ = err.write_all(&output.stdout).and_then(|_| err.write_all(&output.stderr));
+            let printed = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
+            log::output(&String::from_utf8_lossy(&printed));
         }
         Ok(output.status)
     }

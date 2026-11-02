@@ -158,14 +158,22 @@ fn ask(
         log::info("ACP mode cannot ask; merging (existing mounts are kept, missing ones are added)");
         return Ok(ConflictChoice::Merge);
     }
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    let labels: Vec<&str> = items.iter().map(|(_, label)| label.as_str()).collect();
+    if !native::active() && (!std::io::stdin().is_terminal() || !std::io::stderr().is_terminal()) {
         bail!(
             "{question}\nThis needs a decision but there is no terminal to ask on; pass --on-conflict replace|merge|abort."
         );
     }
-    let labels: Vec<&str> = items.iter().map(|(_, label)| label.as_str()).collect();
-    let picked = Select::new().with_prompt(question).items(&labels).default(0).interact_on_opt(&Term::stderr())?;
-    Ok(picked.map_or(ConflictChoice::Abort, |i| items[i].0))
+    Ok(select(question, &labels)?.map_or(ConflictChoice::Abort, |i| items[i].0))
+}
+
+/// Asks the person to pick one of `labels`, on the native surface when one
+/// shows the session, else on the terminal; `None` when they abort.
+fn select(question: &str, labels: &[&str]) -> Result<Option<usize>> {
+    if let Some(answer) = native::ask(question, labels) {
+        return Ok(answer);
+    }
+    Ok(Select::new().with_prompt(question).items(labels).default(0).interact_on_opt(&Term::stderr())?)
 }
 
 fn show_set(title: &str, set: &MountSet) {
@@ -296,7 +304,7 @@ fn nightly_update(req: &Request, dirs: &Dirs, current: &mut SandboxState, args: 
     } else if current.declined_digest.as_deref() == Some(latest.as_str()) {
         log::info(format!("{found}; you chose to keep the sandbox ({hint})"));
         return keep;
-    } else if args.acp || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    } else if args.acp || !native::active() && (!std::io::stdin().is_terminal() || !std::io::stderr().is_terminal()) {
         log::warn(format!("{found}; keeping the sandbox because there is no terminal to ask on ({hint})"));
         return keep;
     } else {
@@ -311,12 +319,7 @@ fn nightly_update(req: &Request, dirs: &Dirs, current: &mut SandboxState, args: 
             (ConflictChoice::Abort, "Abort — leave everything as it is"),
         ];
         let labels: Vec<&str> = items.iter().map(|(_, label)| *label).collect();
-        let picked = Select::new()
-            .with_prompt("How do you want to continue?")
-            .items(&labels)
-            .default(0)
-            .interact_on_opt(&Term::stderr())?;
-        picked.map_or(ConflictChoice::Abort, |i| items[i].0)
+        select("How do you want to continue?", &labels)?.map_or(ConflictChoice::Abort, |i| items[i].0)
     };
     if choice == ConflictChoice::Merge {
         current.declined_digest = Some(latest);
@@ -838,6 +841,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     }
 
     let (sbx, listed) = Sbx::connect_listing(!args.acp)?;
+    // From here on, a Tern pane shows setup natively; sbx no longer gets the terminal then.
+    let sbx = if native && native::start(native_info(&req, dirs)) { sbx.quiet() } else { sbx };
     log::step(format!("sand: {} in sandbox '{}'", profile.name, req.name));
     if profile.is_basic() {
         log::info(format!(
@@ -952,7 +957,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     };
     // ACP mode has no terminal to authorize on.
     if !args.acp {
-        let can_prompt = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        let can_prompt = std::io::stdin().is_terminal() && std::io::stderr().is_terminal() && !native::active();
         mcp::ensure_authorized(&sbx, &used_mcp, can_prompt)?;
     }
 
@@ -1042,12 +1047,18 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let mcp_status = mcp::status(&sbx, &state.mcp);
     runtime::write_mcp_status(&runtime_dir, &mcp_status)?;
     let api = if args.acp { ApiState::Skipped } else { runtime::check_api(&sbx, &state.name, profile) };
-    runtime::banner(&state.name, profile, &state.mounts, api, &mcp_status);
+    if native::active() {
+        native::update(native::Update::Mounts(state.mounts.describe()));
+        native::update(native::Update::Api(api));
+        native::update(native::Update::Mcp(mcp_status.clone()));
+    } else {
+        runtime::banner(&state.name, profile, &state.mounts, api, &mcp_status);
+    }
     if args.no_attach {
         log::ok(format!("sandbox '{}' is ready; `sand {} --resume` attaches to it", state.name, profile.name));
         return Ok(0);
     }
-    if profile.statusline != StatuslineKind::Claude && !args.acp {
+    if profile.statusline != StatuslineKind::Claude && !args.acp && !native::active() {
         let shows = match profile.statusline {
             StatuslineKind::Codex => "status line shows model, branch, context and limits, but not the sandbox",
             _ => "cannot run a custom status line",
@@ -1059,9 +1070,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     }
 
     // --- hand over to the agent -------------------------------------------------
-    // Asked only now: the handshake puts the terminal in raw mode.
-    let code = if let Some(tsp) = native.then(native::connect).flatten() {
-        attach_native(tsp, &sbx, dirs, config, profile, &state, keep_alive)?
+    let code = if native::active() {
+        attach_native(&sbx, dirs, config, profile, &state, keep_alive)?
     } else if let Some(handoff) = handoff {
         return open_in_tern(handoff, dirs, profile, &state, lock, keep_alive);
     } else {
@@ -1086,10 +1096,37 @@ fn native_eligible(args: &RunArgs, profile: &Profile) -> bool {
     eligible
 }
 
-/// Runs the session in this Tern pane, drawn natively: sand starts the
+/// What the native surface shows about the session before the sandbox is set up.
+fn native_info(req: &Request, dirs: &Dirs) -> native::Info {
+    let profile = &req.profile;
+    let api_host = profile.api_check_url.as_deref().map(|url| {
+        let rest = url.split("//").nth(1).unwrap_or(url);
+        rest.split('/').next().unwrap_or(rest).to_string()
+    });
+    native::Info {
+        harness: profile.name.clone(),
+        product: crate::tern::product_name(&profile.name).to_string(),
+        sandbox: req.name.clone(),
+        workspace: req.mounts.primary.as_ref().map(|m| tilde(&m.path, &dirs.home)),
+        mounts: req.mounts.describe(),
+        mcp: req.mcp.iter().map(|name| mcp::McpStatus { name: name.clone(), state: mcp::McpState::Unknown }).collect(),
+        api: None,
+        api_host,
+        branch: None,
+    }
+}
+
+fn tilde(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Runs the chat on the native surface that showed setup: sand starts the
 /// agent's ACP server and is its client. `keep_alive` is let go once it ends.
 fn attach_native(
-    tsp: tern_sdk::Session<native::Msg>,
     sbx: &Sbx,
     dirs: &Dirs,
     config: &Config,
@@ -1097,11 +1134,26 @@ fn attach_native(
     state: &SandboxState,
     keep_alive: KeepAlive,
 ) -> Result<i32> {
-    log::step(format!("Opening {} in this Tern pane", profile.name));
-    let launch = acp_launch(profile, state);
+    log::step(format!("Starting {}", crate::tern::product_name(&profile.name)));
+    let spec = native::ChatSpec {
+        sbx: sbx.clone(),
+        launch: acp_launch(profile, state),
+        log: dirs.runtime_dir(&state.name).join("acp-agent.log"),
+        paths: acp::PathMap::new(&state.mounts),
+        cwd: state
+            .mounts
+            .primary
+            .as_ref()
+            .map(|m| container_path(&m.path.to_string_lossy()))
+            .unwrap_or_else(|| config.sandbox_home().to_string()),
+        profile: profile.clone(),
+        sandbox: state.name.clone(),
+        mcp: state.mcp.clone(),
+        workspace: state.mounts.primary.as_ref().map(|m| m.path.clone()),
+    };
     let bridge = profile.network_prompts.then(|| Bridge::start(sbx.clone(), dirs.clone(), state.name.clone()));
     IN_SESSION.store(true, Ordering::SeqCst);
-    let code = native::run(sbx, dirs, profile, state, tsp, launch, config.sandbox_home());
+    let code = native::chat(spec).unwrap_or_else(|| Err(anyhow::anyhow!("the native session is gone")));
     IN_SESSION.store(false, Ordering::SeqCst);
     let summary = bridge.map(Bridge::finish).unwrap_or_default();
     drop(keep_alive);
