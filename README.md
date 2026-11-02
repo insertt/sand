@@ -457,8 +457,10 @@ ACP server in the sandbox and becomes its client:
   doing and for how long;
 - the composer stays at the bottom of the pane and shows what the status line
   shows: a context bar (used and window size), the model and its reasoning
-  effort, the sandbox, the git branch, whether the agent's API is reachable,
-  each MCP server's state, the permission mode and the session's cost. The
+  effort, the permission mode and the session's cost, and on a line under
+  them the sandbox with its git branch, whether the agent's API is reachable,
+  and the MCP servers: green when all are connected, a warning or failed mark
+  when one needs attention or failed, and each server's state in a dropdown. The
   model, effort and mode chips are pickers of the choices the agent offers
   (Shift+Tab also steps through the modes, and a mode other than the default
   shows in the warning color); until it says, they show what your harness settings pick.

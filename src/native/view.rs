@@ -46,6 +46,7 @@ pub const STYLE: &str = r#"
 [data-role='sand.composer.context'] { margin: 0 4px; }
 [data-role='sand.composer.bar'] { gap: 8px; min-width: 0; font: 12.5px/1.3 var(--sans); }
 [data-role='sand.composer.bar'] > * { flex: none; }
+[data-role='sand.composer.mcp'] .sf-btn-label, [data-role='sand.composer.mcp'] .ico { color: var(--tc); }
 [data-role='sand.composer.facts'] {
 	gap: 4px 14px;
 	padding: 4px 4px 0;
@@ -796,10 +797,18 @@ fn facts(t: &Transcript, info: &Info) -> Node<Msg> {
     if let Some((text, tone, icon)) = state {
         facts.push(fact("state", icon, text.to_string(), tone, "Session".to_string()));
     }
-    facts.push(fact("sandbox", "box", info.sandbox.clone(), "accent", "Sandbox".to_string()));
+    // Where it runs: the sandbox and its branch, kept together.
+    let mut place = ui::row().key("place").gap("sm").align("center").child(fact(
+        "sandbox",
+        "box",
+        info.sandbox.clone(),
+        "accent",
+        "Sandbox".to_string(),
+    ));
     if let Some(branch) = &info.branch {
-        facts.push(fact("branch", "branch", branch.clone(), "", "Git branch".to_string()));
+        place = place.child(fact("branch", "branch", branch.clone(), "", "Git branch".to_string()));
     }
+    facts.push(place.into());
     let api = match info.api {
         Some(ApiState::Ok) => Some(("API ✓", "success")),
         Some(ApiState::Blocked) => Some(("API blocked", "error")),
@@ -810,15 +819,56 @@ fn facts(t: &Transcript, info: &Info) -> Node<Msg> {
         let title = info.api_host.clone().unwrap_or_else(|| "The agent's API".to_string());
         facts.push(fact("api", "globe", text.to_string(), tone, title));
     }
-    if info.mcp.is_empty() {
-        facts.push(fact("mcp", "plug", "MCP none".to_string(), "muted", "MCP servers".to_string()));
-    }
-    for (i, server) in info.mcp.iter().enumerate() {
-        let (mark, tone) = mcp_mark(server.state);
-        let title = format!("MCP server {}", server.name);
-        facts.push(fact(&format!("mcp{i}"), "plug", format!("{} {mark}", server.name), tone, title));
-    }
+    facts.push(mcp_menu(&info.mcp));
     ui::row().key("facts").role("sand.composer.facts").align("center").wrap(true).children(facts).into()
+}
+
+/// The MCP servers: their worst state on the trigger (green when all are
+/// fine, a warning when one needs attention, failed when one failed), and
+/// each server's state in its menu.
+fn mcp_menu(mcp: &[McpStatus]) -> Node<Msg> {
+    if mcp.is_empty() {
+        return fact("mcp", "plug", "MCP none".to_string(), "muted", "No MCP servers".to_string());
+    }
+    let worst = |state: McpState| match state {
+        McpState::Ok => 0,
+        McpState::Unknown => 1,
+        McpState::NeedsAuth => 2,
+        McpState::Error => 3,
+    };
+    let state = mcp.iter().map(|s| s.state).max_by_key(|s| worst(*s)).unwrap_or(McpState::Unknown);
+    let (icon, tone, summary) = match state {
+        McpState::Ok => ("check", "success", "all connected"),
+        McpState::Unknown => ("help", "muted", "not checked yet"),
+        McpState::NeedsAuth => ("warn", "warning", "one needs attention"),
+        McpState::Error => ("x-circle", "error", "one failed"),
+    };
+    let mut items = vec![json!({"header": "MCP servers"})];
+    items.extend(mcp.iter().map(|server| {
+        let (icon, detail) = match server.state {
+            McpState::Ok => ("check", "connected".to_string()),
+            McpState::NeedsAuth => ("warn", format!("needs authorization: sbx mcp auth {}", server.name)),
+            McpState::Error => ("x-circle", "failed".to_string()),
+            McpState::Unknown => ("help", "not checked yet".to_string()),
+        };
+        let mut item =
+            json!({"id": format!("mcp.{}", server.name), "label": server.name, "icon": icon, "detail": detail});
+        if server.state == McpState::Error {
+            item["danger"] = json!(true);
+        }
+        item
+    }));
+    ui::node("menu")
+        .key("mcp")
+        .role("sand.composer.mcp")
+        .tone(tone)
+        .title(format!("MCP servers: {summary}"))
+        .prop("text", format!("MCP {}", mcp.len()))
+        .prop("icon", icon)
+        .prop("trigger", "quiet")
+        .prop("size", "sm")
+        .prop("caret", true)
+        .prop("items", items)
 }
 
 /// The composer's bar: the model, effort and mode pickers, the cost and send.
@@ -993,15 +1043,19 @@ mod tests {
         assert_eq!((context.props()["value"].as_f64(), context.props()["label"].as_str()), (Some(0.4), Some("40%")));
         let facts = find(dock, "sand.composer.facts").unwrap();
         assert_eq!(facts.props()["wrap"], true);
-        let segs: Vec<(&str, &str)> = facts
-            .child_nodes()
-            .iter()
-            .map(|f| {
-                let text = &f.child_nodes()[1];
-                (text.props()["text"].as_str().unwrap(), text.props().get("tone").and_then(Value::as_str).unwrap_or(""))
-            })
-            .collect();
-        assert_eq!(segs, [("claude-app", "accent"), ("main", ""), ("API ✓", "success"), ("github ⚠ auth", "warning")]);
+        let place = &facts.child_nodes()[0];
+        let texts: Vec<&str> =
+            place.child_nodes().iter().map(|f| f.child_nodes()[1].props()["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["claude-app", "main"], "the sandbox and its branch, on one line");
+        assert_eq!(facts.child_nodes()[1].child_nodes()[1].props()["tone"], "success");
+        let mcp = facts.child_nodes()[2].props();
+        assert_eq!(facts.child_nodes()[2].kind(), "menu");
+        assert_eq!(
+            (mcp["text"].as_str(), mcp["icon"].as_str(), mcp["tone"].as_str()),
+            (Some("MCP 1"), Some("warn"), Some("warning"))
+        );
+        assert_eq!(mcp["items"][1]["label"], "github");
+        assert_eq!(mcp["items"][1]["detail"], "needs authorization: sbx mcp auth github");
         assert_eq!(find(dock, "sand.composer.usage").unwrap().props()["spans"][0]["t"], "$0.04");
         assert_eq!(main.last().unwrap().props()["role"], "sand.tail");
         assert_eq!(main.last().unwrap().props()["min"], json!({"h": "3lines"}));
@@ -1066,6 +1120,20 @@ mod tests {
         assert!(find(dock, "omp.working").is_none());
         let composer = find(dock, "sand.composer").unwrap();
         assert_eq!(composer.child_nodes()[0].props()["placeholder"], "Enter allows · Esc denies");
+    }
+
+    #[test]
+    fn the_mcp_menu_shows_the_worst_state() {
+        let server = |name: &str, state| McpStatus { name: name.into(), state };
+        let ok = mcp_menu(&[server("a", McpState::Ok), server("b", McpState::Ok)]);
+        assert_eq!((ok.props()["icon"].as_str(), ok.props()["tone"].as_str()), (Some("check"), Some("success")));
+        let failed = mcp_menu(&[server("a", McpState::NeedsAuth), server("b", McpState::Error)]);
+        assert_eq!(
+            (failed.props()["icon"].as_str(), failed.props()["tone"].as_str()),
+            (Some("x-circle"), Some("error"))
+        );
+        assert_eq!(failed.props()["items"][2]["danger"], true);
+        assert_eq!(mcp_menu(&[]).kind(), "row");
     }
 
     #[test]
