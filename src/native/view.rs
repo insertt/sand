@@ -249,6 +249,8 @@ pub struct Info {
     pub api: Option<ApiState>,
     /// The host the API check reaches.
     pub api_host: Option<String>,
+    /// The agent reaches its models through Vertex AI, which counts as an API.
+    pub vertex: bool,
     pub branch: Option<String>,
     /// The model and effort the host's settings pick, until the agent says.
     pub model: Option<String>,
@@ -256,6 +258,12 @@ pub struct Info {
 }
 
 impl Info {
+    /// How the agent signs in, as far as the host can tell: ACP does not report
+    /// subscription limits, so only Vertex AI is known, and the rest is just the API's state.
+    fn auth_label(&self) -> &'static str {
+        if self.vertex { "API (Vertex)" } else { "API" }
+    }
+
     fn model<'a>(&'a self, t: &'a Transcript) -> &'a str {
         t.model_name().or(self.model.as_deref()).unwrap_or(self.product.as_str())
     }
@@ -576,7 +584,7 @@ fn welcome(t: &Transcript, info: &Info) -> Node<Msg> {
     for (i, mount) in info.mounts.iter().enumerate() {
         facts = facts.item(if i == 0 { "mounts" } else { "" }, Span::new(mount.clone()).style("path"));
     }
-    facts = facts.item("API", api_spans(info)).item("MCP", mcp_spans(&info.mcp));
+    facts = facts.item(info.auth_label(), api_spans(info)).item("MCP", mcp_spans(&info.mcp));
     let tips: Vec<Span> = [("⇧Enter", "new line"), ("⇧Tab", "mode"), ("Esc", "stop"), ("Ctrl+C ×2", "quit")]
         .iter()
         .enumerate()
@@ -1372,15 +1380,39 @@ fn facts(t: &Transcript, info: &Info) -> Node<Msg> {
     if let Some(workspace) = &info.workspace {
         facts.push(fact("workspace", "folder", short_path(workspace), "", workspace.clone()));
     }
+    // Subscription limits are reported only to Pro and Max plans, which names the sign-in.
+    let kind = if info.vertex {
+        "API (Vertex)"
+    } else if t.limits.is_some() {
+        "Subscription"
+    } else {
+        "API"
+    };
     let api = match info.api {
-        Some(ApiState::Ok) => Some(("API ✓", "success")),
-        Some(ApiState::Blocked) => Some(("API blocked", "error")),
-        Some(ApiState::Unreachable) => Some(("API ✗", "error")),
+        Some(ApiState::Ok) => Some((format!("{kind} ✓"), "success")),
+        Some(ApiState::Blocked) => Some((format!("{kind} blocked"), "error")),
+        Some(ApiState::Unreachable) => Some((format!("{kind} ✗"), "error")),
         _ => None,
     };
     if let Some((text, tone)) = api {
         let title = info.api_host.clone().unwrap_or_else(|| "The agent's API".to_string());
-        facts.push(fact("api", "globe", text.to_string(), tone, title));
+        facts.push(fact("api", "globe", text, tone, title));
+    }
+    if let Some(limits) = &t.limits {
+        for (key, label, used, title) in [
+            ("limit5h", "5h", limits.five_hour, "Share of the 5-hour subscription limit used"),
+            ("limit7d", "7d", limits.seven_day, "Share of the weekly subscription limit used"),
+        ] {
+            let Some(used) = used else { continue };
+            let tone = if used >= 90.0 {
+                "error"
+            } else if used >= 70.0 {
+                "warning"
+            } else {
+                "success"
+            };
+            facts.push(fact(key, "history", format!("{label} {}%", used.round()), tone, title.to_string()));
+        }
     }
     facts.push(mcp_menu(&info.mcp));
     ui::row().key("facts").role("sand.composer.facts").align("center").wrap(true).children(facts).into()
@@ -1492,6 +1524,7 @@ mod tests {
             mcp: vec![McpStatus { name: "github".into(), state: McpState::NeedsAuth }],
             api: Some(ApiState::Ok),
             api_host: Some("api.anthropic.com".into()),
+            vertex: false,
             branch: Some("main".into()),
             model: Some("opus".into()),
             effort: Some("high".into()),
@@ -1557,6 +1590,26 @@ mod tests {
         assert_eq!(first.child_nodes()[0].props()["variant"], "primary");
         assert_eq!(first.child_nodes()[1].props()["spans"][0]["t"], "make it match");
         assert!(find(region(&v, 1), "omp.working").is_none());
+    }
+
+    #[test]
+    fn subscription_limits_are_shown_beside_the_api_state() {
+        let mut t = Transcript::default();
+        let mut info = info();
+        let kind = |t: &Transcript, info: &Info| {
+            let tree = facts(t, info);
+            tree.child_nodes()
+                .iter()
+                .map(|n| format!("{:?}", n.child_nodes().iter().map(|c| c.props().clone()).collect::<Vec<_>>()))
+                .collect::<String>()
+        };
+        assert!(kind(&t, &info).contains("API ✓") && !kind(&t, &info).contains("5h"));
+        let meta = json!({"_claude/rateLimit": {"rateLimitType": "five_hour", "utilization": 0.8}});
+        t.apply(&json!({"sessionUpdate": "usage_update", "used": 1, "size": 2, "_meta": meta}), Instant::now());
+        let shown = kind(&t, &info);
+        assert!(shown.contains("Subscription ✓") && shown.contains("5h 80%") && !shown.contains("7d"));
+        info.vertex = true;
+        assert!(kind(&t, &info).contains("API (Vertex) ✓"));
     }
 
     #[test]

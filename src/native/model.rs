@@ -104,6 +104,27 @@ pub struct SessionPicker {
     pub error: Option<String>,
 }
 
+/// How much of a Claude subscription's windows is spent, in percent. Known once
+/// the agent reports a rate limit, which it does only for Pro and Max plans.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Limits {
+    pub five_hour: Option<f64>,
+    pub seven_day: Option<f64>,
+}
+
+impl Limits {
+    /// Takes in the adapter's `_claude/rateLimit`, whose `utilization` is a fraction.
+    fn apply(&mut self, info: &Value) {
+        let Some(used) = info["utilization"].as_f64() else { return };
+        let percent = (used * 100.0).clamp(0.0, 100.0);
+        match info["rateLimitType"].as_str() {
+            Some("five_hour") => self.five_hour = Some(percent),
+            Some("seven_day") => self.seven_day = Some(percent),
+            _ => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TurnUsage {
     pub took: Duration,
@@ -448,6 +469,8 @@ pub struct Transcript {
     pub context: Option<(u64, u64)>,
     /// What the session has cost so far, in USD.
     pub cost: Option<f64>,
+    /// The subscription limits; `None` for API keys and Vertex AI, which have none.
+    pub limits: Option<Limits>,
     /// When the turn started, and the cost then.
     turn_start: Option<(Instant, Option<f64>)>,
 }
@@ -484,6 +507,7 @@ impl Default for Transcript {
             options: Vec::new(),
             context: None,
             cost: None,
+            limits: None,
             turn_start: None,
         }
     }
@@ -651,6 +675,10 @@ impl Transcript {
                 }
                 if let Some(cost) = update["cost"]["amount"].as_f64() {
                     self.cost = Some(cost);
+                }
+                let rate_limit = &update["_meta"]["_claude/rateLimit"];
+                if rate_limit.is_object() {
+                    self.limits.get_or_insert_with(Limits::default).apply(rate_limit);
                 }
             }
             "config_option_update" => self.set_options(&update["configOptions"]),
@@ -1078,6 +1106,23 @@ mod tests {
         // A response without a turn in flight adds nothing.
         t.turn_ended(Some("end_turn"), &Value::Null, now);
         assert_eq!(t.entries.len(), 3);
+    }
+
+    #[test]
+    fn subscription_limits_come_with_the_usage_updates() {
+        let now = Instant::now();
+        let mut t = Transcript::default();
+        t.apply(&json!({"sessionUpdate": "usage_update", "used": 1, "size": 2}), now);
+        assert_eq!(t.limits, None);
+        let event = |kind: &str, used: f64| {
+            json!({"sessionUpdate": "usage_update", "used": 1, "size": 2,
+                "_meta": {"_claude/rateLimit": {"status": "allowed", "rateLimitType": kind, "utilization": used}}})
+        };
+        t.apply(&event("five_hour", 0.235), now);
+        assert_eq!(t.limits.map(|l| (l.five_hour.map(|p| p.round()), l.seven_day)), Some((Some(24.0), None)));
+        t.apply(&event("seven_day", 0.9), now);
+        t.apply(&event("seven_day_opus", 0.5), now);
+        assert_eq!(t.limits.unwrap().seven_day.map(|p| p.round()), Some(90.0));
     }
 
     #[test]

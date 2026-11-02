@@ -207,10 +207,12 @@ context window in use and how much of the 5-hour and weekly subscription limits
 is spent:
 
 ```text
-📦 claude-myproject │ ⎇ main │ API ✓ │ MCP atlassian ✓ gitlab ⚠ auth
+📦 claude-myproject │ ⎇ main │ Subscription ✓ │ MCP atlassian ✓ gitlab ⚠ auth
 🤖 Opus 5.5 │ ctx ████░░░░░░ 42% │ 5h 23% │ 7d 41%
 ```
 
+The API mark names how the agent signs in: `Subscription` when Claude Code
+reports limits, `API` otherwise and `API (Vertex)` with Vertex AI.
 Claude Code reports the limits only for Pro and Max subscriptions and only
 after the first response of a session; until then that part is left out, as is
 the branch outside a git repository.
@@ -540,8 +542,10 @@ Claude Code, Ctrl+C stops a turn or clears the draft first, and otherwise
 quits (or stops setup) only when pressed twice in a row; a toast asks for the
 second press. Ctrl+D twice quits too. This needs no setup in Tern and works for
 every kind of sandbox, but not with agent arguments, which open the terminal
-UI. The subscription limits (5h, 7d) the terminal status line shows are not
-reported over ACP, so the native composer leaves them out. If setup fails or is
+UI. The subscription limits (5h, 7d) appear under the composer for Claude Code
+Pro and Max plans, once the agent reports them (they ride on its usage updates,
+so only after a response, and a window shows once it has been reported);
+there the API mark reads `Subscription` instead of `API`. If setup fails or is
 aborted, its log is printed in the terminal as usual. The agent's stderr goes
 to `acp-agent.log` in the sandbox's runtime directory. To keep the terminal
 UI, set `tern_native = false` in the config, or `SAND_TERN_NATIVE=0` (or
