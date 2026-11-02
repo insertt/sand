@@ -48,9 +48,30 @@ const MOD_FILES: &[(&str, &str)] = &[
     ("types/index.d.ts", include_str!("../assets/claude-mod/sand/types/index.d.ts")),
 ];
 
-/// The mod's files as the sandbox gets them: paths relative to the sandbox home.
+/// Where the MCP server that gives an ACP agent `request_mount` is copied,
+/// relative to the sandbox home: the mod gives it to Claude Code's own UI,
+/// which a session sand draws itself does not run.
+pub const MCP_SERVER: &str = ".local/share/sand/mcp/sand.mjs";
+
+/// The mod's files, and the MCP server's, as the sandbox gets them: paths
+/// relative to the sandbox home.
 pub fn mod_files() -> Vec<(String, &'static str)> {
-    MOD_FILES.iter().map(|(rel, content)| (format!("{MOD_DIR}/{rel}"), *content)).collect()
+    let mut files: Vec<(String, &'static str)> =
+        MOD_FILES.iter().map(|(rel, content)| (format!("{MOD_DIR}/{rel}"), *content)).collect();
+    files.push((MCP_SERVER.to_string(), include_str!("../assets/mcp/sand.mjs")));
+    files
+}
+
+/// The MCP server, as ACP's `session/new` takes it: run by the agent in the
+/// sandbox, with the bridge directory it files requests in.
+pub fn mcp_server(sandbox_home: &str) -> Value {
+    json!({
+        // Not `sand`: the mod's hooks claim `mcp__sand__request_mount`, should anything load it.
+        "name": "sand-acp",
+        "command": "node",
+        "args": [format!("{sandbox_home}/{MCP_SERVER}")],
+        "env": [{"name": "SAND_POLICY_DIR", "value": format!("{sandbox_home}/{POLICY_DIR_NAME}")}],
+    })
 }
 
 /// Settings that make the extra mounts working directories of Claude Code, so
@@ -379,9 +400,12 @@ pub type Watch = Box<dyn Fn(&[Approval]) + Send>;
 pub enum Asked {
     /// Network access to a host (empty when the approval was gone).
     Host(String),
+    /// A host directory the agent asked to mount, as it wrote it.
+    Mount(String),
 }
 
-/// Told how an answer given in the session's own UI turned out.
+/// Told how an answer given in the session's own UI, or a mount the agent
+/// asked for, turned out.
 pub type Told = Box<dyn Fn(&Asked, &Outcome) + Send>;
 
 /// What the person chose in a UI the agent cannot reach.
@@ -593,6 +617,10 @@ impl Worker {
         let _ = fs::remove_file(path);
         let outcome = self.answer(&request);
         self.record(&request, &outcome);
+        // No mod reads the result back in a session sand draws: it tells the agent.
+        if let Some(told) = self.told.as_ref().filter(|_| request.kind.as_deref() == Some("mount")) {
+            told(&Asked::Mount(request.path.clone().unwrap_or_default()), &outcome);
+        }
         Some(outcome)
     }
 
@@ -976,6 +1004,76 @@ mod tests {
             *told.lock().unwrap(),
             [(Asked::Host("api.github.com".into()), false), (Asked::Host("example.com".into()), false)]
         );
+    }
+
+    #[test]
+    fn the_mcp_server_files_mount_requests_for_the_bridge() {
+        use std::io::{BufRead, BufReader};
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("requests")).unwrap();
+        let script = tmp.path().join("sand.mjs");
+        fs::write(&script, mod_files().iter().find(|(rel, _)| rel == MCP_SERVER).unwrap().1).unwrap();
+        let Ok(mut node) = Command::new("node")
+            .arg(&script)
+            .env("SAND_POLICY_DIR", tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("node is not installed; skipped");
+            return;
+        };
+        let mut stdin = node.stdin.take().unwrap();
+        for message in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "request_mount", "arguments": {"path": "~/notes:ro", "reason": "the docs"}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "request_mount", "arguments": {}}}),
+        ] {
+            writeln!(stdin, "{message}").unwrap();
+        }
+        drop(stdin);
+        let answers: Vec<Value> = BufReader::new(node.stdout.take().unwrap())
+            .lines()
+            .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+            .collect();
+        node.wait().unwrap();
+        assert_eq!(answers.len(), 4, "the notification gets no answer");
+        assert_eq!(answers[0]["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(answers[1]["result"]["tools"][0]["name"], "request_mount");
+        assert!(
+            answers[2]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Asked the user to mount ~/notes (ro)")
+        );
+        assert_eq!(answers[3]["result"]["isError"], true);
+        let filed: Vec<_> = fs::read_dir(tmp.path().join("requests")).unwrap().flatten().collect();
+        assert_eq!(filed.len(), 1);
+        let request: Request = serde_json::from_str(&fs::read_to_string(filed[0].path()).unwrap()).unwrap();
+        assert_eq!(
+            (request.kind.as_deref(), request.path.as_deref(), request.mode.as_deref(), request.reason.as_deref()),
+            (Some("mount"), Some("~/notes"), Some("ro"), Some("the docs"))
+        );
+        assert!(valid_id(filed[0].path().file_stem().unwrap().to_str().unwrap()), "the bridge takes its name");
+    }
+
+    #[test]
+    fn mount_requests_are_told_to_a_session_that_draws_its_own_ui() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, _) = worker(tmp.path(), Answer::Deny);
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let heard = told.clone();
+        worker.told = Some(Box::new(move |asked: &Asked, outcome: &Outcome| {
+            heard.lock().unwrap().push((asked.clone(), outcome.allowed));
+        }));
+        let request = json!({"kind": "mount", "path": tmp.path().to_string_lossy(), "mode": "ro"});
+        fs::write(tmp.path().join("requests/r1.json"), request.to_string()).unwrap();
+        worker.round(&AtomicBool::new(false));
+        assert_eq!(*told.lock().unwrap(), [(Asked::Mount(tmp.path().to_string_lossy().into_owned()), false)]);
+        assert!(tmp.path().join("results/r1.json").exists(), "the result is written as for the mod");
     }
 
     #[test]

@@ -114,11 +114,13 @@ pub struct Client {
     paths: Option<PathMap>,
     next_id: u64,
     calls: HashMap<u64, Call>,
+    /// sand's own MCP servers, for every session opened.
+    pub servers: Value,
 }
 
 impl Client {
     pub fn new(to: Box<dyn Write + Send>, paths: Option<PathMap>) -> Self {
-        Self { to, paths, next_id: 1, calls: HashMap::new() }
+        Self { to, paths, next_id: 1, calls: HashMap::new(), servers: json!([]) }
     }
 
     fn send(&mut self, message: &Value) -> io::Result<()> {
@@ -169,7 +171,7 @@ impl Client {
     }
 
     pub fn new_session(&mut self, cwd: &str) -> io::Result<()> {
-        self.request(Call::NewSession, json!({"cwd": cwd, "mcpServers": []}))
+        self.request(Call::NewSession, json!({"cwd": cwd, "mcpServers": self.servers}))
     }
 
     /// Sends a prompt: its images (as ACP image blocks), then its text.
@@ -222,7 +224,7 @@ impl Client {
     /// `session/resume` (for an agent that cannot load) does not.
     pub fn open_session(&mut self, session: &str, cwd: &str, load: bool) -> io::Result<()> {
         let call = if load { Call::LoadSession } else { Call::ResumeSession };
-        self.request(call, json!({"sessionId": session, "cwd": cwd, "mcpServers": []}))
+        self.request(call, json!({"sessionId": session, "cwd": cwd, "mcpServers": self.servers}))
     }
 
     pub fn cancel(&mut self, session: &str) -> io::Result<()> {

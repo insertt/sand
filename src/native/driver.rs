@@ -349,7 +349,7 @@ impl Driver {
     fn start(&mut self, spec: ChatSpec, now: Instant) {
         self.t.setup.finish(now);
         self.t.turn = Turn::Starting;
-        let ChatSpec { sbx, launch, log, paths, cwd, profile, sandbox, mcp, workspace } = spec;
+        let ChatSpec { sbx, launch, log, paths, cwd, profile, sandbox, mcp, servers, workspace } = spec;
         self.workspace = workspace.clone();
         self.list_files();
         self.probe(sbx.clone(), profile, sandbox, mcp, workspace);
@@ -374,7 +374,8 @@ impl Driver {
                 waker.wake();
             }
         });
-        let client = Client::new(Box::new(child.stdin.take().expect("piped")), paths);
+        let mut client = Client::new(Box::new(child.stdin.take().expect("piped")), paths);
+        client.servers = servers;
         self.attach(client, rx, Some(child), Some(log), cwd);
     }
 
@@ -690,17 +691,26 @@ impl Driver {
         self.agent.as_ref().map(|a| a.cwd.clone()).unwrap_or_default()
     }
 
-    /// How an answer given in the pane turned out: the person hears, and
-    /// the agent, of a host allowed, with the next message.
+    /// How an answer given in the pane, or a mount the agent asked for,
+    /// turned out: the person hears, and the agent with the next message.
     fn told(&mut self, asked: Asked, outcome: Outcome) {
-        let Asked::Host(host) = &asked;
-        self.t.blocked.retain(|b| b.host != *host);
-        if outcome.allowed && !host.is_empty() {
-            self.agent_notes.push(format!(
-                "[sand] The user allowed {host} for this sandbox. \
-                 Requests to it that were blocked earlier failed; retry them if they are still needed."
-            ));
-        }
+        let note = match &asked {
+            Asked::Host(host) => {
+                self.t.blocked.retain(|b| b.host != *host);
+                (outcome.allowed && !host.is_empty()).then(|| {
+                    format!(
+                        "[sand] The user allowed {host} for this sandbox. \
+                         Requests to it that were blocked earlier failed; retry them if they are still needed."
+                    )
+                })
+            }
+            Asked::Mount(_) if outcome.allowed => Some(format!(
+                "[sand] With the user's approval sand {}; it is available in the sandbox now.",
+                outcome.message
+            )),
+            Asked::Mount(path) => Some(format!("[sand] The directory {path} was not mounted: {}.", outcome.message)),
+        };
+        self.agent_notes.extend(note);
         if !outcome.ok {
             self.t.error(outcome.message, None);
             return;
@@ -1434,6 +1444,13 @@ mod tests {
         d.command(Command::Told(Asked::Host("evil.test".into()), failed));
         assert!(matches!(d.t.entries.last(), Some(Entry::Error { .. })));
         assert_eq!(d.agent_notes.len(), 1, "a host that stays blocked needs no word to the agent");
+
+        let mounted = Outcome { ok: true, allowed: true, message: "mounted /h/notes (ro) at /h/notes".into() };
+        d.command(Command::Told(Asked::Mount("~/notes".into()), mounted));
+        let declined = Outcome { ok: true, allowed: false, message: "mounting /h/x: declined on the host".into() };
+        d.command(Command::Told(Asked::Mount("~/x".into()), declined));
+        assert!(d.agent_notes[1].contains("sand mounted /h/notes (ro)"));
+        assert_eq!(d.agent_notes[2], "[sand] The directory ~/x was not mounted: mounting /h/x: declined on the host.");
     }
 
     #[test]

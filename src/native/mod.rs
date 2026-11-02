@@ -68,7 +68,7 @@ pub enum Command {
     /// Where answers to sbx's pending network approvals, and to hosts seen
     /// blocked, go.
     Approvals(Sender<crate::network::Answered>),
-    /// How an answer given on the surface turned out.
+    /// How an answer given on the surface, or a mount the agent asked for, turned out.
     Told(crate::network::Asked, crate::network::Outcome),
     /// What a paste found on the clipboard: an image and its type, or why not.
     Pasted(std::result::Result<(Vec<u8>, &'static str), String>),
@@ -102,6 +102,8 @@ pub struct ChatSpec {
     pub profile: Profile,
     pub sandbox: String,
     pub mcp: Vec<String>,
+    /// MCP servers of sand's own for the agent, as ACP's `session/new` takes them.
+    pub servers: serde_json::Value,
     /// The primary workspace on the host, for the git branch.
     pub workspace: Option<PathBuf>,
 }

@@ -1155,6 +1155,11 @@ fn attach_native(
         profile: profile.clone(),
         sandbox: state.name.clone(),
         mcp: state.mcp.clone(),
+        servers: if profile.network_prompts {
+            serde_json::json!([network::mcp_server(config.sandbox_home())])
+        } else {
+            serde_json::json!([])
+        },
         workspace: state.mounts.primary.as_ref().map(|m| m.path.clone()),
     };
     let bridge = (hooks.is_some() || profile.network_prompts)
