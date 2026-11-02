@@ -29,6 +29,10 @@ case "$(uname -m)" in
     *) die "unsupported architecture $(uname -m)" ;;
 esac
 
+if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ]; then
+    die "unsupported platform: Intel Macs (x86_64-apple-darwin) have no prebuilt executable; build from source with cargo"
+fi
+
 asset="sand-$arch-$os.tar.gz"
 if [ "$VERSION" = latest ]; then
     url="https://github.com/$REPO/releases/latest/download/$asset"

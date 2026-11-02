@@ -34,7 +34,7 @@ releases.
 
 | Area | State |
 | --- | --- |
-| Platforms | Linux (x86-64, arm64), macOS (Intel, Apple silicon) and Windows (x86-64). CI builds and tests on all three. |
+| Platforms | Linux (x86-64, arm64), macOS (Apple silicon) and Windows (x86-64). CI builds and tests on all three. |
 | Harnesses | `claude`, `codex` and `opencode` are built in, with config copy, history and status. Every other `sbx` agent (`copilot`, `cursor`, `devin`, `docker-agent`, `droid`, `gemini`, `kiro`, `shell`) runs without those, and you can [define your own](#configuration). |
 | Terminal UI | The default: `sand <harness>` opens the agent's own UI in your terminal. |
 | Vertex AI | Built-in wiring for Claude Code; other harnesses describe theirs with `vertex_overlay`. |
