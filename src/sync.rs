@@ -164,6 +164,24 @@ fn in_sandbox(sandbox_home: &str, rel: &str) -> String {
 }
 
 /// Host config dir resolved against the home directory.
+/// The model and reasoning effort the host's settings pick for the harness
+/// (`model`, and `effortLevel` or Codex's `model_reasoning_effort`), for a
+/// session whose agent does not report them.
+pub fn host_model(profile: &Profile, host_home: &Path) -> (Option<String>, Option<String>) {
+    let settings = host_config_dir(profile, host_home)
+        .and_then(|dir| profile.settings_files.iter().map(|f| dir.join(f)).find(|p| p.is_file()))
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| parse_settings(&text, profile.settings_format, "the host settings file").ok())
+        .unwrap_or(Value::Null);
+    let text =
+        |keys: &[&str]| keys.iter().find_map(|k| settings[*k].as_str().filter(|v| !v.is_empty()).map(str::to_string));
+    let model = text(&["model"]).or_else(|| match profile.name.as_str() {
+        "claude" => std::env::var("ANTHROPIC_MODEL").ok().filter(|m| !m.is_empty()),
+        _ => None,
+    });
+    (model, text(&["effortLevel", "model_reasoning_effort", "reasoningEffort", "effort"]))
+}
+
 pub fn host_config_dir(profile: &Profile, host_home: &Path) -> Option<PathBuf> {
     profile.host_config_dir.as_deref().map(|dir| expand_tilde(dir, host_home))
 }
@@ -425,6 +443,19 @@ cp "$SRC/manifest" "$STATE/manifest"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_settings_name_the_model_and_effort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let codex = Profile {
+            host_config_dir: Some(tmp.path().display().to_string()),
+            ..Profile::resolve("codex", &config).unwrap()
+        };
+        assert_eq!(host_model(&codex, tmp.path()), (None, None));
+        fs::write(tmp.path().join("config.toml"), "model = \"gpt-6\"\nmodel_reasoning_effort = \"high\"\n").unwrap();
+        assert_eq!(host_model(&codex, tmp.path()), (Some("gpt-6".into()), Some("high".into())));
+    }
     use crate::config::Config;
     use serde_json::json;
 

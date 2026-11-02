@@ -1099,6 +1099,7 @@ fn native_eligible(args: &RunArgs, profile: &Profile) -> bool {
 /// What the native surface shows about the session before the sandbox is set up.
 fn native_info(req: &Request, dirs: &Dirs) -> native::Info {
     let profile = &req.profile;
+    let (model, effort) = sync::host_model(profile, &dirs.home);
     let api_host = profile.api_check_url.as_deref().map(|url| {
         let rest = url.split("//").nth(1).unwrap_or(url);
         rest.split('/').next().unwrap_or(rest).to_string()
@@ -1113,6 +1114,8 @@ fn native_info(req: &Request, dirs: &Dirs) -> native::Info {
         api: None,
         api_host,
         branch: None,
+        model,
+        effort,
     }
 }
 

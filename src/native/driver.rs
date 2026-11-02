@@ -18,7 +18,7 @@ use tern_sdk::{Input, Key, Session, Surface, SurfaceOptions, Waker};
 
 use super::client::{self, Call, Client, Incoming};
 use super::composer::Composer;
-use super::model::{Approval, Entry, Mode, Question, Transcript, Turn};
+use super::model::{Approval, Entry, Mode, Question, Setting, Transcript, Turn};
 use super::view::{EDITOR, Info, Msg, view};
 use super::{ChatSpec, Command, Update};
 use crate::log::Line;
@@ -50,6 +50,7 @@ pub struct Driver {
     agent: Option<Agent>,
     session: Option<String>,
     asked_mode: Option<String>,
+    asked_model: Option<String>,
     /// Where the answer to the question on screen goes.
     reply: Option<Sender<Option<usize>>>,
     /// Commands, for the probes started with the chat.
@@ -79,6 +80,7 @@ impl Driver {
             agent: None,
             session: None,
             asked_mode: None,
+            asked_model: None,
             reply: None,
             commands,
             waker,
@@ -159,7 +161,11 @@ impl Driver {
                     session.focus(sf, Some(EDITOR))?;
                     continue;
                 }
-                Some(Input::Msg(msg, _)) => self.msg(msg),
+                Some(Input::Msg(msg, _)) => {
+                    self.msg(msg);
+                    // A click on a button never leaves the composer without the keys.
+                    session.focus(sf, Some(EDITOR))?;
+                }
                 Some(Input::Event(_) | Input::Clipboard(_)) => continue,
             }
             session.render(sf, view(&self.t, &self.composer, &self.info))?;
@@ -376,16 +382,8 @@ impl Driver {
                     })
                     .unwrap_or_default();
                 self.t.mode = modes["currentModeId"].as_str().map(str::to_string);
-                let models = &result["models"];
-                let current = models["currentModelId"].as_str();
-                self.t.model = current.map(|id| {
-                    models["availableModels"]
-                        .as_array()
-                        .and_then(|all| all.iter().find(|m| m["modelId"].as_str() == Some(id)))
-                        .and_then(|m| m["name"].as_str())
-                        .unwrap_or(id)
-                        .to_string()
-                });
+                self.t.set_models(&result["models"]);
+                self.t.set_options(&result["configOptions"]);
                 self.t.turn = Turn::Idle;
                 if let Some(text) = self.t.queued.take() {
                     self.send(text);
@@ -400,6 +398,12 @@ impl Driver {
                 self.t.turn_ended(None, &Value::Null, now);
             }
             (Call::SetMode, Ok(_)) => self.t.mode = self.asked_mode.take().or(self.t.mode.take()),
+            (Call::SetModel, Ok(_)) => self.t.model = self.asked_model.take().or(self.t.model.take()),
+            (Call::SetConfig, Ok(result)) => self.t.set_options(&result["configOptions"]),
+            (Call::SetModel | Call::SetConfig, Err(err)) => {
+                self.asked_model = None;
+                self.t.error(format!("The setting could not be changed: {err}"), None);
+            }
             (Call::SetMode, Err(err)) => {
                 self.asked_mode = None;
                 self.t.error(format!("The mode could not be changed: {err}"), None);
@@ -476,6 +480,7 @@ impl Driver {
             Msg::Answer(approval) => self.answer(approval),
             Msg::Choose(choice) => self.choose(Some(choice)),
             Msg::CycleMode => self.next_mode(),
+            Msg::Pick(setting, value) => self.pick(setting, &value),
             Msg::Focus => {}
         }
     }
@@ -531,6 +536,23 @@ impl Driver {
         } else {
             self.composer.key(key);
         }
+    }
+
+    /// Switches `setting` to `value`, one of the agent's choices.
+    fn pick(&mut self, setting: Setting, value: &str) {
+        let Some(session) = self.session.clone() else { return };
+        let sent = match self.t.option(setting) {
+            Some(option) if option.current != value => {
+                let id = option.id.clone();
+                self.client().map(|c| c.set_config(&session, &id, value))
+            }
+            None if setting == Setting::Model && self.t.model.as_deref() != Some(value) => {
+                self.asked_model = Some(value.to_string());
+                self.client().map(|c| c.set_model(&session, value))
+            }
+            _ => return,
+        };
+        self.check(sent);
     }
 
     fn next_mode(&mut self) {

@@ -455,11 +455,13 @@ ACP server in the sandbox and becomes its client:
 - a call that needs permission asks in its card: Enter allows, Esc denies;
 - above the composer: the plan, and a working line with what the agent is
   doing and for how long;
-- the composer shows what the status line shows: a context bar (used and
-  window size), the model, the sandbox, the git branch, whether the agent's
-  API is reachable, each MCP server's state, the mode (click or Shift+Tab to
-  change it) and the session's cost. Branch, API and MCP are checked again
-  while the session runs.
+- the composer stays at the bottom of the pane and shows what the status line
+  shows: a context bar (used and window size), the model and its reasoning
+  effort, the sandbox, the git branch, whether the agent's API is reachable,
+  each MCP server's state, the mode (click or Shift+Tab to change it) and the
+  session's cost. The model and effort chips are pickers of the choices the
+  agent offers; until it says, they show what your harness settings pick.
+  Branch, API and MCP are checked again while the session runs.
 
 You can type during setup; the first message is sent once the agent is ready.
 Enter sends, Shift+Enter starts a new line, Esc stops a turn, Ctrl+C stops

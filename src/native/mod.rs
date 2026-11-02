@@ -272,14 +272,19 @@ mod tests {
             match self.step {
                 // Setup asks; the second answer is picked with its key.
                 0 if since.contains("How do you want to continue?") => input.push_back(b"2".to_vec()),
-                1 if since.contains(r#""sendable":true"#) => input.push_back(b"hi\r".to_vec()),
-                2 if since.contains(r#""status":"ask""#) => {
+                // The model chip is a picker of the agent's models.
+                1 if since.contains(r#""sendable":true"#) => input.push_back(event(json!({"ev": "change", "sf": "s1",
+                    "id": "dock.composer.bar.model", "value": "haiku"}))),
+                2 if since.contains("Haiku 5.5") && since.contains(r#""value":"haiku""#) => {
+                    input.push_back(b"hi\r".to_vec())
+                }
+                3 if since.contains(r#""status":"ask""#) => {
                     let at = since.find(r#""k":"tool""#).expect("a tool node");
                     let start = since[..at].rfind(r#""id":""#).expect("its id") + 6;
                     let id = &since[start..start + since[start..].find('"').unwrap()];
                     input.push_back(event(json!({"ev": "action", "sf": "s1", "id": id, "act": "allow"})));
                 }
-                3 if since.contains("this turn") => input.push_back(vec![0x04]),
+                4 if since.contains("this turn") => input.push_back(vec![0x04]),
                 _ => return,
             }
             self.step += 1;
@@ -349,9 +354,21 @@ mod tests {
             let init = next(&mut seen).unwrap();
             say(json!({"jsonrpc": "2.0", "id": init["id"], "result": {"protocolVersion": 1}}));
             let new = next(&mut seen).unwrap();
-            say(json!({"jsonrpc": "2.0", "id": new["id"], "result": {"sessionId": "S",
-                "models": {"currentModelId": "opus", "availableModels": [{"modelId": "opus", "name": "Opus 5.5"}]},
-                "modes": {"currentModeId": "default", "availableModes": [{"id": "default", "name": "Default"}]}}}));
+            let options = |current: &str| {
+                json!([
+                {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": current,
+                 "options": [{"value": "opus", "name": "Opus 5.5"}, {"value": "haiku", "name": "Haiku 5.5"}]},
+                {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "high",
+                 "options": [{"value": "low", "name": "low"}, {"value": "high", "name": "high"}]}])
+            };
+            say(
+                json!({"jsonrpc": "2.0", "id": new["id"], "result": {"sessionId": "S", "configOptions": options("opus"),
+                "modes": {"currentModeId": "default", "availableModes": [{"id": "default", "name": "Default"}]}}}),
+            );
+            let set = next(&mut seen).unwrap();
+            say(
+                json!({"jsonrpc": "2.0", "id": set["id"], "result": {"configOptions": options(set["params"]["value"].as_str().unwrap())}}),
+            );
             let prompt = next(&mut seen).unwrap();
             say(chunk("Hel"));
             thread::sleep(Duration::from_millis(300));
@@ -435,11 +452,12 @@ mod tests {
         assert_eq!(answer, Some(1), "the second answer was picked with 2");
         assert_eq!(code, 0, "the person quit with Ctrl+D");
         let methods: Vec<&str> = seen.iter().map(|m| m["method"].as_str().unwrap_or("(response)")).collect();
-        assert_eq!(methods, ["initialize", "session/new", "session/prompt", "(response)"]);
+        assert_eq!(methods, ["initialize", "session/new", "session/set_config_option", "session/prompt", "(response)"]);
         assert_eq!(seen[1]["params"]["cwd"], "/w");
-        assert_eq!(seen[2]["params"]["prompt"], json!([{"type": "text", "text": "hi"}]));
+        assert_eq!(seen[2]["params"], json!({"sessionId": "S", "configId": "model", "value": "haiku"}));
+        assert_eq!(seen[3]["params"]["prompt"], json!([{"type": "text", "text": "hi"}]));
         assert_eq!(
-            seen[3],
+            seen[4],
             json!({"jsonrpc": "2.0", "id": "perm",
             "result": {"outcome": {"outcome": "selected", "optionId": "allow-1"}}})
         );
@@ -452,7 +470,7 @@ mod tests {
         has(r#""append","lo"]"#);
         has(r#""approved":"once""#);
         has(r#""target":"rm -rf build""#);
-        has("Opus 5.5");
+        has("Haiku 5.5");
         has(r#""label":"25%""#);
         has("$0.12");
     }

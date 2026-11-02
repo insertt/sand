@@ -257,6 +257,58 @@ pub struct Mode {
     pub name: String,
 }
 
+/// A session setting the agent offers (ACP's `configOptions`): its model,
+/// its reasoning effort, and others.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigOption {
+    pub id: String,
+    /// `model`, `thought_level`, `mode`, …
+    pub category: String,
+    pub current: String,
+    /// (value, name) of each choice.
+    pub choices: Vec<(String, String)>,
+}
+
+impl ConfigOption {
+    fn parse(option: &Value) -> Option<Self> {
+        let mut choices = Vec::new();
+        fn collect(options: &Value, out: &mut Vec<(String, String)>) {
+            for option in options.as_array().into_iter().flatten() {
+                match option["value"].as_str() {
+                    Some(value) => {
+                        let name = option["name"].as_str().unwrap_or(value);
+                        out.push((value.to_string(), name.to_string()));
+                    }
+                    // A group of choices.
+                    None => collect(&option["options"], out),
+                }
+            }
+        }
+        collect(&option["options"], &mut choices);
+        Some(Self {
+            id: option["id"].as_str()?.to_string(),
+            category: option["category"].as_str().unwrap_or_default().to_string(),
+            current: option["currentValue"].as_str().unwrap_or_default().to_string(),
+            choices,
+        })
+    }
+
+    pub fn current_name(&self) -> &str {
+        self.choices.iter().find(|(v, _)| *v == self.current).map_or(self.current.as_str(), |(_, n)| n.as_str())
+    }
+
+    fn is_effort(&self) -> bool {
+        self.category == "thought_level" || ["effort", "reasoning", "thinking"].iter().any(|w| self.id.contains(w))
+    }
+}
+
+/// Which setting a chip changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    Model,
+    Effort,
+}
+
 #[derive(Debug)]
 pub struct Transcript {
     pub setup: Setup,
@@ -272,7 +324,10 @@ pub struct Transcript {
     pub modes: Vec<Mode>,
     pub mode: Option<String>,
     pub commands: Vec<String>,
+    /// The model, by id, and the models the agent offers (ACP's `models`).
     pub model: Option<String>,
+    pub models: Vec<Mode>,
+    pub options: Vec<ConfigOption>,
     /// Context used and the window's size, in tokens.
     pub context: Option<(u64, u64)>,
     /// What the session has cost so far, in USD.
@@ -296,6 +351,8 @@ impl Default for Transcript {
             mode: None,
             commands: Vec::new(),
             model: None,
+            models: Vec::new(),
+            options: Vec::new(),
             context: None,
             cost: None,
             turn_start: None,
@@ -463,6 +520,7 @@ impl Transcript {
                     self.cost = Some(cost);
                 }
             }
+            "config_option_update" => self.set_options(&update["configOptions"]),
             "current_model_update" => {
                 if let Some(model) = update["currentModelId"].as_str().or(update["modelId"].as_str()) {
                     self.model = Some(model.to_string());
@@ -630,6 +688,49 @@ impl Transcript {
         self.permission = None;
         self.error(message, detail);
         self.turn = Turn::Exited;
+    }
+
+    /// Takes the agent's `configOptions` (all of them, as it sends them).
+    pub fn set_options(&mut self, options: &Value) {
+        if let Some(options) = options.as_array() {
+            self.options = options.iter().filter_map(ConfigOption::parse).collect();
+        }
+    }
+
+    /// Takes the agent's `models` (`currentModelId` and `availableModels`).
+    pub fn set_models(&mut self, models: &Value) {
+        if let Some(available) = models["availableModels"].as_array() {
+            self.models = available
+                .iter()
+                .filter_map(|m| {
+                    let id = m["modelId"].as_str()?.to_string();
+                    Some(Mode { name: m["name"].as_str().map_or_else(|| id.clone(), str::to_string), id })
+                })
+                .collect();
+        }
+        if let Some(current) = models["currentModelId"].as_str() {
+            self.model = Some(current.to_string());
+        }
+    }
+
+    pub fn option(&self, setting: Setting) -> Option<&ConfigOption> {
+        self.options.iter().find(|o| match setting {
+            Setting::Model => o.category == "model" || o.id == "model",
+            Setting::Effort => o.is_effort(),
+        })
+    }
+
+    /// The model's name, as the agent reports it.
+    pub fn model_name(&self) -> Option<&str> {
+        if let Some(option) = self.option(Setting::Model) {
+            return Some(option.current_name());
+        }
+        let id = self.model.as_deref()?;
+        Some(self.models.iter().find(|m| m.id == id).map_or(id, |m| m.name.as_str()))
+    }
+
+    pub fn effort_name(&self) -> Option<&str> {
+        self.option(Setting::Effort).map(ConfigOption::current_name)
     }
 
     /// The name of the current mode, as the agent calls it.
@@ -817,5 +918,24 @@ mod tests {
         assert_eq!(t.next_mode().map(|m| m.id.as_str()), Some("default"));
         t.apply(&json!({"sessionUpdate": "available_commands_update", "availableCommands": [{"name": "init"}]}), now);
         assert_eq!(t.commands, vec!["init"]);
+    }
+
+    #[test]
+    fn model_and_effort_come_from_config_options_or_models() {
+        let (mut t, now) = (Transcript::default(), Instant::now());
+        t.set_models(&json!({"currentModelId": "sonnet", "availableModels": [
+            {"modelId": "sonnet", "name": "Sonnet 5.5"}, {"modelId": "opus", "name": "Opus 5.5"}]}));
+        assert_eq!((t.model_name(), t.effort_name()), (Some("Sonnet 5.5"), None));
+        t.apply(
+            &json!({"sessionUpdate": "config_option_update", "configOptions": [
+                {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "opus",
+                 "options": [{"group": "Claude", "name": "Claude", "options": [
+                    {"value": "opus", "name": "Opus 5.5"}, {"value": "haiku", "name": "Haiku 5.5"}]}]},
+                {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "high",
+                 "options": [{"value": "low", "name": "low"}, {"value": "high", "name": "high"}]}]}),
+            now,
+        );
+        assert_eq!((t.model_name(), t.effort_name()), (Some("Opus 5.5"), Some("high")));
+        assert_eq!(t.option(Setting::Model).map(|o| o.choices.len()), Some(2));
     }
 }

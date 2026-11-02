@@ -11,12 +11,13 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tern_sdk::ui::{
-    self, Ask, AskAlways, ChecklistItem, Node, Phase, Span, Thresholds, ToolButton, ToolPreview, TraceLine, View,
+    self, Ask, AskAlways, Bound, ChecklistItem, Extent, Node, Phase, Span, Thresholds, ToolButton, ToolPreview,
+    TraceLine, View,
 };
 
 use super::composer::Composer;
 use super::model::{
-    Approval, Entry, Permission, Question, Setup, StepStatus, TargetKind, ToolCall, ToolContent, ToolStatus,
+    Approval, Entry, Permission, Question, Setting, Setup, StepStatus, TargetKind, ToolCall, ToolContent, ToolStatus,
     Transcript, Turn, TurnUsage,
 };
 use crate::mcp::{McpState, McpStatus};
@@ -44,6 +45,8 @@ pub enum Msg {
     Choose(usize),
     /// The mode segment.
     CycleMode,
+    /// A choice picked in the model or effort chip.
+    Pick(Setting, String),
 }
 
 /// What the session runs in: what the status line shows besides the agent's own facts.
@@ -62,6 +65,19 @@ pub struct Info {
     /// The host the API check reaches.
     pub api_host: Option<String>,
     pub branch: Option<String>,
+    /// The model and effort the host's settings pick, until the agent says.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl Info {
+    fn model<'a>(&'a self, t: &'a Transcript) -> &'a str {
+        t.model_name().or(self.model.as_deref()).unwrap_or(self.product.as_str())
+    }
+
+    fn effort<'a>(&'a self, t: &'a Transcript) -> Option<&'a str> {
+        t.effort_name().or(self.effort.as_deref())
+    }
 }
 
 pub fn view(t: &Transcript, composer: &Composer, info: &Info) -> View<Msg> {
@@ -156,6 +172,8 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
     if let Some(text) = &t.queued {
         nodes.push(user("queued".to_string(), text, true));
     }
+    // Room under the last turn, so that its end and its tooltips clear the floating composer.
+    nodes.push(ui::row().key("tail").role("sand.tail").min(Bound::h(Extent::Lines(3.0))).into());
     nodes
 }
 
@@ -217,7 +235,10 @@ fn setup(setup: &Setup, info: &Info) -> Node<Msg> {
 
 /// What greets the person before the first message, as omp's welcome card.
 fn welcome(t: &Transcript, info: &Info) -> Node<Msg> {
-    let mut where_ = vec![Span::new(t.model.clone().unwrap_or_else(|| info.product.clone())).style("accent")];
+    let mut where_ = vec![Span::new(info.model(t)).style("accent")];
+    if let Some(effort) = info.effort(t) {
+        where_.push(Span::new(format!(" · {effort}")).style("accent"));
+    }
     where_.push(Span::new("  ·  ").style("muted"));
     where_.push(Span::new(format!("sandbox {}", info.sandbox)).style("strong"));
     if let Some(workspace) = &info.workspace {
@@ -335,7 +356,17 @@ fn usage_footer(key: String, usage: &TurnUsage) -> Node<Msg> {
         text.push(Span::new(" · ").style("muted"));
         text.push(Span::new(stopped.clone()).style("warning"));
     }
-    ui::row().key(key).role("omp.turn.usage").gap("xs").align("center").child(ui::text(text).key("t")).into()
+    let mut detail = vec![duration(usage.took)];
+    detail.extend(usage.tokens.map(|n| format!("{n} tokens")));
+    detail.extend(usage.cost.map(cost));
+    ui::row()
+        .key(key)
+        .role("omp.turn.usage")
+        .title(format!("This turn: {}", detail.join(" · ")))
+        .gap("xs")
+        .align("center")
+        .child(ui::text(text).key("t"))
+        .into()
 }
 
 /// The `tool` icon names Tern knows, by ACP tool kind.
@@ -632,7 +663,8 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
         .cursor(composer.cursor_utf16())
         .placeholder(placeholder)
         .sendable(t.turn == Turn::Idle)
-        .readonly(t.turn == Turn::Exited)
+        // Always a box of its own, however empty, at the bottom of the pane.
+        .min(Bound::h(Extent::Lines(2.0)))
         .max_lines(12u32)
         .on_send(|text| Msg::Send(text.to_owned()))
         .on_focus(Msg::Focus);
@@ -653,19 +685,54 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
     col.child(editor).child(bar(t, info)).into()
 }
 
+/// The model or effort: a picker of the agent's choices once it offers
+/// them, else what the host's settings name.
+fn chip(t: &Transcript, key: &str, role: &str, icon: &str, text: &str, label: &str, setting: Setting) -> Node<Msg> {
+    let choices: Vec<(String, String)> = match (t.option(setting), setting) {
+        (Some(option), _) => option.choices.clone(),
+        (None, Setting::Model) => t.models.iter().map(|m| (m.id.clone(), m.name.clone())).collect(),
+        (None, Setting::Effort) => Vec::new(),
+    };
+    let current = match (t.option(setting), setting) {
+        (Some(option), _) => Some(option.current.clone()),
+        (None, Setting::Model) => t.model.clone(),
+        (None, Setting::Effort) => None,
+    };
+    if choices.len() > 1 {
+        let options: Vec<ui::SelectOption> = choices
+            .into_iter()
+            .map(|(value, name)| ui::SelectOption { icon: Some(icon.into()), ..ui::SelectOption::new(value, name) })
+            .collect();
+        return ui::select()
+            .key(key)
+            .role(role)
+            .variant("quiet")
+            .label(label)
+            .size("sm")
+            .options(options)
+            .value(current.unwrap_or_default())
+            .title(format!("{label} · click to change"))
+            .on_change(move |change| Msg::Pick(setting, change.value.as_str().unwrap_or_default().to_string()))
+            .into();
+    }
+    ui::row()
+        .key(key)
+        .role(role)
+        .gap("xs")
+        .align("center")
+        .title(label.to_string())
+        .child(ui::icon(icon).tone("accent").key("i"))
+        .child(ui::text(text.to_string()).key("t"))
+        .into()
+}
+
 /// The status line's facts, in the composer's bar.
 fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
-    let model = t.model.clone().unwrap_or_else(|| info.product.clone());
-    let mut row = ui::row().key("bar").role("omp.composer.bar").align("center").child(
-        ui::row()
-            .key("model")
-            .role("omp.composer.model")
-            .gap("xs")
-            .align("center")
-            .title("Model")
-            .child(ui::icon("sparkle").tone("accent").key("i"))
-            .child(ui::text(model).key("t")),
-    );
+    let mut row = ui::row().key("bar").role("omp.composer.bar").align("center");
+    row = row.child(chip(t, "model", "omp.composer.model", "sparkle", info.model(t), "Model", Setting::Model));
+    if let Some(effort) = info.effort(t) {
+        row = row.child(chip(t, "effort", "omp.composer.effort", "brain", effort, "Effort", Setting::Effort));
+    }
 
     let mut status = ui::status().key("extras").role("omp.composer.extras").transparent(true).grow(1.0);
     let state = match t.turn {
@@ -762,6 +829,8 @@ mod tests {
             api: Some(ApiState::Ok),
             api_host: Some("api.anthropic.com".into()),
             branch: Some("main".into()),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
         }
     }
 
@@ -878,6 +947,38 @@ mod tests {
             .collect();
         assert_eq!(segs, [("claude-app", "accent"), ("main", ""), ("API ✓", "success"), ("github ⚠ auth", "warning")]);
         assert_eq!(find(dock, "omp.composer.usage").unwrap().props()["spans"][0]["t"], "$0.04");
+        assert_eq!(main.last().unwrap().props()["role"], "sand.tail");
+        assert_eq!(main.last().unwrap().props()["min"], json!({"h": "3lines"}));
+    }
+
+    #[test]
+    fn the_composer_always_shows_its_box_and_the_model_with_its_effort() {
+        let mut t = Transcript::default();
+        // Before the agent says, the host's settings name them; nothing can be changed yet.
+        let v = view(&t, &Composer::default(), &info());
+        let composer = find(region(&v, 1), "omp.editor").unwrap();
+        assert_eq!(composer.child_nodes()[0].props()["min"], json!({"h": "2lines"}));
+        let text = |role: &str, v: &View<Msg>| {
+            let chip = find(region(v, 1), role).unwrap();
+            (chip.child_nodes()[1].props()["text"].as_str().unwrap().to_string(), chip.child_nodes().len())
+        };
+        assert_eq!(text("omp.composer.model", &v), ("opus".into(), 2));
+        assert_eq!(text("omp.composer.effort", &v), ("high".into(), 2));
+
+        t.turn = Turn::Exited;
+        t.set_options(&json!([
+            {"id": "model", "category": "model", "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet 5.5"}, {"value": "opus", "name": "Opus 5.5"}]},
+            {"id": "effort", "category": "thought_level", "currentValue": "low",
+             "options": [{"value": "low", "name": "low"}, {"value": "max", "name": "max"}]}]));
+        let v = view(&t, &Composer::default(), &info());
+        let picker = |role: &str| find(region(&v, 1), role).unwrap().props().clone();
+        let model = picker("omp.composer.model");
+        assert_eq!((model["value"].as_str(), model["variant"].as_str()), (Some("sonnet"), Some("quiet")));
+        assert_eq!(model["options"][1], json!({"value": "opus", "label": "Opus 5.5", "icon": "sparkle"}));
+        assert_eq!(picker("omp.composer.effort")["options"].as_array().map(Vec::len), Some(2));
+        let composer = find(region(&v, 1), "omp.editor").unwrap();
+        assert!(composer.child_nodes()[0].props().get("readonly").is_none());
     }
 
     #[test]

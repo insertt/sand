@@ -18,6 +18,8 @@ pub enum Call {
     NewSession,
     Prompt,
     SetMode,
+    SetModel,
+    SetConfig,
 }
 
 impl Call {
@@ -27,6 +29,8 @@ impl Call {
             Self::NewSession => "session/new",
             Self::Prompt => "session/prompt",
             Self::SetMode => "session/set_mode",
+            Self::SetModel => "session/set_model",
+            Self::SetConfig => "session/set_config_option",
         }
     }
 }
@@ -167,6 +171,14 @@ impl Client {
 
     pub fn set_mode(&mut self, session: &str, mode: &str) -> io::Result<()> {
         self.request(Call::SetMode, json!({"sessionId": session, "modeId": mode}))
+    }
+
+    pub fn set_model(&mut self, session: &str, model: &str) -> io::Result<()> {
+        self.request(Call::SetModel, json!({"sessionId": session, "modelId": model}))
+    }
+
+    pub fn set_config(&mut self, session: &str, option: &str, value: &str) -> io::Result<()> {
+        self.request(Call::SetConfig, json!({"sessionId": session, "configId": option, "value": value}))
     }
 
     pub fn cancel(&mut self, session: &str) -> io::Result<()> {
