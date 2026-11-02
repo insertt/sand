@@ -19,8 +19,8 @@ use super::commands::{self, SlashCommand};
 use super::composer::Composer;
 use super::files;
 use super::model::{
-    Approval, Entry, Image, Permission, Question, SessionPicker, Setting, Setup, StepStatus, TargetKind, ToolCall,
-    ToolContent, ToolStatus, Transcript, Turn, TurnUsage,
+    Approval, Blocked, Entry, Image, Permission, Question, SessionPicker, Setting, Setup, StepStatus, TargetKind,
+    ToolCall, ToolContent, ToolStatus, Transcript, Turn, TurnUsage,
 };
 use crate::mcp::{McpState, McpStatus};
 use crate::runtime::ApiState;
@@ -227,6 +227,9 @@ pub enum Msg {
     Suggest(String),
     /// An option of one of sbx's network approvals (approval id, option id).
     Network(String, String),
+    /// A host a tool saw blocked, allowed for this sandbox or put away.
+    AllowHost(String),
+    DismissHost(String),
     /// The person's answer to question `index` (a mount, a host).
     Confirm(usize, bool),
 }
@@ -910,6 +913,10 @@ fn dock(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
     for approval in &t.network {
         nodes.push(network_card(approval, info));
     }
+    // A host sbx holds an approval for is answered there.
+    for blocked in t.blocked.iter().filter(|b| !t.network.iter().any(|a| a.host == b.host)) {
+        nodes.push(blocked_card(blocked, info));
+    }
     if !t.plan.is_empty() {
         nodes.push(plan(t));
     }
@@ -1057,6 +1064,47 @@ fn network_card(approval: &crate::network::Approval, info: &Info) -> Node<Msg> {
             )]))
             .key("why"),
         )
+        .child(answers)
+        .into()
+}
+
+/// A host a tool's output says the policy blocked, which sbx holds no
+/// approval for: allowing adds a rule for this sandbox alone.
+fn blocked_card(blocked: &Blocked, info: &Info) -> Node<Msg> {
+    let (why, allow) = if blocked.ruled {
+        ("A deny rule blocks this host for", "Lift the deny rule and allow")
+    } else {
+        ("The network policy blocked this host for", "Allow for this sandbox")
+    };
+    let answers = if blocked.sent {
+        ui::row().key("answers").child(ui::text(spans(&[("Changing the policy…", "muted")])).key("sent"))
+    } else {
+        ui::row()
+            .key("answers")
+            .gap("sm")
+            .wrap(true)
+            .child(
+                ui::button(allow)
+                    .key("allow")
+                    .variant("primary")
+                    .size("sm")
+                    .on_click(Msg::AllowHost(blocked.host.clone())),
+            )
+            .child(
+                ui::button("Dismiss")
+                    .key("dismiss")
+                    .variant("quiet")
+                    .size("sm")
+                    .on_click(Msg::DismissHost(blocked.host.clone())),
+            )
+    };
+    ui::card()
+        .key(format!("blocked-{}", blocked.host))
+        .role("agent.request")
+        .tone("warning")
+        .icon("globe")
+        .head(format!("Network access to {}", blocked.host))
+        .child(ui::text(spans(&[(&format!("{why} the sandbox {}.", info.sandbox), "muted")])).key("why"))
         .child(answers)
         .into()
 }
@@ -1770,7 +1818,7 @@ mod tests {
             (Some("ab12"), Some("640×480"), Some(true))
         );
         t.prompt(
-            &super::super::model::Prompt { text: "what is this?".into(), images: vec![image], links: Vec::new() },
+            &super::super::model::Prompt { text: "what is this?".into(), images: vec![image], ..Default::default() },
             Instant::now(),
         );
         let v = view(&t, &Composer::default(), &info());

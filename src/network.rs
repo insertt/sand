@@ -120,11 +120,11 @@ struct Request {
     reason: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
-struct Outcome {
-    ok: bool,
-    allowed: bool,
-    message: String,
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Outcome {
+    pub ok: bool,
+    pub allowed: bool,
+    pub message: String,
 }
 
 impl Outcome {
@@ -146,6 +146,44 @@ pub enum Answer {
     Deny,
     /// No dialog could be shown, and why.
     Unavailable(String),
+}
+
+/// What the network policy blocked, as the proxy's 403 bodies say it.
+#[derive(Debug, Default, PartialEq)]
+pub struct Blocks {
+    /// Hosts no rule allows, or held for an approval.
+    pub hosts: Vec<String>,
+    /// Hosts a local deny rule blocks (an earlier refusal).
+    pub ruled: Vec<String>,
+    /// The organization's policy blocked something; nothing to ask about.
+    pub org: bool,
+}
+
+/// The blocks a tool's output reports, each host once, plain and lowercase.
+pub fn blocks_in(text: &str) -> Blocks {
+    fn hosts(text: &str, marker: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for (at, _) in text.match_indices(marker) {
+            let rest = &text[at + marker.len()..];
+            let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || ".-:".contains(c))).unwrap_or(rest.len());
+            // A sentence ending right after the host ("...for example.com.") keeps its period.
+            let host = rest[..end].trim_end_matches(['.', ':']).to_ascii_lowercase();
+            if valid_host(&host) && !found.contains(&host) {
+                found.push(host);
+            }
+        }
+        found
+    }
+    let ruled = hosts(text, "Blocked by local rule for ");
+    let mut open = Vec::new();
+    for host in
+        hosts(text, "Approval required for ").into_iter().chain(hosts(text, "Blocked by network policy: domain "))
+    {
+        if !ruled.contains(&host) && !open.contains(&host) {
+            open.push(host);
+        }
+    }
+    Blocks { hosts: open, ruled, org: text.contains("Blocked by org policy") }
 }
 
 /// Whether `host` is one plain host, as the policy log writes them: a name
@@ -336,14 +374,34 @@ pub type Confirm = Box<dyn Fn(&str) -> Answer + Send>;
 /// Told the approvals sbx has pending for the sandbox, whenever they change.
 pub type Watch = Box<dyn Fn(&[Approval]) + Send>;
 
+/// What an outcome answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// Network access to a host (empty when the approval was gone).
+    Host(String),
+}
+
+/// Told how an answer given in the session's own UI turned out.
+pub type Told = Box<dyn Fn(&Asked, &Outcome) + Send>;
+
+/// What the person chose in a UI the agent cannot reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// An option of one of sbx's approvals (approval id, option id).
+    Approval(String, String),
+    /// A host the policy blocked without an approval, allowed for this sandbox.
+    Allow(String),
+}
+
 /// How a session that draws its own UI takes part: it asks the questions in
 /// place of the host dialog, sees the approvals sbx has pending for the
-/// sandbox, and answers them (approval id, option id), already confirmed by
-/// the person in that UI.
+/// sandbox, and answers them and the hosts it saw blocked, already confirmed
+/// by the person in that UI, hearing back how each answer went.
 pub struct Hooks {
     pub confirm: Confirm,
     pub pending: Watch,
-    pub answers: Receiver<(String, String)>,
+    pub answers: Receiver<Answered>,
+    pub told: Told,
 }
 
 /// Answers the requests of one sandbox while its session runs.
@@ -379,11 +437,13 @@ impl Bridge {
             confirm: Box::new(confirm),
             watch: None,
             answers: None,
+            told: None,
         };
         if let Some(hooks) = hooks {
             worker.confirm = hooks.confirm;
             worker.watch = Some(hooks.pending);
             worker.answers = Some(hooks.answers);
+            worker.told = Some(hooks.told);
         }
         let flag = stop.clone();
         // Not joined: it may be waiting on a dialog nobody answers.
@@ -418,8 +478,9 @@ struct Worker {
     mounter: Mounter,
     /// Told whenever the pending approvals change.
     watch: Option<Watch>,
-    /// Approvals answered in the session's own UI.
-    answers: Option<Receiver<(String, String)>>,
+    /// Approvals and hosts answered in the session's own UI, and where their outcomes go.
+    answers: Option<Receiver<Answered>>,
+    told: Option<Told>,
 }
 
 impl Worker {
@@ -435,20 +496,41 @@ impl Worker {
         if self.pending_at.is_none_or(|at| at.elapsed() >= PENDING_EVERY) {
             self.refresh_pending();
         }
-        let answered: Vec<(String, String)> =
-            self.answers.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
-        for (id, option) in answered {
-            let outcome = self.answer_approval(&id, Some(&option), true);
-            let request = Request {
-                kind: Some("approval".into()),
-                host: String::new(),
-                approval: Some(id),
-                option: Some(option),
-                path: None,
-                mode: None,
-                reason: None,
+        let answered: Vec<Answered> = self.answers.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for answer in answered {
+            let (asked, outcome, request) = match answer {
+                Answered::Approval(id, option) => {
+                    let host = self.pending.iter().find(|a| a.id == id).map(|a| a.host.clone()).unwrap_or_default();
+                    let outcome = self.answer_approval(&id, Some(&option), true);
+                    let request = Request {
+                        kind: Some("approval".into()),
+                        host: host.clone(),
+                        approval: Some(id),
+                        option: Some(option),
+                        path: None,
+                        mode: None,
+                        reason: None,
+                    };
+                    (Asked::Host(host), outcome, request)
+                }
+                Answered::Allow(host) => {
+                    let outcome = self.answer_allow(&host, true);
+                    let request = Request {
+                        kind: None,
+                        host: host.clone(),
+                        approval: None,
+                        option: None,
+                        path: None,
+                        mode: None,
+                        reason: None,
+                    };
+                    (Asked::Host(host), outcome, request)
+                }
             };
             self.record(&request, &outcome);
+            if let Some(told) = &self.told {
+                told(&asked, &outcome);
+            }
         }
         for (id, path) in self.requests().into_iter().take(PER_ROUND) {
             if stop.load(Ordering::Relaxed) {
@@ -521,7 +603,7 @@ impl Worker {
         }
         match &request.approval {
             Some(approval) => self.answer_approval(approval, request.option.as_deref(), false),
-            None => self.answer_allow(&request.host),
+            None => self.answer_allow(&request.host, false),
         }
     }
 
@@ -634,11 +716,13 @@ impl Worker {
         }
     }
 
-    fn answer_allow(&mut self, host: &str) -> Outcome {
+    /// Allows `host` for this sandbox; `confirmed` when the person chose it in
+    /// a UI the agent cannot reach, which needs no second question.
+    fn answer_allow(&mut self, host: &str, confirmed: bool) -> Outcome {
         if !valid_host(host) {
             return Outcome::failed(format!("'{host}' is not a single host sand can allow"));
         }
-        if self.declined.get(host).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
+        if !confirmed && self.declined.get(host).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
             return Outcome::done(format!("{host}: declined on the host a moment ago"));
         }
         // A deny rule (an earlier refusal) wins over any allow, and sbx refuses an
@@ -654,7 +738,7 @@ impl Worker {
                 self.sandbox
             ),
         };
-        match (self.confirm)(&question) {
+        match if confirmed { Answer::Allow } else { (self.confirm)(&question) } {
             Answer::Allow => {}
             Answer::Deny => {
                 self.declined.insert(host.to_string(), Instant::now());
@@ -851,6 +935,7 @@ mod tests {
             }),
             watch: None,
             answers: None,
+            told: None,
         };
         worker.reset();
         (worker, asked)
@@ -873,12 +958,37 @@ mod tests {
             Approval { id: "a2".into(), host: "pypi.org".into(), options: vec![choice("allow", "Allow")] },
         ];
         worker.pending_at = Some(Instant::now());
-        tx.send(("a1".into(), "allow".into())).unwrap();
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let heard = told.clone();
+        worker.told = Some(Box::new(move |asked: &Asked, outcome: &Outcome| {
+            heard.lock().unwrap().push((asked.clone(), outcome.ok));
+        }));
+        tx.send(Answered::Approval("a1".into(), "allow".into())).unwrap();
+        tx.send(Answered::Allow("example.com".into())).unwrap();
         worker.round(&AtomicBool::new(false));
         assert!(asked.lock().unwrap().is_empty(), "the person chose in the pane; no host dialog");
         assert_eq!(seen.lock().unwrap().last().unwrap(), &vec!["a2".to_string()], "a1 is no longer pending");
         let log = fs::read_to_string(tmp.path().join("log")).unwrap();
         assert!(log.contains("\"approval\":\"a1\""), "{log}");
+        assert!(log.contains("\"host\":\"example.com\""), "{log}");
+        // sbx is not there to answer: both fail, and the pane hears so for each host.
+        assert_eq!(
+            *told.lock().unwrap(),
+            [(Asked::Host("api.github.com".into()), false), (Asked::Host("example.com".into()), false)]
+        );
+    }
+
+    #[test]
+    fn blocks_are_read_from_the_proxys_403_bodies() {
+        let text = "curl: (22) 403\nBlocked by network policy: domain PyPI.org\n  rule: x\n\
+                    Approval required for api.github.com.\nBlocked by local rule for evil.test:8443\n\
+                    Blocked by network policy: domain pypi.org\nBlocked by local rule for api.github.com";
+        let blocks = blocks_in(text);
+        assert_eq!(blocks.hosts, ["pypi.org"]);
+        assert_eq!(blocks.ruled, ["evil.test:8443", "api.github.com"]);
+        assert!(!blocks.org);
+        assert!(blocks_in("Blocked by org policy").org);
+        assert_eq!(blocks_in("Blocked by network policy: domain *.x"), Blocks::default());
     }
 
     #[test]
@@ -940,9 +1050,9 @@ mod tests {
     fn a_declined_host_is_not_asked_about_again_right_away() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut worker, asked) = worker(tmp.path(), Answer::Deny);
-        let declined = worker.answer_allow("example.com:443");
+        let declined = worker.answer_allow("example.com:443", false);
         assert_eq!(declined, Outcome::done("example.com:443: declined on the host".into()));
-        let again = worker.answer_allow("example.com:443");
+        let again = worker.answer_allow("example.com:443", false);
         assert_eq!(again.message, "example.com:443: declined on the host a moment ago");
         assert_eq!(asked.lock().unwrap().len(), 1);
         assert!(asked.lock().unwrap()[0].contains("Sandbox 'claude-proj' asks for network access to example.com:443"));
@@ -952,8 +1062,8 @@ mod tests {
     fn requests_that_widen_or_name_unknown_approvals_are_refused_unasked() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
-        assert!(!worker.answer_allow("*.example.com").ok);
-        assert!(!worker.answer_allow("a.com,b.com").ok);
+        assert!(!worker.answer_allow("*.example.com", false).ok);
+        assert!(!worker.answer_allow("a.com,b.com", false).ok);
         assert!(!worker.answer_approval("made-up", Some("once"), false).ok);
         assert!(asked.lock().unwrap().is_empty());
     }

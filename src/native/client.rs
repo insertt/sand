@@ -183,6 +183,7 @@ impl Client {
                 json!({"type": "image", "mimeType": image.mime, "data": data})
             })
             .collect();
+        blocks.extend(prompt.context.iter().map(|note| json!({"type": "text", "text": note})));
         // Each mention in its place, as an editor's links sit in its text.
         let mut at = 0;
         for link in &prompt.links {
@@ -310,7 +311,7 @@ mod tests {
             dims: None,
             blob: None,
         };
-        let prompt = Prompt { text: "what is this?".into(), images: vec![image.clone()], links: Vec::new() };
+        let prompt = Prompt { text: "what is this?".into(), images: vec![image.clone()], ..Prompt::default() };
         client.prompt("S", &prompt).unwrap();
         client.prompt("S", &Prompt { images: vec![image], ..Prompt::default() }).unwrap();
         let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();

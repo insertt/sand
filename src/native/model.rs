@@ -3,7 +3,7 @@
 //! permission waiting for an answer, usage and where the turn is. Pure state;
 //! `view` draws it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -24,12 +24,15 @@ pub struct Image {
     pub blob: Option<String>,
 }
 
-/// What the person sends: text, the files it mentions, and images.
+/// What the person sends: text, the files it mentions, and images; and
+/// what sand tells the agent with it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prompt {
     pub text: String,
     pub images: Vec<Image>,
     pub links: Vec<Link>,
+    /// sand's notes for the agent (a host allowed since), before the text.
+    pub context: Vec<String>,
 }
 
 impl Prompt {
@@ -282,6 +285,16 @@ pub struct ToolCall {
     pub approval: Option<Approval>,
 }
 
+/// A host the network policy blocked, as a tool's output said.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Blocked {
+    pub host: String,
+    /// A local deny rule blocks it (it was refused before).
+    pub ruled: bool,
+    /// Allowed in the pane: sand is changing the policy.
+    pub sent: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlanEntry {
     pub content: String,
@@ -401,6 +414,12 @@ pub struct Transcript {
     pub last_session: Option<SessionEntry>,
     /// Network access the sandbox was blocked from, waiting for the person.
     pub network: Vec<crate::network::Approval>,
+    /// Hosts a tool's output says the policy blocked with no approval to
+    /// answer, waiting for the person.
+    pub blocked: Vec<Blocked>,
+    /// (tool call, host) pairs already offered, so that a tool's output
+    /// sent again, or a dismissed host, is not offered twice.
+    blocked_seen: HashSet<(String, String)>,
     /// Questions only the person may answer (a mount, a host), oldest first.
     pub confirms: Vec<String>,
     pub entries: Vec<Entry>,
@@ -452,6 +471,8 @@ impl Default for Transcript {
             mode: None,
             commands: Vec::new(),
             files: Vec::new(),
+            blocked: Vec::new(),
+            blocked_seen: HashSet::new(),
             picker: None,
             resuming: None,
             exit_armed: None,
@@ -597,6 +618,10 @@ impl Transcript {
             "tool_call" | "tool_call_update" => {
                 let Some(id) = update["toolCallId"].as_str() else { return };
                 self.tool_mut(id, now).merge(update, now);
+                // A resumed session's replay tells of blocks long answered.
+                if self.resuming.is_none() && update.get("content").is_some_and(|c| !c.is_null()) {
+                    self.scan_blocks(id);
+                }
             }
             "plan" => {
                 self.plan = update["entries"]
@@ -733,6 +758,38 @@ impl Transcript {
     pub fn note(&mut self, text: impl Into<String>, tone: &'static str) {
         if self.hidden {
             self.notes.push(Note { text: text.into(), tone });
+        }
+    }
+
+    /// Offers the hosts tool `id`'s output says the network policy blocked.
+    fn scan_blocks(&mut self, id: &str) {
+        let Some(Entry::Tool(tool)) = self.tools.get(id).and_then(|&i| self.entries.get(i)) else { return };
+        let text: Vec<&str> = tool
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                ToolContent::Text(text) => Some(text.as_str()),
+                ToolContent::Diff { .. } => None,
+            })
+            .collect();
+        let blocks = crate::network::blocks_in(&text.join("\n"));
+        if blocks.org && self.blocked_seen.insert((id.to_string(), String::new())) {
+            self.entries.push(Entry::Notice(
+                "A request was blocked by your organization's policy; ask your IT team if you need access".into(),
+            ));
+        }
+        let found = blocks.ruled.into_iter().map(|h| (h, true)).chain(blocks.hosts.into_iter().map(|h| (h, false)));
+        for (host, ruled) in found {
+            if !self.blocked_seen.insert((id.to_string(), host.clone())) {
+                continue;
+            }
+            match self.blocked.iter_mut().find(|b| b.host == host) {
+                Some(known) => known.ruled |= ruled,
+                None => {
+                    self.note(format!("The sandbox was blocked from reaching {host}"), "warning");
+                    self.blocked.push(Blocked { host, ruled, sent: false });
+                }
+            }
         }
     }
 

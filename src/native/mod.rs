@@ -65,8 +65,11 @@ pub enum Command {
         question: String,
         reply: Sender<bool>,
     },
-    /// Where answers to sbx's pending network approvals go.
-    Approvals(Sender<(String, String)>),
+    /// Where answers to sbx's pending network approvals, and to hosts seen
+    /// blocked, go.
+    Approvals(Sender<crate::network::Answered>),
+    /// How an answer given on the surface turned out.
+    Told(crate::network::Asked, crate::network::Outcome),
     /// What a paste found on the clipboard: an image and its type, or why not.
     Pasted(std::result::Result<(Vec<u8>, &'static str), String>),
     /// The workspace's files, listed for `@` mentions.
@@ -248,10 +251,14 @@ pub fn bridge_hooks() -> Option<crate::network::Hooks> {
             }
         }
     });
+    let watch = send.clone();
     let pending = Box::new(move |approvals: &[crate::network::Approval]| {
-        send(Command::Update(Update::Pending(approvals.to_vec())));
+        watch(Command::Update(Update::Pending(approvals.to_vec())));
     });
-    Some(crate::network::Hooks { confirm, pending, answers })
+    let told = Box::new(move |asked: &crate::network::Asked, outcome: &crate::network::Outcome| {
+        send(Command::Told(asked.clone(), outcome.clone()));
+    });
+    Some(crate::network::Hooks { confirm, pending, answers, told })
 }
 
 /// Whether a native surface shows the session (setup has not handed it over yet).

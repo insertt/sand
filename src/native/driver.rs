@@ -26,6 +26,7 @@ use super::model::{
 use super::view::{Completion, EDITOR, Info, Msg, STYLE, completions, view};
 use super::{ChatSpec, Command, Update};
 use crate::log::Line;
+use crate::network::{Answered, Asked, Outcome};
 
 /// Follow-ups that can wait for the agent at once.
 const QUEUE: usize = 8;
@@ -96,8 +97,10 @@ pub struct Driver {
     stop_probes: Arc<AtomicBool>,
     /// Where the answers to the person's questions go, oldest first.
     confirm_replies: Vec<Sender<bool>>,
-    /// Where answers to sbx's network approvals go.
-    approvals: Option<Sender<(String, String)>>,
+    /// Where answers to sbx's network approvals, and to blocked hosts, go.
+    approvals: Option<Sender<Answered>>,
+    /// What sand tells the agent with the next message (a host allowed since).
+    agent_notes: Vec<String>,
     quit: bool,
     /// The person pressed Ctrl+C during setup.
     pub interrupted: bool,
@@ -139,6 +142,7 @@ impl Driver {
             stop_probes: Arc::new(AtomicBool::new(false)),
             confirm_replies: Vec::new(),
             approvals: None,
+            agent_notes: Vec::new(),
             quit: false,
             interrupted: false,
             by_person: false,
@@ -313,6 +317,7 @@ impl Driver {
                 self.confirm_replies.push(reply);
             }
             Command::Approvals(answers) => self.approvals = Some(answers),
+            Command::Told(asked, outcome) => self.told(asked, outcome),
             Command::Pasted(image) => self.pasted(image),
             Command::Files(files) => self.t.files = files,
             #[cfg(test)]
@@ -634,7 +639,7 @@ impl Driver {
             return self.submit();
         }
         let links = self.links(&text);
-        let prompt = Prompt { text, images: std::mem::take(&mut self.composer.images), links };
+        let prompt = Prompt { text, images: std::mem::take(&mut self.composer.images), links, context: Vec::new() };
         self.force(prompt);
     }
 
@@ -683,6 +688,25 @@ impl Driver {
 
     fn cwd(&self) -> String {
         self.agent.as_ref().map(|a| a.cwd.clone()).unwrap_or_default()
+    }
+
+    /// How an answer given in the pane turned out: the person hears, and
+    /// the agent, of a host allowed, with the next message.
+    fn told(&mut self, asked: Asked, outcome: Outcome) {
+        let Asked::Host(host) = &asked;
+        self.t.blocked.retain(|b| b.host != *host);
+        if outcome.allowed && !host.is_empty() {
+            self.agent_notes.push(format!(
+                "[sand] The user allowed {host} for this sandbox. \
+                 Requests to it that were blocked earlier failed; retry them if they are still needed."
+            ));
+        }
+        if !outcome.ok {
+            self.t.error(outcome.message, None);
+            return;
+        }
+        self.t.note(outcome.message.clone(), if outcome.allowed { "success" } else { "muted" });
+        self.t.entries.push(Entry::Notice(outcome.message));
     }
 
     /// Runs one of sand's commands.
@@ -756,6 +780,7 @@ impl Driver {
 
     fn prompt(&mut self, mut prompt: Prompt) {
         let Some(session) = self.session.clone() else { return };
+        prompt.context = std::mem::take(&mut self.agent_notes);
         // The files as they are now, for a prompt that waited in the queue.
         if let Some(root) = self.workspace.as_deref().filter(|_| self.can_embed) {
             for link in &mut prompt.links {
@@ -784,7 +809,12 @@ impl Driver {
             Some(_) => self.composer.set(&text),
             None => {
                 let links = self.links(&text);
-                let prompt = Prompt { text: text.clone(), images: std::mem::take(&mut self.composer.images), links };
+                let prompt = Prompt {
+                    text: text.clone(),
+                    images: std::mem::take(&mut self.composer.images),
+                    links,
+                    context: Vec::new(),
+                };
                 if !self.send(prompt.clone()) {
                     self.composer.set(&text);
                     self.composer.images = prompt.images;
@@ -990,11 +1020,25 @@ impl Driver {
             Msg::DismissNotes => self.t.notes.clear(),
             Msg::Network(id, option) => {
                 if let Some(answers) = &self.approvals {
-                    let _ = answers.send((id.clone(), option));
+                    let _ = answers.send(Answered::Approval(id.clone(), option));
                 }
                 // Gone at once; the bridge says so too once sbx took the answer.
                 self.t.network.retain(|a| a.id != id);
             }
+            Msg::AllowHost(host) => match &self.approvals {
+                Some(answers) if answers.send(Answered::Allow(host.clone())).is_ok() => {
+                    if let Some(blocked) = self.t.blocked.iter_mut().find(|b| b.host == host) {
+                        blocked.sent = true;
+                    }
+                }
+                _ => self.t.error(
+                    format!(
+                        "sand cannot change the network policy from here; allow {host} with `sbx policy allow network`"
+                    ),
+                    None,
+                ),
+            },
+            Msg::DismissHost(host) => self.t.blocked.retain(|b| b.host != host),
             Msg::Confirm(index, allow) => {
                 if index < self.t.confirms.len() {
                     self.t.confirms.remove(index);
@@ -1352,8 +1396,44 @@ mod tests {
         let asked: Vec<&str> = d.t.notes.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(asked.iter().filter(|n| n.contains("api.github.com")).count(), 1, "noted once");
         d.msg(Msg::Network("a1".into(), "once".into()));
-        assert_eq!(answered.recv().unwrap(), ("a1".to_string(), "once".to_string()));
+        assert_eq!(answered.recv().unwrap(), Answered::Approval("a1".into(), "once".into()));
         assert!(d.t.network.is_empty());
+    }
+
+    #[test]
+    fn hosts_a_tool_saw_blocked_are_allowed_in_the_pane_and_the_agent_told() {
+        let mut d = idle();
+        d.session = Some("S".into());
+        let (answers, answered) = std::sync::mpsc::channel();
+        d.command(Command::Approvals(answers));
+        let output = |id: &str, text: &str| {
+            serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": id, "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": text}}]})
+        };
+        let blocked = "HTTP 403\nBlocked by network policy: domain pypi.org\n  detail: no matching allow rule";
+        d.t.apply(&output("t1", blocked), Instant::now());
+        d.t.apply(&output("t1", blocked), Instant::now());
+        d.t.apply(&output("t2", "Blocked by local rule for evil.test"), Instant::now());
+        let hosts: Vec<(&str, bool)> = d.t.blocked.iter().map(|b| (b.host.as_str(), b.ruled)).collect();
+        assert_eq!(hosts, [("pypi.org", false), ("evil.test", true)], "each host offered once");
+        d.t.resuming = Some("old".into());
+        d.t.apply(&output("t0", "Blocked by network policy: domain old.test"), Instant::now());
+        assert_eq!(d.t.blocked.len(), 2, "a resumed session's replay offers nothing");
+        d.t.resuming = None;
+
+        d.msg(Msg::DismissHost("evil.test".into()));
+        d.msg(Msg::AllowHost("pypi.org".into()));
+        assert_eq!(answered.recv().unwrap(), Answered::Allow("pypi.org".into()));
+        assert!(d.t.blocked[0].sent);
+        let allowed = Outcome { ok: true, allowed: true, message: "pypi.org: allowed for this sandbox".into() };
+        d.command(Command::Told(Asked::Host("pypi.org".into()), allowed));
+        assert!(d.t.blocked.is_empty());
+        assert!(matches!(d.t.entries.last(), Some(Entry::Notice(t)) if t.contains("allowed for this sandbox")));
+        assert!(d.agent_notes[0].contains("allowed pypi.org"), "the agent hears with the next message");
+        let failed = Outcome { ok: false, allowed: false, message: "evil.test: sbx refused: no".into() };
+        d.command(Command::Told(Asked::Host("evil.test".into()), failed));
+        assert!(matches!(d.t.entries.last(), Some(Entry::Error { .. })));
+        assert_eq!(d.agent_notes.len(), 1, "a host that stays blocked needs no word to the agent");
     }
 
     #[test]
