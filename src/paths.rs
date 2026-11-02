@@ -9,8 +9,12 @@ use anyhow::{Context, Result, anyhow};
 pub const DEFAULT_SANDBOX_HOME: &str = "/home/agent";
 /// Where the per-sandbox runtime directory is mounted (read-only) inside the sandbox.
 pub const RUNTIME_DIR_NAME: &str = ".sand";
-/// Where the per-sandbox network-prompt bridge is mounted (read-write) inside the sandbox.
+/// Where the per-sandbox network-prompt bridge is mounted (read-only) inside the sandbox.
 pub const POLICY_DIR_NAME: &str = ".sand-policy";
+/// Where the sandbox files its requests to the bridge (read-write), apart from
+/// what sand writes back, so that nothing the agent can change is in a
+/// directory sand writes to or deletes from.
+pub const REQUESTS_DIR_NAME: &str = ".sand-requests";
 
 #[derive(Clone, Debug)]
 pub struct Dirs {
@@ -58,10 +62,17 @@ impl Dirs {
         self.sandbox_dir(name).join("history")
     }
 
-    /// Host directory mounted read-write at `~/.sand-policy` inside the sandbox:
-    /// the network prompts the sandbox files and what sand answers.
+    /// Host directory mounted read-only at `~/.sand-policy` inside the sandbox:
+    /// what sand answers the sandbox's network and mount prompts.
     pub fn policy_dir(&self, name: &str) -> PathBuf {
         self.sandbox_dir(name).join("policy")
+    }
+
+    /// Host directory mounted read-write at `~/.sand-requests` inside the
+    /// sandbox: the prompts it files. Being the mount's root, the agent can
+    /// fill it but not swap it for a link.
+    pub fn requests_dir(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("requests")
     }
 
     /// Where sand keeps the per-sandbox directories of every sandbox.

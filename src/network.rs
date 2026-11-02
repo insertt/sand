@@ -5,15 +5,17 @@
 //! in a native dialog on the host, which the agent cannot click, before it
 //! changes the policy with sbx.
 //!
-//! Requests and answers go through a directory per sandbox, mounted read-write
-//! at `~/.sand-policy` in that sandbox alone, so the sandbox a request came from
-//! is the directory it appeared in, never anything the request says:
+//! Requests and answers go through two directories per sandbox, mounted in
+//! that sandbox alone, so the sandbox a request came from is the directory it
+//! appeared in, never anything the request says. The agent can write only the
+//! first, the root of its mount, where sand reads files and removes entries
+//! without following links; what sand writes is in the second, read-only to it:
 //!
 //! ```text
-//! pending.json        sand: the sbx approvals waiting for this sandbox
-//! requests/<id>.json  the mod: {"host": ..., "approval": ..., "option": ...},
-//!                     or {"kind": "mount", "path": ..., "mode": ..., "reason": ...}
-//! results/<id>.json   sand: {"ok": ..., "allowed": ..., "message": ...}
+//! ~/.sand-requests/<id>.json      the mod: {"host": ..., "approval": ..., "option": ...},
+//!                                 or {"kind": "mount", "path": ..., "mode": ..., "reason": ...}
+//! ~/.sand-policy/pending.json     sand: the sbx approvals waiting for this sandbox
+//! ~/.sand-policy/results/<id>.json  sand: {"ok": ..., "allowed": ..., "message": ...}
 //! ```
 
 use std::collections::HashMap;
@@ -33,7 +35,7 @@ use serde_json::{Value, json};
 
 use crate::args;
 use crate::mounts::{self, Mode, Mount, MountSet};
-use crate::paths::{Dirs, POLICY_DIR_NAME, container_path};
+use crate::paths::{Dirs, POLICY_DIR_NAME, REQUESTS_DIR_NAME, container_path};
 use crate::sbx::Sbx;
 use crate::session;
 
@@ -70,7 +72,10 @@ pub fn mcp_server(sandbox_home: &str) -> Value {
         "name": "sand-acp",
         "command": "node",
         "args": [format!("{sandbox_home}/{MCP_SERVER}")],
-        "env": [{"name": "SAND_POLICY_DIR", "value": format!("{sandbox_home}/{POLICY_DIR_NAME}")}],
+        "env": [
+            {"name": "SAND_POLICY_DIR", "value": format!("{sandbox_home}/{POLICY_DIR_NAME}")},
+            {"name": "SAND_REQUESTS_DIR", "value": format!("{sandbox_home}/{REQUESTS_DIR_NAME}")},
+        ],
     })
 }
 
@@ -90,6 +95,7 @@ pub fn settings(sandbox_home: &str) -> Value {
         "env": {
             "CLAUDE_CODE_PLUGIN_DIRS": format!("{sandbox_home}/{MOD_DIR}"),
             "SAND_POLICY_DIR": format!("{sandbox_home}/{POLICY_DIR_NAME}"),
+            "SAND_REQUESTS_DIR": format!("{sandbox_home}/{REQUESTS_DIR_NAME}"),
         },
     })
 }
@@ -452,6 +458,7 @@ impl Bridge {
         let mut worker = Worker {
             sbx,
             dir: dirs.policy_dir(&sandbox),
+            inbox: dirs.requests_dir(&sandbox),
             log: dirs.sandbox_dir(&sandbox).join("network-prompts.log"),
             sandbox,
             dirs,
@@ -494,7 +501,10 @@ struct Worker {
     sbx: Sbx,
     dirs: Dirs,
     sandbox: String,
+    /// What sand writes back; read-only in the sandbox.
     dir: PathBuf,
+    /// Where the sandbox files requests; anything in it is the agent's.
+    inbox: PathBuf,
     log: PathBuf,
     pending: Vec<Approval>,
     pending_at: Option<Instant>,
@@ -513,7 +523,7 @@ impl Worker {
     /// Starts from a clean directory: requests filed while no session ran are
     /// answered now, but a pending list from an earlier session would be stale.
     fn reset(&self) {
-        let _ = fs::create_dir_all(self.dir.join("requests"));
+        let _ = fs::create_dir_all(&self.inbox);
         let _ = fs::create_dir_all(self.dir.join("results"));
         let _ = fs::remove_file(self.dir.join("pending.json"));
     }
@@ -594,20 +604,23 @@ impl Worker {
         }
     }
 
-    /// Request files by age, oldest first; anything else in the directory is removed.
+    /// Request files by age, oldest first; anything else in the directory is
+    /// removed. Nothing here follows a link: the agent makes the entries.
     fn requests(&self) -> Vec<(String, PathBuf)> {
-        let Ok(entries) = fs::read_dir(self.dir.join("requests")) else { return Vec::new() };
+        let Ok(entries) = fs::read_dir(&self.inbox) else { return Vec::new() };
         let mut found: Vec<(SystemTime, String, PathBuf)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
+            // `DirEntry::metadata` does not follow links, unlike `Path::metadata`.
+            let meta = entry.metadata().ok();
             match name.strip_suffix(".json").filter(|id| valid_id(id)) {
-                Some(id) if path.is_file() => {
-                    let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+                Some(id) if meta.as_ref().is_some_and(fs::Metadata::is_file) => {
+                    let modified = meta.and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
                     found.push((modified, id.to_string(), path));
                 }
                 _ => {
-                    let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+                    let _ = crate::state::remove_any(&path);
                 }
             }
         }
@@ -617,11 +630,11 @@ impl Worker {
 
     /// Reads, answers and removes one request; `None` while it may still be being written.
     fn take(&mut self, path: &Path) -> Option<Outcome> {
-        let text = fs::read_to_string(path).unwrap_or_default();
+        let text = read_plain_file(path).unwrap_or_default();
         let request = match serde_json::from_str::<Request>(&text) {
             Ok(request) => request,
             Err(_) => {
-                let age = fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                let age = fs::symlink_metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
                 if age.is_some_and(|age| age < WRITE_GRACE) {
                     return None;
                 }
@@ -847,6 +860,26 @@ impl Worker {
     }
 }
 
+/// The text of `path` when it is a regular file, never what a link points to:
+/// the agent could swap the file for a link after it was listed.
+fn read_plain_file(path: &Path) -> Option<String> {
+    let before = fs::symlink_metadata(path).ok().filter(fs::Metadata::is_file)?;
+    let mut file = fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (&before, &opened);
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text).ok()?;
+    Some(text)
+}
+
 /// Text from the agent made fit for one line of a dialog.
 fn one_line(text: &str) -> String {
     let flat: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
@@ -968,7 +1001,8 @@ mod tests {
             dirs,
             mounter: Box::new(|mount| Ok(!mount.path.ends_with("already"))),
             sandbox: "claude-proj".into(),
-            dir: dir.to_path_buf(),
+            dir: dir.join("policy"),
+            inbox: dir.join("requests"),
             log: dir.join("log"),
             pending: Vec::new(),
             pending_at: None,
@@ -1032,7 +1066,7 @@ mod tests {
         fs::write(&script, mod_files().iter().find(|(rel, _)| rel == MCP_SERVER).unwrap().1).unwrap();
         let Ok(mut node) = Command::new("node")
             .arg(&script)
-            .env("SAND_POLICY_DIR", tmp.path())
+            .env("SAND_REQUESTS_DIR", tmp.path().join("requests"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -1090,7 +1124,7 @@ mod tests {
         fs::write(tmp.path().join("requests/r1.json"), request.to_string()).unwrap();
         worker.round(&AtomicBool::new(false));
         assert_eq!(*told.lock().unwrap(), [(Asked::Mount(tmp.path().to_string_lossy().into_owned()), false)]);
-        assert!(tmp.path().join("results/r1.json").exists(), "the result is written as for the mod");
+        assert!(tmp.path().join("policy/results/r1.json").exists(), "the result is written as for the mod");
     }
 
     #[test]
@@ -1222,5 +1256,30 @@ mod tests {
         assert_eq!(outcome.message, "a.com: declined on the host");
         assert!(!requests.join("one.json").exists());
         assert!(fs::read_to_string(tmp.path().join("log")).unwrap().contains(r#""host":"a.com""#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_the_agent_files_are_removed_never_followed() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let precious = tmp.path().join("precious");
+        fs::create_dir_all(precious.join("docs")).unwrap();
+        fs::write(precious.join("notes.txt"), "keep").unwrap();
+        fs::write(precious.join("secret.json"), r#"{"host": "leaked.example"}"#).unwrap();
+
+        let (mut worker, _) = worker(tmp.path(), Answer::Deny);
+        let requests = tmp.path().join("requests");
+        symlink(&precious, requests.join("dir")).unwrap();
+        symlink(precious.join("secret.json"), requests.join("swapped.json")).unwrap();
+        fs::write(requests.join("r1.json"), r#"{"host": "bad host"}"#).unwrap();
+        worker.round(&AtomicBool::new(false));
+
+        assert!(precious.join("docs").is_dir() && precious.join("secret.json").exists());
+        assert_eq!(fs::read_to_string(precious.join("notes.txt")).unwrap(), "keep");
+        assert!(fs::read_dir(&requests).unwrap().next().is_none(), "links and answered requests are gone");
+        assert_eq!(read_plain_file(&precious.join("notes.txt")).as_deref(), Some("keep"));
+        symlink(precious.join("secret.json"), requests.join("late.json")).unwrap();
+        assert_eq!(read_plain_file(&requests.join("late.json")), None);
     }
 }

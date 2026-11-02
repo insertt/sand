@@ -341,12 +341,14 @@ which wins over any allow. The mod offers to lift it, the dialog says so, and
 that applies to every sandbox is not removed: the request fails with the
 `sbx policy rm` command to remove it yourself.
 
-Requests and answers go through a directory of each sandbox's own, mounted
-read-write at `~/.sand-policy` in that sandbox alone. Since a request names its
-sandbox by where it appears, keep sand's data directory out of your mounts:
-`sand` warns about a mount that contains it. The mod is loaded through
-`CLAUDE_CODE_PLUGIN_DIRS` in the sandbox's Claude Code settings. Set
-`network_prompts = false` under `[harness.claude]` to leave it out.
+Requests go through a directory of each sandbox's own, mounted read-write at
+`~/.sand-requests` in that sandbox alone, and `sand` answers in another,
+`~/.sand-policy`, which the sandbox can only read. `sand` never follows a link
+the agent puts in the first. Since a request names its sandbox by where it
+appears, keep sand's data directory out of your mounts: `sand` warns about a
+mount that contains it. The mod is loaded through `CLAUDE_CODE_PLUGIN_DIRS` in
+the sandbox's Claude Code settings. Set `network_prompts = false` under
+`[harness.claude]` to leave it out.
 
 ## MCP servers
 

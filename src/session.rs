@@ -26,7 +26,7 @@ use crate::mcp;
 use crate::mounts::{self, Mode, Mount, MountSet, Plan, Strategy};
 use crate::native;
 use crate::network::{self, Bridge};
-use crate::paths::{Dirs, POLICY_DIR_NAME, RUNTIME_DIR_NAME, container_path};
+use crate::paths::{Dirs, POLICY_DIR_NAME, REQUESTS_DIR_NAME, RUNTIME_DIR_NAME, container_path};
 use crate::registry;
 use crate::runtime::{self, ApiState, Refresher};
 use crate::sbx::{KeepAlive, Sbx, shell_quote};
@@ -579,7 +579,8 @@ fn ensure_internal_mounts(
     let runtime = dirs.runtime_dir(&state.name);
     let mut wanted = vec![(runtime, format!("{home}/{RUNTIME_DIR_NAME}"), Mode::Ro)];
     if profile.network_prompts {
-        wanted.push((dirs.policy_dir(&state.name), format!("{home}/{POLICY_DIR_NAME}"), Mode::Rw));
+        wanted.push((dirs.policy_dir(&state.name), format!("{home}/{POLICY_DIR_NAME}"), Mode::Ro));
+        wanted.push((dirs.requests_dir(&state.name), format!("{home}/{REQUESTS_DIR_NAME}"), Mode::Rw));
     }
     if state.kind != Kind::Dedicated {
         for rel in &profile.history {
@@ -604,7 +605,7 @@ fn ensure_internal_mounts(
     let targets = missing.iter().map(|m| shell_quote(&m.target)).collect::<Vec<_>>().join(" ");
     sbx.exec_sh(&state.name, &format!("mkdir -p {targets}"))?;
     for mount in missing {
-        let what = if mount.target.ends_with(POLICY_DIR_NAME) {
+        let what = if mount.target.ends_with(POLICY_DIR_NAME) || mount.target.ends_with(REQUESTS_DIR_NAME) {
             "network prompts"
         } else if mount.mode == Mode::Ro {
             "status"

@@ -388,11 +388,17 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     wait_for(&PathBuf::from(format!("{}.started", gate.display())), "session never started");
 
     let dir = env.sandbox_dir("claude-proj").join("policy");
-    let mount =
-        env.state("claude-proj")["internal_mounts"].as_array().unwrap().iter().any(|m| {
-            m["target"] == "/home/agent/.sand-policy" && m["mode"] == "rw" && m["host"] == env.p(&dir).as_str()
-        });
-    assert!(mount, "{:#?}", env.state("claude-proj"));
+    let inbox = env.sandbox_dir("claude-proj").join("requests");
+    // The agent writes only the requests; what sand writes back is read-only to it.
+    let mounted = |target: &str, mode: &str, host: &Path| {
+        env.state("claude-proj")["internal_mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["target"] == target && m["mode"] == mode && m["host"] == env.p(host).as_str())
+    };
+    assert!(mounted("/home/agent/.sand-policy", "ro", &dir), "{:#?}", env.state("claude-proj"));
+    assert!(mounted("/home/agent/.sand-requests", "rw", &inbox), "{:#?}", env.state("claude-proj"));
     let staged = env.sandbox_dir("claude-proj").join("runtime/sync/home/.local/share/sand/mods/sand");
     assert!(staged.join("hooks/register.tsx").is_file() && staged.join(".claude-plugin/plugin.json").is_file());
 
@@ -401,21 +407,21 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     let pending = fs::read_to_string(dir.join("pending.json")).unwrap();
     assert!(pending.contains("ap-1") && !pending.contains("ap-2"), "{pending}");
 
-    fs::write(dir.join("requests/r1.json"), r#"{"host": "example.com:443"}"#).unwrap();
-    fs::write(dir.join("requests/r2.json"), r#"{"host": "evil.com", "approval": "ap-2", "option": "once"}"#).unwrap();
-    fs::write(dir.join("requests/r3.json"), r#"{"host": "*", "approval": null}"#).unwrap();
+    fs::write(inbox.join("r1.json"), r#"{"host": "example.com:443"}"#).unwrap();
+    fs::write(inbox.join("r2.json"), r#"{"host": "evil.com", "approval": "ap-2", "option": "once"}"#).unwrap();
+    fs::write(inbox.join("r3.json"), r#"{"host": "*", "approval": null}"#).unwrap();
     // A host refused before is blocked by a deny rule: allowing lifts this sandbox's own,
     // but not one that applies to every sandbox.
     for (scope, host, id) in [("claude-proj", "refused.com:443", "rule-1"), ("global", "global.com:443", "rule-2")] {
         fs::create_dir_all(env.fake.join("deny").join(scope)).unwrap();
         fs::write(env.fake.join("deny").join(scope).join(host), id).unwrap();
     }
-    fs::write(dir.join("requests/r5.json"), r#"{"host": "refused.com:443"}"#).unwrap();
-    fs::write(dir.join("requests/r6.json"), r#"{"host": "global.com:443"}"#).unwrap();
+    fs::write(inbox.join("r5.json"), r#"{"host": "refused.com:443"}"#).unwrap();
+    fs::write(inbox.join("r6.json"), r#"{"host": "global.com:443"}"#).unwrap();
     // A mount the agent asked for; relative paths are taken from the primary workspace.
-    fs::write(dir.join("requests/m1.json"), r#"{"kind": "mount", "path": "../other:ro", "reason": "docs"}"#).unwrap();
+    fs::write(inbox.join("m1.json"), r#"{"kind": "mount", "path": "../other:ro", "reason": "docs"}"#).unwrap();
     // The host and options of an approval come from sbx, whatever the request says.
-    fs::write(dir.join("requests/r4.json"), r#"{"host": "other.com", "approval": "ap-1", "option": "once"}"#).unwrap();
+    fs::write(inbox.join("r4.json"), r#"{"host": "other.com", "approval": "ap-1", "option": "once"}"#).unwrap();
     for id in ["r1", "r2", "r3", "r4", "r5", "r6", "m1"] {
         wait_for(&dir.join(format!("results/{id}.json")), "no result");
     }
@@ -941,6 +947,7 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
             "DEBUG": "1",
             "CLAUDE_CODE_PLUGIN_DIRS": "/home/agent/.local/share/sand/mods/sand",
             "SAND_POLICY_DIR": "/home/agent/.sand-policy",
+            "SAND_REQUESTS_DIR": "/home/agent/.sand-requests",
             "CLAUDE_CODE_USE_VERTEX": "1",
             "CLAUDE_CODE_SKIP_VERTEX_AUTH": "1",
             "ANTHROPIC_VERTEX_PROJECT_ID": "acme",
@@ -989,6 +996,7 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
             "DEBUG": "1",
             "CLAUDE_CODE_PLUGIN_DIRS": "/home/agent/.local/share/sand/mods/sand",
             "SAND_POLICY_DIR": "/home/agent/.sand-policy",
+            "SAND_REQUESTS_DIR": "/home/agent/.sand-requests",
         })
     );
 }

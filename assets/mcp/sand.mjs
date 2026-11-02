@@ -4,13 +4,13 @@
 // the person on its surface and tells the agent the outcome with the next
 // message. No dependencies: the sandbox's Node is all it needs.
 //
-//   requests/<id>.json  { kind: 'mount', path, mode, reason }
+//   <requests dir>/<id>.json  { kind: 'mount', path, mode, reason }
 import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
 
-const DIR = process.env.SAND_POLICY_DIR || `${homedir()}/.sand-policy`
+const REQUESTS = process.env.SAND_REQUESTS_DIR || `${homedir()}/.sand-requests`
 
 const TOOL = {
   name: 'request_mount',
@@ -48,7 +48,7 @@ function requestMount(args) {
   const mode = suffix ?? (args.mode === 'ro' ? 'ro' : 'rw')
   const reason = typeof args.reason === 'string' ? args.reason.slice(0, 300) : null
   try {
-    writeFileSync(`${DIR}/requests/${randomUUID()}.json`, JSON.stringify({ kind: 'mount', path, mode, reason }))
+    writeFileSync(`${REQUESTS}/${randomUUID()}.json`, JSON.stringify({ kind: 'mount', path, mode, reason }))
   } catch (err) {
     return text(`sand could not ask the user: ${String(err)}`, true)
   }
