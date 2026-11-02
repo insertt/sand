@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::args;
@@ -11,7 +12,8 @@ use crate::config::Config;
 use crate::log;
 use crate::sbx::Sbx;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum McpState {
     Ok,
     NeedsAuth,
@@ -31,7 +33,7 @@ impl McpState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct McpStatus {
     pub name: String,
     pub state: McpState,

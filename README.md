@@ -72,14 +72,15 @@ the same.
 | `--on-conflict replace\|merge\|abort` | Answer the "sandbox exists with a different setup" question up front. |
 | `-v`, `--verbose` | Echo every `sbx` command sand runs and show its output (otherwise shown only when a command fails). Works with the subcommands too. |
 
-Other commands: `sand status [HARNESS] [DIR]` prints a sandbox's mounts, agent
-API connectivity and MCP server status. `sand describe [HARNESS] [DIR]` prints
-everything sand recorded about a sandbox (harness, kind, creation time,
-template, nightly image, mounts including sand's own, MCP servers, data
-directory) along with whether sbx reports it running and whether a `sand`
-session is attached; it runs nothing inside the sandbox, and `--json` prints the
-same on stdout for scripts. `sand allow [HARNESS] [DIR]` opens the
-network for hosts the sandbox was blocked from reaching (see
+Other commands: `sand status [HARNESS] [DIR]` prints everything sand recorded
+about a sandbox (harness, kind, creation time, template, nightly image, mounts
+including sand's own, MCP servers, data directory), whether sbx reports it
+running and whether a `sand` session is attached, and checks whether the agent
+API is reachable from inside it and how the MCP servers are doing. The API
+check runs only while the sandbox is running, so `sand status` never starts
+one; `--no-probe` skips both checks and runs nothing inside the sandbox, and
+`--json` prints the same on stdout for scripts. `sand describe` is an alias.
+`sand allow [HARNESS] [DIR]` opens the network for hosts the sandbox was blocked from reaching (see
 [Blocked network access](#blocked-network-access)). `sand mount [HARNESS]
 DIR[:ro|:rw]...` and `sand umount [HARNESS] DIR...` add and remove extra mounts
 of an existing sandbox (see [Adding mounts later](#adding-mounts-later)).

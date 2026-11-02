@@ -1273,46 +1273,47 @@ fn agent_exit_code_and_unknown_harnesses_pass_through() {
 }
 
 #[test]
-fn status_shows_the_banner_for_an_existing_sandbox() {
+fn status_prints_the_record_the_sbx_state_and_live_checks() {
     let env = Env::new();
     assert!(env.fails(&["status", "codex"]).contains("no sandbox named 'codex-proj'"));
-    env.ok(&["codex", ".", "../other:ro"]);
-    let out = env.command(&["status", "codex"]).env("FAKE_SBX_API_CODE", "502").output().unwrap();
-    let err = stderr(&out);
-    assert!(out.status.success(), "{err}");
-    assert!(err.contains("codex-proj") && err.contains("[primary workspace]") && err.contains("(ro)"), "{err}");
-    assert!(err.contains("api.openai.com unreachable"), "{err}");
-}
-
-#[test]
-fn describe_prints_the_record_and_the_sbx_state() {
-    let env = Env::new();
-    assert!(env.fails(&["describe", "codex"]).contains("no sandbox named 'codex-proj'"));
     env.ok(&["codex", ".", "../other:ro", "--no-attach"]);
     fs::write(env.fake.join("ls.json"), r#"[{"name": "codex-proj", "status": "running"}]"#).unwrap();
     env.take_log();
 
-    let out = env.ok(&["describe", "codex"]);
+    let out = env.command(&["status", "codex"]).env("FAKE_SBX_API_CODE", "502").output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("codex-proj") && text.contains("running") && text.contains("none attached"), "{text}");
     assert!(text.contains("[primary workspace]") && text.contains(&format!("{} (ro)", env.p(&env.other))), "{text}");
     assert!(text.contains("history/.codex_sessions → /home/agent/.codex/sessions (rw)"), "{text}");
-    // Nothing runs inside the sandbox.
-    assert!(!has(&env.take_log(), "exec"));
+    assert!(text.contains("api.openai.com unreachable"), "{text}");
+    assert!(has(&env.take_log(), "exec"));
 
-    let out = env.ok(&["describe", "--name", "codex-proj", "--json"]);
+    let out = env.ok(&["status", "--name", "codex-proj", "--json"]);
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["sbx_state"], "running");
+    assert_eq!(json["api"], "ok");
     assert_eq!(json["record"]["harness"], "codex");
     assert_eq!(json["record"]["mounts"]["extras"][0]["mode"], "ro");
+
+    // --no-probe (and the old `describe` name) runs nothing inside the sandbox.
+    env.take_log();
+    let out = env.ok(&["describe", "codex", "--no-probe"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("not checked (--no-probe)"));
+    assert!(env.ok(&["status", "codex", "--no-probe", "--json"]).stdout.starts_with(b"{"));
+    // Neither does a stopped sandbox, which `sbx exec` would start.
+    fs::write(env.fake.join("ls.json"), r#"[{"name": "codex-proj", "status": "stopped"}]"#).unwrap();
+    let out = env.ok(&["status", "codex", "--json"]);
+    assert!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["api"].is_null());
+    assert!(!has(&env.take_log(), "exec"));
 
     // A sandbox sand did not create is described from what sbx knows.
     fs::write(env.fake.join("sandboxes/hand-made"), "").unwrap();
     fs::remove_file(env.fake.join("ls.json")).unwrap();
-    let out = env.ok(&["describe", "--name", "hand-made"]);
+    let out = env.ok(&["status", "--name", "hand-made", "--no-probe"]);
     assert!(stderr(&out).contains("was not created by sand"), "{}", stderr(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("unknown"));
-    let out = env.ok(&["describe", "--name", "hand-made", "--json"]);
+    let out = env.ok(&["status", "--name", "hand-made", "--json", "--no-probe"]);
     assert!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["record"].is_null());
 }
 

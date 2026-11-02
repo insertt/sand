@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use console::style;
+use serde::Serialize;
 
 use crate::args;
 use crate::harness::Profile;
@@ -19,7 +20,8 @@ use crate::mounts::MountSet;
 use crate::paths::RUNTIME_DIR_NAME;
 use crate::sbx::{Sbx, shell_quote};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApiState {
     Ok,
     /// The sandbox network policy rejected the request.
@@ -153,7 +155,7 @@ pub fn describe_api(api: ApiState, profile: &Profile) -> String {
     }
 }
 
-/// The status summary shown before the agent starts and by `sand status`.
+/// The status summary shown before the agent starts.
 pub fn banner(sandbox: &str, profile: &Profile, mounts: &MountSet, api: ApiState, mcp: &[McpStatus]) {
     let label = |text: &str| style(format!("{text:<8}")).dim().for_stderr();
     eprintln!();

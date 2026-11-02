@@ -17,7 +17,7 @@ use dialoguer::{MultiSelect, Select};
 
 use crate::acp;
 use crate::args;
-use crate::cli::{ConflictChoice, MountArgs, RunArgs, StatusArgs};
+use crate::cli::{ConflictChoice, MountArgs, RunArgs};
 use crate::config::{Config, StatuslineKind};
 use crate::harness::{self, Profile};
 use crate::lock;
@@ -1427,23 +1427,6 @@ pub fn find_sandbox(
         bail!("there is no sandbox named '{name}' (see `sbx ls`)");
     }
     Ok((name, harness))
-}
-
-/// `sand status`: the banner for an existing sandbox.
-pub fn status(args: StatusArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
-    let sbx = Sbx::connect(true)?;
-    let (name, harness) = find_sandbox(&sbx, &args.targets, args.name.as_deref(), args.scratch, dirs, config)?;
-    let (profile, mounts, servers) = match state::load(dirs, &name)? {
-        Some(state) => (Profile::resolve(&state.harness, config)?, state.mounts, state.mcp),
-        None => {
-            log::warn(format!("'{name}' was not created by sand; mounts and MCP servers are unknown"));
-            (Profile::resolve(&harness, config)?, MountSet::default(), Vec::new())
-        }
-    };
-    let mcp_status = mcp::status(&sbx, &servers);
-    let api = runtime::check_api(&sbx, &name, &profile);
-    runtime::banner(&name, &profile, &mounts, api, &mcp_status);
-    Ok(0)
 }
 
 /// Adds `mount` to a sandbox while its session runs, as `sand mount` does but

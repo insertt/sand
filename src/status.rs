@@ -1,5 +1,6 @@
-//! `sand describe`: everything sand recorded about a sandbox, plus what sbx
-//! says it is doing. Unlike `sand status` it probes nothing inside the sandbox.
+//! `sand status`: everything sand recorded about a sandbox, what sbx says it is
+//! doing, and (unless `--no-probe`) whether the agent API and the MCP servers
+//! can be reached right now.
 
 use std::path::{Path, PathBuf};
 
@@ -7,17 +8,20 @@ use anyhow::Result;
 use console::style;
 use serde::Serialize;
 
-use crate::cli::DescribeArgs;
+use crate::cli::StatusArgs;
 use crate::config::Config;
+use crate::harness::Profile;
 use crate::lock;
 use crate::log;
+use crate::mcp::{self, McpStatus};
 use crate::paths::Dirs;
+use crate::runtime::{self, ApiState};
 use crate::sbx::Sbx;
 use crate::session;
 use crate::state::{self, Kind, SandboxState};
 
 #[derive(Debug, Serialize)]
-struct Description {
+struct Status {
     name: String,
     /// As reported by `sbx ls --json` (running, stopped, …).
     sbx_state: Option<String>,
@@ -26,30 +30,64 @@ struct Description {
     data_dir: PathBuf,
     /// sand's record; `None` for a sandbox sand did not create.
     record: Option<SandboxState>,
+    /// The agent API probe; `None` when it was not run.
+    api: Option<ApiState>,
+    /// The recorded MCP servers as the gateway reports them; empty when not probed.
+    mcp: Vec<McpStatus>,
 }
 
-pub fn describe(args: DescribeArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
+/// Why the live checks did not run, if they did not.
+fn skip_reason(args: &StatusArgs, sbx_state: Option<&str>) -> Option<&'static str> {
+    if args.no_probe {
+        Some("not checked (--no-probe)")
+    } else if sbx_state.is_some_and(|s| s != "running") {
+        // `sbx exec` would start it; a status query should not.
+        Some("not checked (the sandbox is not running)")
+    } else {
+        None
+    }
+}
+
+pub fn status(args: StatusArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let sbx = Sbx::connect(true)?;
     let (name, harness) = session::find_sandbox(&sbx, &args.targets, args.name.as_deref(), args.scratch, dirs, config)?;
-    let description = Description {
-        sbx_state: sbx.sandbox_state(&name)?,
+    let record = state::load(dirs, &name)?;
+    let profile = Profile::resolve(record.as_ref().map_or(&harness, |r| &r.harness), config)?;
+    let sbx_state = sbx.sandbox_state(&name)?;
+    let skipped = skip_reason(&args, sbx_state.as_deref());
+
+    let api = skipped.is_none().then(|| runtime::check_api(&sbx, &name, &profile));
+    // The gateway runs on the host, so a stopped sandbox does not stop this one.
+    let mcp = match &record {
+        Some(r) if !args.no_probe => mcp::status(&sbx, &r.mcp),
+        _ => Vec::new(),
+    };
+    let status = Status {
+        sbx_state,
         session: lock::holder(dirs, &name),
         data_dir: dirs.sandbox_dir(&name),
-        record: state::load(dirs, &name)?,
+        record,
+        api,
+        mcp,
         name,
     };
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&description)?);
+        println!("{}", serde_json::to_string_pretty(&status)?);
         return Ok(0);
     }
-    if description.record.is_none() {
-        log::warn(format!("'{}' was not created by sand; only what sbx reports is known", description.name));
+    if status.record.is_none() {
+        log::warn(format!("'{}' was not created by sand; only what sbx reports is known", status.name));
     }
-    print(&description, &harness, state::now());
+    print(&status, &harness, &profile, skipped, state::now());
     Ok(0)
 }
 
-fn print(d: &Description, harness: &str, now: u64) {
+/// The banner helpers style for stderr; this prints to stdout.
+fn for_stdout(text: String) -> String {
+    if console::colors_enabled() { text } else { console::strip_ansi_codes(&text).into_owned() }
+}
+
+fn print(d: &Status, harness: &str, profile: &Profile, skipped: Option<&str>, now: u64) {
     let row = |label: &str, value: String| println!("  {} {value}", style(format!("{label:<9}")).dim());
     let rows = |label: &str, values: Vec<String>| {
         for (i, value) in values.into_iter().enumerate() {
@@ -60,8 +98,15 @@ fn print(d: &Description, harness: &str, now: u64) {
     row("sandbox", style(&d.name).cyan().bold().to_string());
     row("state", describe_sbx_state(d.sbx_state.as_deref()));
     row("session", d.session.clone().unwrap_or_else(|| "none attached".to_string()));
+    let api = || match (d.api, skipped) {
+        (Some(api), _) => for_stdout(runtime::describe_api(api, profile)),
+        (None, reason) => style(reason.unwrap_or("not checked")).dim().to_string(),
+    };
     match &d.record {
-        None => row("harness", format!("{harness} (assumed; not recorded)")),
+        None => {
+            row("harness", format!("{harness} (assumed; not recorded)"));
+            row("API", api());
+        }
         Some(r) => {
             let agent = if r.agent == r.harness { String::new() } else { format!(" (sbx agent {})", r.agent) };
             row("harness", format!("{}{agent}", r.harness));
@@ -75,7 +120,15 @@ fn print(d: &Description, harness: &str, now: u64) {
                 row("", format!("newer build {} declined", short_digest(digest)));
             }
             rows("mounts", r.mounts.describe());
-            row("MCP", if r.mcp.is_empty() { "none (gateway discovery)".to_string() } else { r.mcp.join(", ") });
+            let mcp = if !d.mcp.is_empty() {
+                for_stdout(runtime::describe_mcp(&d.mcp))
+            } else if r.mcp.is_empty() {
+                "none (gateway discovery)".to_string()
+            } else {
+                format!("{} {}", r.mcp.join(", "), style("(not checked)").dim())
+            };
+            row("API", api());
+            row("MCP", mcp);
             if !r.internal_mounts.is_empty() {
                 // Host directories under the data directory are shown relative to it.
                 let host = |h: &str| match Path::new(h).strip_prefix(&d.data_dir) {
