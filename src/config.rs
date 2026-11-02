@@ -19,6 +19,7 @@ const STARTER: &str = r#"# sand configuration. Everything is optional; the READM
 # default_harness = "claude"
 # nightly = true                       # create sandboxes from nightly harness images
 # tern_native = false                  # keep the agent's terminal UI in Tern
+# usage_limits = false                 # don't read the host's Claude login for the 5h/7d limits
 
 # [harness.claude]
 # template = "rust"
@@ -127,6 +128,10 @@ pub struct Config {
     /// Draw sessions natively in Tern when it can (default: true); false keeps
     /// the agent's terminal UI. `SAND_TERN_NATIVE` overrides it when set.
     pub tern_native: Option<bool>,
+    /// Show Claude subscription limits in Tern's native surface by asking
+    /// Anthropic from the host with the host's Claude login (default: true).
+    /// The token never enters the sandbox.
+    pub usage_limits: Option<bool>,
     /// Overrides for built-in harnesses and definitions of additional ones.
     #[serde(default)]
     pub harness: BTreeMap<String, HarnessOverride>,
@@ -282,6 +287,7 @@ mod tests {
             default_harness = "codex"
             nightly = true
             tern_native = false
+            usage_limits = false
 
             [harness.claude]
             template = "rust"
@@ -321,7 +327,7 @@ mod tests {
         assert_eq!(config.sandbox_home(), "/home/agent");
         assert_eq!(config.harness["claude"].template.as_deref(), Some("rust"));
         assert_eq!((config.nightly, config.harness["claude"].nightly), (Some(true), Some(false)));
-        assert_eq!(config.tern_native, Some(false));
+        assert_eq!((config.tern_native, config.usage_limits), (Some(false), Some(false)));
         assert_eq!(config.harness["aider"].statusline, Some(StatuslineKind::None));
         assert_eq!(config.templates["rust"].build_args["RUST"], "1.90");
         assert_eq!(config.mcp["pw"].args, vec!["@playwright/mcp@latest"]);

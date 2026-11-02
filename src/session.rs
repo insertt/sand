@@ -1220,6 +1220,14 @@ fn native_eligible(args: &RunArgs, profile: &Profile, config: &Config) -> bool {
     eligible
 }
 
+/// The host's Claude login, for the native surface to ask how much of the
+/// subscription's limits is spent. Only for Claude Code signed in through sbx:
+/// Vertex AI has no such limits. The login stays on the host.
+fn usage_credentials(profile: &Profile, dirs: &Dirs, config: &Config) -> Option<crate::usage::Credentials> {
+    let wanted = profile.name == "claude" && profile.vertex.is_none() && config.usage_limits.unwrap_or(true);
+    wanted.then(|| sync::host_config_dir(profile, &dirs.home)).flatten().map(|dir| crate::usage::Credentials::new(&dir))
+}
+
 /// What the native surface shows about the session before the sandbox is set up.
 fn native_info(req: &Request, dirs: &Dirs) -> native::Info {
     let profile = &req.profile;
@@ -1292,6 +1300,7 @@ fn attach_native(
                 state.map(|s| s.mounts.all().map(|m| m.path.clone()).collect()).unwrap_or_default()
             })
         },
+        usage: usage_credentials(profile, dirs, config),
     };
     let bridge = (hooks.is_some() || profile.network_prompts)
         .then(|| Bridge::start_with(sbx.clone(), dirs.clone(), state.name.clone(), hooks));
