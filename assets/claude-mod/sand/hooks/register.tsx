@@ -2,12 +2,12 @@
 // asks to mount a host directory (its request_mount tool), a row above the
 // prompt offers to allow it. The choice is only a request: sand, on the host,
 // confirms it in a native dialog the agent cannot answer, applies it and writes
-// back the result. The bridge directory is mounted from the host, one per
-// sandbox:
+// back the result. Two bridge directories are mounted from the host, one pair
+// per sandbox: requests go in the writable one, sand answers in the read-only one.
 //
-//   pending.json        sand: the sbx approvals waiting for this sandbox
-//   requests/<id>.json  this mod: { host, approval, option } or { kind: 'mount', path, mode, reason }
-//   results/<id>.json   sand: { ok, allowed, message }
+//   ~/.sand-requests/<id>.json        this mod: { host, approval, option } or { kind: 'mount', path, mode, reason }
+//   ~/.sand-policy/pending.json       sand: the sbx approvals waiting for this sandbox
+//   ~/.sand-policy/results/<id>.json  sand: { ok, allowed, message }
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
@@ -70,8 +70,10 @@ const isDenyOption = (o: { id: string; label: string }) => /deny|reject|block|de
 
 const hostsIn = (text: string, pattern: RegExp) => [...text.matchAll(pattern)].map(m => cleanHost(m[1] ?? ''))
 
-const bridgeDir = async ($: EngineInterface) =>
-  (await $.env.get('SAND_POLICY_DIR')) ?? `${(await $.env.get('HOME')) ?? '/home/agent'}/.sand-policy`
+const home = async ($: EngineInterface) => (await $.env.get('HOME')) ?? '/home/agent'
+const bridgeDir = async ($: EngineInterface) => (await $.env.get('SAND_POLICY_DIR')) ?? `${await home($)}/.sand-policy`
+const requestsDir = async ($: EngineInterface) =>
+  (await $.env.get('SAND_REQUESTS_DIR')) ?? `${await home($)}/.sand-requests`
 
 const readJson = async <T,>($: EngineInterface, path: string): Promise<T | undefined> => {
   const text = await $.fs.read(path).catch(() => undefined)
@@ -119,7 +121,7 @@ const choose = async ($: EngineInterface, block: Block, choice: Choice) => {
     ? { kind: 'mount', path: block.host, mode: choice.id, reason: block.mount.reason ?? null }
     : { host: block.host, approval: block.approval ?? null, option: block.approval ? choice.id : null }
   try {
-    await $.fs.write(`${await bridgeDir($)}/requests/${block.id}.json`, JSON.stringify(request))
+    await $.fs.write(`${await requestsDir($)}/${block.id}.json`, JSON.stringify(request))
   } catch (err) {
     $.ui.toast(`Could not ask sand to change the policy: ${String(err)}`)
     return

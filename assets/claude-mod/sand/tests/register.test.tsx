@@ -7,6 +7,7 @@ const BAND = {
   props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: 100, scroll: { offset: 0, bodyRows: 20 }, view: {} },
 } as const
 const DIR = '/home/agent/.sand-policy'
+const REQUESTS = '/home/agent/.sand-requests'
 const BLOCKED = 'Blocked by network policy: domain example.com:443\n  detail: no matching allow rule'
 
 /** The bridge directory as files in memory; what the mod writes lands there too. */
@@ -49,8 +50,8 @@ test('a blocked host gets a row, the model is told to wait, and Allow asks sand'
   await ui.press({ key: allow?.key as string })
 
   expect(notes).toEqual(['claude-proj is blocked from reaching example.com:443. Answer in Claude Code.'])
-  const [path, request] = Object.entries(files).find(([p]) => p.includes('/requests/')) ?? []
-  expect(path).toMatch(new RegExp(`^${DIR}/requests/[0-9a-f-]+\\.json$`))
+  const [path, request] = Object.entries(files).find(([p]) => p.startsWith(`${REQUESTS}/`)) ?? []
+  expect(path).toMatch(new RegExp(`^${REQUESTS}/[0-9a-f-]+\\.json$`))
   expect(JSON.parse(request as string)).toEqual({ host: 'example.com:443', approval: null, option: null })
   expect(await ui.find({ type: 'Text', text: /confirm on the host/ })).toBeDefined()
   await ui.unmount()
@@ -67,7 +68,7 @@ test('a host an earlier refusal blocks can be allowed again', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /deny rule/ })).toBeDefined()
   const lift = (await ui.findAll({ type: 'Button' })).find(b => b.props.label === 'Lift the deny rule and allow')
   await ui.press({ key: lift?.key as string })
-  const request = Object.entries(files).find(([p]) => p.includes('/requests/'))?.[1]
+  const request = Object.entries(files).find(([p]) => p.startsWith(`${REQUESTS}/`))?.[1]
   expect(JSON.parse(request as string)).toEqual({ host: 'example.com:443', approval: null, option: null })
   await ui.unmount()
 })
@@ -90,7 +91,7 @@ test('an sbx approval offers its own options, and a result clears the row and te
   const once = (await ui.findAll({ type: 'Button' })).find(b => b.props.label === 'Allow once')
   await ui.press({ key: once?.key as string })
 
-  const [path, request] = Object.entries(files).find(([p]) => p.includes('/requests/')) ?? []
+  const [path, request] = Object.entries(files).find(([p]) => p.startsWith(`${REQUESTS}/`)) ?? []
   expect(JSON.parse(request as string)).toEqual({ host: 'pypi.org', approval: 'ap-1', option: 'once' })
   const id = (path as string).split('/').pop()
   files[`${DIR}/results/${id}`] = JSON.stringify({ ok: true, allowed: true, message: 'pypi.org allowed' })
@@ -131,7 +132,7 @@ test('the agent asks to mount a directory, the user picks read-only, and the res
   expect(buttons.map(b => b.props.label)).toEqual(['Mount read-only', 'Mount read-write', 'Dismiss'])
   await ui.press({ key: buttons[0]?.key as string })
 
-  const [path, request] = Object.entries(files).find(([p]) => p.includes('/requests/')) ?? []
+  const [path, request] = Object.entries(files).find(([p]) => p.startsWith(`${REQUESTS}/`)) ?? []
   expect(JSON.parse(request as string)).toEqual({ kind: 'mount', path: '~/notes', mode: 'ro', reason: 'the user asked' })
   const id = (path as string).split('/').pop()
   files[`${DIR}/results/${id}`] = JSON.stringify({

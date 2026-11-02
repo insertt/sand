@@ -8,12 +8,12 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use console::Term;
-use dialoguer::Select;
+use dialoguer::{MultiSelect, Select};
 
 use crate::acp;
 use crate::args;
@@ -24,8 +24,9 @@ use crate::lock;
 use crate::log;
 use crate::mcp;
 use crate::mounts::{self, Mode, Mount, MountSet, Plan, Strategy};
+use crate::native;
 use crate::network::{self, Bridge};
-use crate::paths::{Dirs, POLICY_DIR_NAME, RUNTIME_DIR_NAME, container_path};
+use crate::paths::{Dirs, POLICY_DIR_NAME, REQUESTS_DIR_NAME, RUNTIME_DIR_NAME, container_path};
 use crate::registry;
 use crate::runtime::{self, ApiState, Refresher};
 use crate::sbx::{KeepAlive, Sbx, shell_quote};
@@ -157,14 +158,22 @@ fn ask(
         log::info("ACP mode cannot ask; merging (existing mounts are kept, missing ones are added)");
         return Ok(ConflictChoice::Merge);
     }
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    let labels: Vec<&str> = items.iter().map(|(_, label)| label.as_str()).collect();
+    if !native::active() && (!std::io::stdin().is_terminal() || !std::io::stderr().is_terminal()) {
         bail!(
             "{question}\nThis needs a decision but there is no terminal to ask on; pass --on-conflict replace|merge|abort."
         );
     }
-    let labels: Vec<&str> = items.iter().map(|(_, label)| label.as_str()).collect();
-    let picked = Select::new().with_prompt(question).items(&labels).default(0).interact_on_opt(&Term::stderr())?;
-    Ok(picked.map_or(ConflictChoice::Abort, |i| items[i].0))
+    Ok(select(question, &labels)?.map_or(ConflictChoice::Abort, |i| items[i].0))
+}
+
+/// Asks the person to pick one of `labels`, on the native surface when one
+/// shows the session, else on the terminal; `None` when they abort.
+fn select(question: &str, labels: &[&str]) -> Result<Option<usize>> {
+    if let Some(answer) = native::ask(question, labels) {
+        return Ok(answer);
+    }
+    Ok(Select::new().with_prompt(question).items(labels).default(0).interact_on_opt(&Term::stderr())?)
 }
 
 fn show_set(title: &str, set: &MountSet) {
@@ -295,7 +304,7 @@ fn nightly_update(req: &Request, dirs: &Dirs, current: &mut SandboxState, args: 
     } else if current.declined_digest.as_deref() == Some(latest.as_str()) {
         log::info(format!("{found}; you chose to keep the sandbox ({hint})"));
         return keep;
-    } else if args.acp || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    } else if args.acp || !native::active() && (!std::io::stdin().is_terminal() || !std::io::stderr().is_terminal()) {
         log::warn(format!("{found}; keeping the sandbox because there is no terminal to ask on ({hint})"));
         return keep;
     } else {
@@ -310,12 +319,7 @@ fn nightly_update(req: &Request, dirs: &Dirs, current: &mut SandboxState, args: 
             (ConflictChoice::Abort, "Abort — leave everything as it is"),
         ];
         let labels: Vec<&str> = items.iter().map(|(_, label)| *label).collect();
-        let picked = Select::new()
-            .with_prompt("How do you want to continue?")
-            .items(&labels)
-            .default(0)
-            .interact_on_opt(&Term::stderr())?;
-        picked.map_or(ConflictChoice::Abort, |i| items[i].0)
+        select("How do you want to continue?", &labels)?.map_or(ConflictChoice::Abort, |i| items[i].0)
     };
     if choice == ConflictChoice::Merge {
         current.declined_digest = Some(latest);
@@ -345,6 +349,101 @@ fn reconcile_unmanaged(req: &Request, args: &RunArgs) -> Result<Decision> {
             })
         }
     }
+}
+
+/// What `--recreate` can carry over to the new sandbox, beyond the command line.
+#[derive(Debug, PartialEq)]
+enum Keep {
+    History,
+    /// Extra mounts the sandbox has and the command line does not name.
+    Mounts(Vec<Mount>),
+    /// MCP servers the sandbox has and the command line does not name.
+    Mcp(Vec<String>),
+}
+
+impl Keep {
+    fn label(&self) -> String {
+        match self {
+            Keep::History => "conversation history".to_string(),
+            Keep::Mounts(mounts) => {
+                format!("mounts: {}", mounts.iter().map(Mount::to_string).collect::<Vec<_>>().join(", "))
+            }
+            Keep::Mcp(servers) => format!("MCP servers: {}", servers.join(", ")),
+        }
+    }
+}
+
+/// What there is to keep when recreating `current` for `req`; only what the
+/// command line does not already ask for.
+fn keepable(req: &Request, current: Option<&SandboxState>, has_history: bool) -> Vec<Keep> {
+    let mut offered = Vec::new();
+    if has_history {
+        offered.push(Keep::History);
+    }
+    let Some(state) = current else { return offered };
+    let mounts: Vec<Mount> =
+        state.mounts.extras.iter().filter(|m| req.mounts.all().all(|r| r.path != m.path)).cloned().collect();
+    if !mounts.is_empty() {
+        offered.push(Keep::Mounts(mounts));
+    }
+    let servers: Vec<String> = state.mcp.iter().filter(|m| !req.mcp.contains(m)).cloned().collect();
+    if !servers.is_empty() {
+        offered.push(Keep::Mcp(servers));
+    }
+    offered
+}
+
+/// Asks which of `offered` to keep, all of it by default; `None` when the person aborts.
+fn choose_kept(name: &str, offered: Vec<Keep>, acp: bool) -> Result<Option<Vec<Keep>>> {
+    if offered.is_empty() {
+        return Ok(Some(offered));
+    }
+    let labels: Vec<String> = offered.iter().map(Keep::label).collect();
+    let picked: Vec<bool> = if native::active() {
+        // The surface asks one question at a time.
+        let mut picked = Vec::new();
+        for label in &labels {
+            match select(&format!("Recreating '{name}': keep its {label}?"), &["Keep", "Drop"])? {
+                Some(answer) => picked.push(answer == 0),
+                None => return Ok(None),
+            }
+        }
+        picked
+    } else if acp || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(
+            "--recreate asks what to keep of '{name}' ({}), but there is no terminal to ask on; \
+             pass --force-recreate to recreate it from the command line alone",
+            labels.join("; ")
+        );
+    } else {
+        let Some(chosen) = MultiSelect::new()
+            .with_prompt(format!("Recreating '{name}': keep (space toggles, enter confirms)"))
+            .items(&labels)
+            .defaults(&vec![true; labels.len()])
+            .interact_on_opt(&Term::stderr())?
+        else {
+            return Ok(None);
+        };
+        (0..labels.len()).map(|i| chosen.contains(&i)).collect()
+    };
+    let mut kept = Vec::new();
+    for (keep, keep_it) in offered.into_iter().zip(picked) {
+        log::info(format!("{} {}", if keep_it { "keeping" } else { "dropping" }, keep.label()));
+        if keep_it {
+            kept.push(keep);
+        }
+    }
+    Ok(Some(kept))
+}
+
+/// Whether there is any file below `dir`.
+fn has_files(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    entries.flatten().any(|e| match e.file_type() {
+        Ok(t) if t.is_dir() => has_files(&e.path()),
+        Ok(_) => true,
+        Err(_) => false,
+    })
 }
 
 fn remove_sandbox(sbx: &Sbx, dirs: &Dirs, name: &str, keep_history: bool) -> Result<()> {
@@ -575,7 +674,8 @@ fn ensure_internal_mounts(
     let runtime = dirs.runtime_dir(&state.name);
     let mut wanted = vec![(runtime, format!("{home}/{RUNTIME_DIR_NAME}"), Mode::Ro)];
     if profile.network_prompts {
-        wanted.push((dirs.policy_dir(&state.name), format!("{home}/{POLICY_DIR_NAME}"), Mode::Rw));
+        wanted.push((dirs.policy_dir(&state.name), format!("{home}/{POLICY_DIR_NAME}"), Mode::Ro));
+        wanted.push((dirs.requests_dir(&state.name), format!("{home}/{REQUESTS_DIR_NAME}"), Mode::Rw));
     }
     if state.kind != Kind::Dedicated {
         for rel in &profile.history {
@@ -600,7 +700,7 @@ fn ensure_internal_mounts(
     let targets = missing.iter().map(|m| shell_quote(&m.target)).collect::<Vec<_>>().join(" ");
     sbx.exec_sh(&state.name, &format!("mkdir -p {targets}"))?;
     for mount in missing {
-        let what = if mount.target.ends_with(POLICY_DIR_NAME) {
+        let what = if mount.target.ends_with(POLICY_DIR_NAME) || mount.target.ends_with(REQUESTS_DIR_NAME) {
             "network prompts"
         } else if mount.mode == Mode::Ro {
             "status"
@@ -716,7 +816,14 @@ struct TernHandoff {
 /// directory, so only a session that picks the same sandbox is handed over.
 /// Questions are asked and changes the command line asks for are made here
 /// first; the ACP session keeps the sandbox's mounts and MCP servers.
-fn tern_handoff(args: &RunArgs, req: &Request, dirs: &Dirs, config: &Config, cwd: &Path) -> Option<TernHandoff> {
+fn tern_handoff(
+    args: &RunArgs,
+    req: &Request,
+    dirs: &Dirs,
+    config: &Config,
+    cwd: &Path,
+    native: bool,
+) -> Option<TernHandoff> {
     let tern = crate::tern::acp_executable(|name| env::var(name).ok())?;
     if args.acp || args.no_attach || req.profile.acp_command.is_empty() {
         return None;
@@ -727,7 +834,7 @@ fn tern_handoff(args: &RunArgs, req: &Request, dirs: &Dirs, config: &Config, cwd
     let settings = crate::tern::settings_path(dirs).ok().and_then(|p| fs::read_to_string(p).ok()).unwrap_or_default();
     let default_harness = req.profile.name == config.default_harness();
     let Some(agent) = crate::tern::find_agent(&settings, &req.profile.name, default_harness) else {
-        if !crate::tern::has_sand_agent(&settings) {
+        if !native && !crate::tern::has_sand_agent(&settings) {
             log::info(format!(
                 "in Tern, `sand {} --install-acp tern` opens sessions in Tern's chat instead",
                 req.profile.name
@@ -810,7 +917,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
 
     let mut req = build_request(&args, dirs, config, harness, specs)?;
     warn_exposing(dirs, req.mounts.all());
-    let handoff = tern_handoff(&args, &req, dirs, config, &cwd);
+    let native = native_eligible(&args, &req.profile, config);
+    let handoff = tern_handoff(&args, &req, dirs, config, &cwd, native);
     let profile = &req.profile;
 
     // Before sbx lists the sandboxes, so that what it lists stays true.
@@ -829,6 +937,8 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     }
 
     let (sbx, listed) = Sbx::connect_listing(!args.acp)?;
+    // From here on, a Tern pane shows setup natively; sbx no longer gets the terminal then.
+    let sbx = if native && native::start(native_info(&req, dirs)) { sbx.quiet() } else { sbx };
     log::step(format!("sand: {} in sandbox '{}'", profile.name, req.name));
     if profile.is_basic() {
         log::info(format!(
@@ -870,12 +980,32 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         };
         bail!("nothing to resume: there is no sandbox named '{}'. Run without --resume to create it{hint}.", req.name);
     }
-    if args.recreate && exists {
-        remove_sandbox(&sbx, dirs, &req.name, !args.no_preserve_history)?;
+    if args.force_recreate || args.recreate {
+        let kept = if args.recreate {
+            let offered = keepable(&req, current.as_ref(), has_files(&dirs.history_dir(&req.name)));
+            let Some(kept) = choose_kept(&req.name, offered, args.acp)? else {
+                log::info("aborted; nothing was changed");
+                return Ok(1);
+            };
+            kept
+        } else {
+            Vec::new()
+        };
+        let mut keep_history = false;
+        for keep in kept {
+            match keep {
+                Keep::History => keep_history = true,
+                Keep::Mounts(extras) => req.mounts.extras.extend(extras),
+                Keep::Mcp(servers) => req.mcp.extend(servers),
+            }
+        }
+        if exists {
+            remove_sandbox(&sbx, dirs, &req.name, keep_history)?;
+        } else if !keep_history {
+            state::forget(dirs, &req.name, false)?;
+        }
         exists = false;
         current = None;
-    } else if args.recreate && args.no_preserve_history {
-        state::forget(dirs, &req.name, false)?;
     }
 
     // ACP mode cannot ask about a newer image, so it does not look for one.
@@ -943,7 +1073,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     };
     // ACP mode has no terminal to authorize on.
     if !args.acp {
-        let can_prompt = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        let can_prompt = std::io::stdin().is_terminal() && std::io::stderr().is_terminal() && !native::active();
         mcp::ensure_authorized(&sbx, &used_mcp, can_prompt)?;
     }
 
@@ -1033,12 +1163,18 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     let mcp_status = mcp::status(&sbx, &state.mcp);
     runtime::write_mcp_status(&runtime_dir, &mcp_status)?;
     let api = if args.acp { ApiState::Skipped } else { runtime::check_api(&sbx, &state.name, profile) };
-    runtime::banner(&state.name, profile, &state.mounts, api, &mcp_status);
+    if native::active() {
+        native::update(native::Update::Mounts(state.mounts.describe()));
+        native::update(native::Update::Api(api));
+        native::update(native::Update::Mcp(mcp_status.clone()));
+    } else {
+        runtime::banner(&state.name, profile, &state.mounts, api, &mcp_status);
+    }
     if args.no_attach {
         log::ok(format!("sandbox '{}' is ready; `sand {} --resume` attaches to it", state.name, profile.name));
         return Ok(0);
     }
-    if profile.statusline != StatuslineKind::Claude && !args.acp {
+    if profile.statusline != StatuslineKind::Claude && !args.acp && !native::active() {
         let shows = match profile.statusline {
             StatuslineKind::Codex => "status line shows model, branch, context and limits, but not the sandbox",
             _ => "cannot run a custom status line",
@@ -1050,16 +1186,137 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     }
 
     // --- hand over to the agent -------------------------------------------------
-    if let Some(handoff) = handoff {
+    let code = if native::active() {
+        attach_native(&sbx, dirs, config, profile, &state, keep_alive)?
+    } else if let Some(handoff) = handoff {
         return open_in_tern(handoff, dirs, profile, &state, lock, keep_alive);
-    }
-    let status = attach(&sbx, dirs, &args, profile, &state, Some(keep_alive))?;
+    } else {
+        attach(&sbx, dirs, &args, profile, &state, Some(keep_alive))?.code().unwrap_or(1)
+    };
     if disposal.is_some() {
         drop(disposal);
     } else {
         log::info(format!("sandbox '{}' is kept; `sand {} --resume` attaches to it again", state.name, profile.name));
     }
-    Ok(status.code().unwrap_or(1))
+    Ok(code)
+}
+
+/// Whether the session may be drawn natively in Tern, should the terminal
+/// turn out to speak the Tern Surface Protocol.
+fn native_eligible(args: &RunArgs, profile: &Profile, config: &Config) -> bool {
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let eligible = tty
+        && native::eligible(args.acp, args.no_attach, profile, &args.agent_args, config.tern_native.unwrap_or(true));
+    if tty && !eligible && !args.agent_args.is_empty() && env::var("TERM_PROGRAM").is_ok_and(|t| t == "tern") {
+        log::info("opening the terminal UI: Tern draws sessions natively only without agent arguments");
+    }
+    eligible
+}
+
+/// What the native surface shows about the session before the sandbox is set up.
+fn native_info(req: &Request, dirs: &Dirs) -> native::Info {
+    let profile = &req.profile;
+    let (model, effort) = sync::host_model(profile, &dirs.home);
+    let api_host = profile.api_check_url.as_deref().map(|url| {
+        let rest = url.split("//").nth(1).unwrap_or(url);
+        rest.split('/').next().unwrap_or(rest).to_string()
+    });
+    native::Info {
+        harness: profile.name.clone(),
+        product: crate::tern::product_name(&profile.name).to_string(),
+        sandbox: req.name.clone(),
+        workspace: req.mounts.primary.as_ref().map(|m| tilde(&m.path, &dirs.home)),
+        mounts: req.mounts.describe(),
+        mcp: req.mcp.iter().map(|name| mcp::McpStatus { name: name.clone(), state: mcp::McpState::Unknown }).collect(),
+        api: None,
+        api_host,
+        branch: None,
+        model,
+        effort,
+    }
+}
+
+fn tilde(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Runs the chat on the native surface that showed setup: sand starts the
+/// agent's ACP server and is its client. `keep_alive` is let go once it ends.
+fn attach_native(
+    sbx: &Sbx,
+    dirs: &Dirs,
+    config: &Config,
+    profile: &Profile,
+    state: &SandboxState,
+    keep_alive: KeepAlive,
+) -> Result<i32> {
+    log::step(format!("Starting {}", crate::tern::product_name(&profile.name)));
+    // Mounts and hosts the agent asks for, and sbx's network approvals, show in the pane.
+    let hooks = native::bridge_hooks();
+    let spec = native::ChatSpec {
+        sbx: sbx.clone(),
+        launch: acp_launch(profile, state),
+        log: dirs.runtime_dir(&state.name).join("acp-agent.log"),
+        paths: acp::PathMap::new(&state.mounts),
+        cwd: state
+            .mounts
+            .primary
+            .as_ref()
+            .map(|m| container_path(&m.path.to_string_lossy()))
+            .unwrap_or_else(|| config.sandbox_home().to_string()),
+        profile: profile.clone(),
+        sandbox: state.name.clone(),
+        mcp: state.mcp.clone(),
+        servers: if profile.network_prompts {
+            serde_json::json!([network::mcp_server(config.sandbox_home())])
+        } else {
+            serde_json::json!([])
+        },
+        workspace: state.mounts.primary.as_ref().map(|m| m.path.clone()),
+        mounts: {
+            let (dirs, name) = (dirs.clone(), state.name.clone());
+            Arc::new(move || {
+                let state = state::load(&dirs, &name).ok().flatten();
+                state.map(|s| s.mounts.all().map(|m| m.path.clone()).collect()).unwrap_or_default()
+            })
+        },
+    };
+    let bridge = (hooks.is_some() || profile.network_prompts)
+        .then(|| Bridge::start_with(sbx.clone(), dirs.clone(), state.name.clone(), hooks));
+    IN_SESSION.store(true, Ordering::SeqCst);
+    let code = native::chat(spec).unwrap_or_else(|| Err(anyhow::anyhow!("the native session is gone")));
+    IN_SESSION.store(false, Ordering::SeqCst);
+    let summary = bridge.map(Bridge::finish).unwrap_or_default();
+    drop(keep_alive);
+    let code = code?;
+    log_summary(&summary);
+    log::step(format!("Session ended (exit code {code})"));
+    Ok(code)
+}
+
+/// `sbx exec` of the harness's ACP server, in the primary workspace.
+fn acp_launch(profile: &Profile, state: &SandboxState) -> Vec<OsString> {
+    let command = profile.acp_command.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ");
+    let mut cmd = args!["exec", "-i"];
+    if let Some(primary) = &state.mounts.primary {
+        cmd.extend(args!["--workdir", container_path(&primary.path.to_string_lossy())]);
+    }
+    let env = vertex_env(profile, &state.name).map(|pair| format!("{} ", shell_quote(&pair))).unwrap_or_default();
+    cmd.extend(args![&state.name, "bash", "-lc", format!("{env}exec {command}")]);
+    cmd
+}
+
+fn log_summary(summary: &network::Summary) {
+    if !summary.allowed.is_empty() {
+        log::info(format!("allowed during the session, for this sandbox: {}", summary.allowed.join(", ")));
+    }
+    if !summary.mounted.is_empty() {
+        log::info(format!("mounted during the session: {}", summary.mounted.join(", ")));
+    }
 }
 
 /// Starts the agent (its terminal UI, or its ACP server in ACP mode) and
@@ -1082,13 +1339,7 @@ fn attach(
         }
         let command = profile.acp_command.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ");
         log::step(format!("Starting ACP agent: {command}"));
-        let mut cmd = args!["exec", "-i"];
-        if let Some(primary) = &state.mounts.primary {
-            cmd.extend(args!["--workdir", container_path(&primary.path.to_string_lossy())]);
-        }
-        let env = vertex_env(profile, &state.name).map(|pair| format!("{} ", shell_quote(&pair))).unwrap_or_default();
-        cmd.extend(args![&state.name, "bash", "-lc", format!("{env}exec {command}")]);
-        cmd
+        acp_launch(profile, state)
     } else {
         log::step(format!("Starting {} (bypass permissions)", profile.name));
         let mut cmd = args!["run", "--name", &state.name];
@@ -1128,12 +1379,7 @@ fn attach(
     let summary = bridge.map(Bridge::finish).unwrap_or_default();
     drop(keep_alive);
     let status = status?;
-    if !summary.allowed.is_empty() {
-        log::info(format!("allowed during the session, for this sandbox: {}", summary.allowed.join(", ")));
-    }
-    if !summary.mounted.is_empty() {
-        log::info(format!("mounted during the session: {}", summary.mounted.join(", ")));
-    }
+    log_summary(&summary);
     log::step(format!("Session ended ({status})"));
     Ok(status)
 }
@@ -1301,6 +1547,57 @@ mod tests {
         assert_eq!(split(&["./codex"]), (None, s(&["./codex"])));
         assert_eq!(split(&["my-kit", "."]), (Some("my-kit".into()), s(&["."])));
         assert_eq!(split(&["../missing"]), (None, s(&["../missing"])));
+    }
+
+    #[test]
+    fn recreate_offers_only_what_the_command_line_leaves_out() {
+        let mount = |path: &str, mode| Mount { path: path.into(), mode };
+        let req = Request {
+            profile: Profile::resolve("codex", &Config::default()).unwrap(),
+            name: "codex-proj".into(),
+            kind: Kind::Project,
+            mounts: MountSet { primary: Some(mount("/p", Mode::Rw)), extras: vec![mount("/lib", Mode::Rw)] },
+            explicit_mounts: true,
+            mcp: vec!["gitlab".into()],
+            template: None,
+        };
+        let mut state = SandboxState {
+            name: "codex-proj".into(),
+            harness: "codex".into(),
+            agent: "codex".into(),
+            kind: Kind::Project,
+            mounts: MountSet {
+                primary: Some(mount("/p", Mode::Rw)),
+                extras: vec![mount("/lib", Mode::Ro), mount("/docs", Mode::Ro)],
+            },
+            mcp: vec!["gitlab".into(), "atlassian".into()],
+            template: None,
+            image_digest: None,
+            declined_digest: None,
+            internal_mounts: vec![],
+            vertex_secret: None,
+            created_at: 0,
+        };
+        assert_eq!(
+            keepable(&req, Some(&state), true),
+            [Keep::History, Keep::Mounts(vec![mount("/docs", Mode::Ro)]), Keep::Mcp(vec!["atlassian".into()])]
+        );
+        assert_eq!(Keep::Mounts(vec![mount("/docs", Mode::Ro)]).label(), "mounts: /docs (ro)");
+        // A sandbox sand did not create has only its history to keep.
+        assert_eq!(keepable(&req, None, true), [Keep::History]);
+        state.mounts.extras.truncate(1);
+        state.mcp.truncate(1);
+        assert!(keepable(&req, Some(&state), false).is_empty());
+    }
+
+    #[test]
+    fn history_counts_when_it_holds_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        assert!(!has_files(dir.path()));
+        fs::write(dir.path().join("a/b/s.jsonl"), "").unwrap();
+        assert!(has_files(dir.path()));
+        assert!(!has_files(&dir.path().join("missing")));
     }
 
     #[test]

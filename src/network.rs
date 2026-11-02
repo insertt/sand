@@ -5,15 +5,17 @@
 //! in a native dialog on the host, which the agent cannot click, before it
 //! changes the policy with sbx.
 //!
-//! Requests and answers go through a directory per sandbox, mounted read-write
-//! at `~/.sand-policy` in that sandbox alone, so the sandbox a request came from
-//! is the directory it appeared in, never anything the request says:
+//! Requests and answers go through two directories per sandbox, mounted in
+//! that sandbox alone, so the sandbox a request came from is the directory it
+//! appeared in, never anything the request says. The agent can write only the
+//! first, the root of its mount, where sand reads files and removes entries
+//! without following links; what sand writes is in the second, read-only to it:
 //!
 //! ```text
-//! pending.json        sand: the sbx approvals waiting for this sandbox
-//! requests/<id>.json  the mod: {"host": ..., "approval": ..., "option": ...},
-//!                     or {"kind": "mount", "path": ..., "mode": ..., "reason": ...}
-//! results/<id>.json   sand: {"ok": ..., "allowed": ..., "message": ...}
+//! ~/.sand-requests/<id>.json      the mod: {"host": ..., "approval": ..., "option": ...},
+//!                                 or {"kind": "mount", "path": ..., "mode": ..., "reason": ...}
+//! ~/.sand-policy/pending.json     sand: the sbx approvals waiting for this sandbox
+//! ~/.sand-policy/results/<id>.json  sand: {"ok": ..., "allowed": ..., "message": ...}
 //! ```
 
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -32,7 +35,7 @@ use serde_json::{Value, json};
 
 use crate::args;
 use crate::mounts::{self, Mode, Mount, MountSet};
-use crate::paths::{Dirs, POLICY_DIR_NAME, container_path};
+use crate::paths::{Dirs, POLICY_DIR_NAME, REQUESTS_DIR_NAME, container_path};
 use crate::sbx::Sbx;
 use crate::session;
 
@@ -47,9 +50,33 @@ const MOD_FILES: &[(&str, &str)] = &[
     ("types/index.d.ts", include_str!("../assets/claude-mod/sand/types/index.d.ts")),
 ];
 
-/// The mod's files as the sandbox gets them: paths relative to the sandbox home.
+/// Where the MCP server that gives an ACP agent `request_mount` is copied,
+/// relative to the sandbox home: the mod gives it to Claude Code's own UI,
+/// which a session sand draws itself does not run.
+pub const MCP_SERVER: &str = ".local/share/sand/mcp/sand.mjs";
+
+/// The mod's files, and the MCP server's, as the sandbox gets them: paths
+/// relative to the sandbox home.
 pub fn mod_files() -> Vec<(String, &'static str)> {
-    MOD_FILES.iter().map(|(rel, content)| (format!("{MOD_DIR}/{rel}"), *content)).collect()
+    let mut files: Vec<(String, &'static str)> =
+        MOD_FILES.iter().map(|(rel, content)| (format!("{MOD_DIR}/{rel}"), *content)).collect();
+    files.push((MCP_SERVER.to_string(), include_str!("../assets/mcp/sand.mjs")));
+    files
+}
+
+/// The MCP server, as ACP's `session/new` takes it: run by the agent in the
+/// sandbox, with the bridge directory it files requests in.
+pub fn mcp_server(sandbox_home: &str) -> Value {
+    json!({
+        // Not `sand`: the mod's hooks claim `mcp__sand__request_mount`, should anything load it.
+        "name": "sand-acp",
+        "command": "node",
+        "args": [format!("{sandbox_home}/{MCP_SERVER}")],
+        "env": [
+            {"name": "SAND_POLICY_DIR", "value": format!("{sandbox_home}/{POLICY_DIR_NAME}")},
+            {"name": "SAND_REQUESTS_DIR", "value": format!("{sandbox_home}/{REQUESTS_DIR_NAME}")},
+        ],
+    })
 }
 
 /// Settings that make the extra mounts working directories of Claude Code, so
@@ -68,6 +95,7 @@ pub fn settings(sandbox_home: &str) -> Value {
         "env": {
             "CLAUDE_CODE_PLUGIN_DIRS": format!("{sandbox_home}/{MOD_DIR}"),
             "SAND_POLICY_DIR": format!("{sandbox_home}/{POLICY_DIR_NAME}"),
+            "SAND_REQUESTS_DIR": format!("{sandbox_home}/{REQUESTS_DIR_NAME}"),
         },
     })
 }
@@ -119,11 +147,11 @@ struct Request {
     reason: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
-struct Outcome {
-    ok: bool,
-    allowed: bool,
-    message: String,
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Outcome {
+    pub ok: bool,
+    pub allowed: bool,
+    pub message: String,
 }
 
 impl Outcome {
@@ -145,6 +173,44 @@ pub enum Answer {
     Deny,
     /// No dialog could be shown, and why.
     Unavailable(String),
+}
+
+/// What the network policy blocked, as the proxy's 403 bodies say it.
+#[derive(Debug, Default, PartialEq)]
+pub struct Blocks {
+    /// Hosts no rule allows, or held for an approval.
+    pub hosts: Vec<String>,
+    /// Hosts a local deny rule blocks (an earlier refusal).
+    pub ruled: Vec<String>,
+    /// The organization's policy blocked something; nothing to ask about.
+    pub org: bool,
+}
+
+/// The blocks a tool's output reports, each host once, plain and lowercase.
+pub fn blocks_in(text: &str) -> Blocks {
+    fn hosts(text: &str, marker: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for (at, _) in text.match_indices(marker) {
+            let rest = &text[at + marker.len()..];
+            let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || ".-:".contains(c))).unwrap_or(rest.len());
+            // A sentence ending right after the host ("...for example.com.") keeps its period.
+            let host = rest[..end].trim_end_matches(['.', ':']).to_ascii_lowercase();
+            if valid_host(&host) && !found.contains(&host) {
+                found.push(host);
+            }
+        }
+        found
+    }
+    let ruled = hosts(text, "Blocked by local rule for ");
+    let mut open = Vec::new();
+    for host in
+        hosts(text, "Approval required for ").into_iter().chain(hosts(text, "Blocked by network policy: domain "))
+    {
+        if !ruled.contains(&host) && !open.contains(&host) {
+            open.push(host);
+        }
+    }
+    Blocks { hosts: open, ruled, org: text.contains("Blocked by org policy") }
 }
 
 /// Whether `host` is one plain host, as the policy log writes them: a name
@@ -170,7 +236,7 @@ fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-fn is_deny(choice: &Choice) -> bool {
+pub fn is_deny(choice: &Choice) -> bool {
     let text = format!("{} {}", choice.id, choice.label).to_ascii_lowercase();
     ["deny", "reject", "block", "decline"].iter().any(|word| text.contains(word))
 }
@@ -329,6 +395,50 @@ pub struct Summary {
 /// Mounts a directory into the running sandbox; answers whether anything changed.
 type Mounter = Box<dyn Fn(&Mount) -> anyhow::Result<bool> + Send>;
 
+/// Whether sbx logged a host blocked for the sandbox.
+type Seen = Box<dyn Fn(&str) -> anyhow::Result<bool> + Send>;
+
+/// Asks the person on the host whether to allow something.
+pub type Confirm = Box<dyn Fn(&str) -> Answer + Send>;
+
+/// Told the approvals sbx has pending for the sandbox, whenever they change.
+pub type Watch = Box<dyn Fn(&[Approval]) + Send>;
+
+/// What an outcome answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// Network access to a host (empty when the approval was gone).
+    Host(String),
+    /// A host directory the agent asked to mount, as it wrote it.
+    Mount(String),
+}
+
+/// Told how an answer given in the session's own UI, or a mount the agent
+/// asked for, turned out.
+pub type Told = Box<dyn Fn(&Asked, &Outcome) + Send>;
+
+/// What the person chose in a UI the agent cannot reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// An option of one of sbx's approvals (approval id, option id).
+    Approval(String, String),
+    /// A host the policy blocked without an approval, allowed for this sandbox.
+    Allow(String),
+    /// A host directory to mount (`DIR`, `DIR:ro` or `DIR:rw`), asked for by the person.
+    Mount(String),
+}
+
+/// How a session that draws its own UI takes part: it asks the questions in
+/// place of the host dialog, sees the approvals sbx has pending for the
+/// sandbox, and answers them and the hosts it saw blocked, already confirmed
+/// by the person in that UI, hearing back how each answer went.
+pub struct Hooks {
+    pub confirm: Confirm,
+    pub pending: Watch,
+    pub answers: Receiver<Answered>,
+    pub told: Told,
+}
+
 /// Answers the requests of one sandbox while its session runs.
 pub struct Bridge {
     stop: Arc<AtomicBool>,
@@ -337,15 +447,26 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn start(sbx: Sbx, dirs: Dirs, sandbox: String) -> Self {
+        Self::start_with(sbx, dirs, sandbox, None)
+    }
+
+    /// Like `start`, asking and showing through `hooks` when given.
+    pub fn start_with(sbx: Sbx, dirs: Dirs, sandbox: String, hooks: Option<Hooks>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let summary = Arc::new(Mutex::new(Summary::default()));
         let mounter: Mounter = {
             let (sbx, dirs, sandbox) = (sbx.clone(), dirs.clone(), sandbox.clone());
             Box::new(move |mount| session::mount_in_session(&sbx, &dirs, &sandbox, mount))
         };
+        let seen: Seen = {
+            let (sbx, sandbox) = (sbx.clone(), sandbox.clone());
+            Box::new(move |host| crate::policy::was_blocked(&sbx, &sandbox, host))
+        };
         let mut worker = Worker {
             sbx,
+            seen,
             dir: dirs.policy_dir(&sandbox),
+            inbox: dirs.requests_dir(&sandbox),
             log: dirs.sandbox_dir(&sandbox).join("network-prompts.log"),
             sandbox,
             dirs,
@@ -355,7 +476,16 @@ impl Bridge {
             declined: HashMap::new(),
             summary: summary.clone(),
             confirm: Box::new(confirm),
+            watch: None,
+            answers: None,
+            told: None,
         };
+        if let Some(hooks) = hooks {
+            worker.confirm = hooks.confirm;
+            worker.watch = Some(hooks.pending);
+            worker.answers = Some(hooks.answers);
+            worker.told = Some(hooks.told);
+        }
         let flag = stop.clone();
         // Not joined: it may be waiting on a dialog nobody answers.
         thread::spawn(move || {
@@ -377,23 +507,34 @@ impl Bridge {
 
 struct Worker {
     sbx: Sbx,
+    /// Hosts come from text the agent controls (the mod's request, a tool's
+    /// output); only one sbx really blocked is offered.
+    seen: Seen,
     dirs: Dirs,
     sandbox: String,
+    /// What sand writes back; read-only in the sandbox.
     dir: PathBuf,
+    /// Where the sandbox files requests; anything in it is the agent's.
+    inbox: PathBuf,
     log: PathBuf,
     pending: Vec<Approval>,
     pending_at: Option<Instant>,
     declined: HashMap<String, Instant>,
     summary: Arc<Mutex<Summary>>,
-    confirm: Box<dyn Fn(&str) -> Answer + Send>,
+    confirm: Confirm,
     mounter: Mounter,
+    /// Told whenever the pending approvals change.
+    watch: Option<Watch>,
+    /// Approvals and hosts answered in the session's own UI, and where their outcomes go.
+    answers: Option<Receiver<Answered>>,
+    told: Option<Told>,
 }
 
 impl Worker {
     /// Starts from a clean directory: requests filed while no session ran are
     /// answered now, but a pending list from an earlier session would be stale.
     fn reset(&self) {
-        let _ = fs::create_dir_all(self.dir.join("requests"));
+        let _ = fs::create_dir_all(&self.inbox);
         let _ = fs::create_dir_all(self.dir.join("results"));
         let _ = fs::remove_file(self.dir.join("pending.json"));
     }
@@ -401,6 +542,55 @@ impl Worker {
     fn round(&mut self, stop: &AtomicBool) {
         if self.pending_at.is_none_or(|at| at.elapsed() >= PENDING_EVERY) {
             self.refresh_pending();
+        }
+        let answered: Vec<Answered> = self.answers.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for answer in answered {
+            let (asked, outcome, request) = match answer {
+                Answered::Approval(id, option) => {
+                    let host = self.pending.iter().find(|a| a.id == id).map(|a| a.host.clone()).unwrap_or_default();
+                    let outcome = self.answer_approval(&id, Some(&option), true);
+                    let request = Request {
+                        kind: Some("approval".into()),
+                        host: host.clone(),
+                        approval: Some(id),
+                        option: Some(option),
+                        path: None,
+                        mode: None,
+                        reason: None,
+                    };
+                    (Asked::Host(host), outcome, request)
+                }
+                Answered::Allow(host) => {
+                    let outcome = self.answer_allow(&host, true);
+                    let request = Request {
+                        kind: None,
+                        host: host.clone(),
+                        approval: None,
+                        option: None,
+                        path: None,
+                        mode: None,
+                        reason: None,
+                    };
+                    (Asked::Host(host), outcome, request)
+                }
+                Answered::Mount(path) => {
+                    let outcome = self.answer_mount(&path, None, None, true);
+                    let request = Request {
+                        kind: Some("mount".into()),
+                        host: String::new(),
+                        approval: None,
+                        option: None,
+                        path: Some(path.clone()),
+                        mode: None,
+                        reason: None,
+                    };
+                    (Asked::Mount(path), outcome, request)
+                }
+            };
+            self.record(&request, &outcome);
+            if let Some(told) = &self.told {
+                told(&asked, &outcome);
+            }
         }
         for (id, path) in self.requests().into_iter().take(PER_ROUND) {
             if stop.load(Ordering::Relaxed) {
@@ -417,25 +607,31 @@ impl Worker {
         let listed = self.sbx.capture(args!["policy", "approval", "ls", "--json"]).ok().flatten();
         // An sbx without approvals leaves the list out: the mod then offers allow rules alone.
         if let Some(approvals) = listed.and_then(|json| parse_approvals(&json, &self.sandbox)) {
+            if let Some(watch) = self.watch.as_ref().filter(|_| approvals != self.pending) {
+                watch(&approvals);
+            }
             self.pending = approvals;
             let _ = write_json(&self.dir.join("pending.json"), &json!({ "approvals": self.pending }));
         }
     }
 
-    /// Request files by age, oldest first; anything else in the directory is removed.
+    /// Request files by age, oldest first; anything else in the directory is
+    /// removed. Nothing here follows a link: the agent makes the entries.
     fn requests(&self) -> Vec<(String, PathBuf)> {
-        let Ok(entries) = fs::read_dir(self.dir.join("requests")) else { return Vec::new() };
+        let Ok(entries) = fs::read_dir(&self.inbox) else { return Vec::new() };
         let mut found: Vec<(SystemTime, String, PathBuf)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
+            // `DirEntry::metadata` does not follow links, unlike `Path::metadata`.
+            let meta = entry.metadata().ok();
             match name.strip_suffix(".json").filter(|id| valid_id(id)) {
-                Some(id) if path.is_file() => {
-                    let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+                Some(id) if meta.as_ref().is_some_and(fs::Metadata::is_file) => {
+                    let modified = meta.and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
                     found.push((modified, id.to_string(), path));
                 }
                 _ => {
-                    let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+                    let _ = crate::state::remove_any(&path);
                 }
             }
         }
@@ -445,11 +641,11 @@ impl Worker {
 
     /// Reads, answers and removes one request; `None` while it may still be being written.
     fn take(&mut self, path: &Path) -> Option<Outcome> {
-        let text = fs::read_to_string(path).unwrap_or_default();
+        let text = read_plain_file(path).unwrap_or_default();
         let request = match serde_json::from_str::<Request>(&text) {
             Ok(request) => request,
             Err(_) => {
-                let age = fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                let age = fs::symlink_metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
                 if age.is_some_and(|age| age < WRITE_GRACE) {
                     return None;
                 }
@@ -460,21 +656,27 @@ impl Worker {
         let _ = fs::remove_file(path);
         let outcome = self.answer(&request);
         self.record(&request, &outcome);
+        // No mod reads the result back in a session sand draws: it tells the agent.
+        if let Some(told) = self.told.as_ref().filter(|_| request.kind.as_deref() == Some("mount")) {
+            told(&Asked::Mount(request.path.clone().unwrap_or_default()), &outcome);
+        }
         Some(outcome)
     }
 
     fn answer(&mut self, request: &Request) -> Outcome {
         if request.kind.as_deref() == Some("mount") {
             let path = request.path.as_deref().unwrap_or_default();
-            return self.answer_mount(path, request.mode.as_deref(), request.reason.as_deref());
+            return self.answer_mount(path, request.mode.as_deref(), request.reason.as_deref(), false);
         }
         match &request.approval {
-            Some(approval) => self.answer_approval(approval, request.option.as_deref()),
-            None => self.answer_allow(&request.host),
+            Some(approval) => self.answer_approval(approval, request.option.as_deref(), false),
+            None => self.answer_allow(&request.host, false),
         }
     }
 
-    fn answer_mount(&mut self, path: &str, mode: Option<&str>, reason: Option<&str>) -> Outcome {
+    /// Mounts `path`; `confirmed` when the person asked for it in a UI the
+    /// agent cannot reach (`/mount`), which needs no second question.
+    fn answer_mount(&mut self, path: &str, mode: Option<&str>, reason: Option<&str>, confirmed: bool) -> Outcome {
         // `DIR:ro` / `DIR:rw`, as on sand's command line, wins over `mode`.
         let path = path.trim();
         let (raw, suffix) = mounts::split_mode(path);
@@ -490,7 +692,8 @@ impl Worker {
         }
         // Relative paths are taken from the primary workspace, as `sand mount` takes them from where it runs.
         let state = crate::state::load(&self.dirs, &self.sandbox).ok().flatten();
-        let cwd = state.and_then(|s| s.mounts.primary).map(|m| m.path).unwrap_or_else(|| self.dirs.home.clone());
+        let cwd = state.as_ref().and_then(|s| s.mounts.primary.as_ref()).map(|m| m.path.clone());
+        let cwd = cwd.unwrap_or_else(|| self.dirs.home.clone());
         let mount = match Mount::parse(&format!("{path}:{mode}"), &cwd, &self.dirs.home) {
             Ok(mount) if mount.path.is_dir() => mount,
             Ok(mount) => return Outcome::failed(format!("{} is not a directory", mount.path.display())),
@@ -502,8 +705,23 @@ impl Worker {
                 "{shown} holds sand's data for every sandbox; it is never mounted on request"
             ));
         }
+        // Below a read-write mount the agent can swap the directory for a link
+        // while the dialog is open, and have another one mounted than was shown.
+        // It sees what is there already; only the person can ask for it (`/mount`).
+        let writable = state.iter().flat_map(|s| {
+            let user = s.mounts.all().filter(|m| m.mode == Mode::Rw).map(|m| m.path.clone());
+            let own = s.internal_mounts.iter().filter(|m| m.mode == Mode::Rw).map(|m| PathBuf::from(&m.host));
+            user.chain(own).collect::<Vec<_>>()
+        });
+        if !confirmed && let Some(within) = writable.into_iter().find(|w| mount.path.starts_with(w) && mount.path != *w)
+        {
+            return Outcome::failed(format!(
+                "{shown} is inside {}, which the sandbox can already change; sand does not mount it on the agent's request",
+                within.display()
+            ));
+        }
         let key = format!("mount:{shown}");
-        if self.declined.get(&key).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
+        if !confirmed && self.declined.get(&key).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
             return Outcome::done(format!("mounting {shown}: declined on the host a moment ago"));
         }
         let access = match mode {
@@ -516,7 +734,7 @@ impl Worker {
             question.push_str(&format!("\n\nThe agent says: \u{201c}{reason}\u{201d}"));
         }
         question.push_str("\n\nMount it?");
-        match (self.confirm)(&question) {
+        match if confirmed { Answer::Allow } else { (self.confirm)(&question) } {
             Answer::Allow => {}
             Answer::Deny => {
                 self.declined.insert(key, Instant::now());
@@ -527,6 +745,10 @@ impl Worker {
                     "sand could not ask on the host ({why}); mount it there with `sand mount {shown}`"
                 ));
             }
+        }
+        // Still the directory the question named, not a link put there since.
+        if dunce::canonicalize(&mount.path).ok().as_deref() != Some(mount.path.as_path()) {
+            return Outcome::failed(format!("{shown} changed while sand was asking; it was not mounted"));
         }
         let target = container_path(&shown);
         match (self.mounter)(&mount) {
@@ -539,7 +761,9 @@ impl Worker {
         }
     }
 
-    fn answer_approval(&mut self, id: &str, option: Option<&str>) -> Outcome {
+    /// Answers approval `id` with `option`; `confirmed` when the person chose
+    /// it in a UI the agent cannot reach, which needs no second question.
+    fn answer_approval(&mut self, id: &str, option: Option<&str>, confirmed: bool) -> Outcome {
         self.refresh_pending();
         // The host and options come from sbx, not from the request.
         let Some(approval) = self.pending.iter().find(|a| a.id == id).cloned() else {
@@ -553,7 +777,7 @@ impl Worker {
         };
         let host = &approval.host;
         // Refusing needs no confirmation: it can only take access away.
-        if !is_deny(&choice) {
+        if !is_deny(&choice) && !confirmed {
             let question = format!(
                 "Sandbox '{}' asks for network access to {host}.\n\nAnswer: {}\n\nAllow it?",
                 self.sandbox, choice.label
@@ -565,7 +789,13 @@ impl Worker {
             }
         }
         let respond = args!["policy", "approval", "respond", &approval.id, "--option", &choice.id];
-        match self.sbx_quiet(respond) {
+        let responded = self.sbx_quiet(respond);
+        // Answered: it is no longer pending, wherever it shows.
+        self.pending.retain(|a| a.id != approval.id);
+        if let Some(watch) = &self.watch {
+            watch(&self.pending);
+        }
+        match responded {
             Ok(()) if is_deny(&choice) => Outcome::done(format!("{host}: {}", choice.label)),
             Ok(()) => {
                 self.allowed(host);
@@ -575,12 +805,29 @@ impl Worker {
         }
     }
 
-    fn answer_allow(&mut self, host: &str) -> Outcome {
+    /// Allows `host` for this sandbox; `confirmed` when the person chose it in
+    /// a UI the agent cannot reach, which needs no second question.
+    fn answer_allow(&mut self, host: &str, confirmed: bool) -> Outcome {
         if !valid_host(host) {
             return Outcome::failed(format!("'{host}' is not a single host sand can allow"));
         }
-        if self.declined.get(host).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
+        if !confirmed && self.declined.get(host).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
             return Outcome::done(format!("{host}: declined on the host a moment ago"));
+        }
+        // Without this the agent could print a block message for any host and
+        // have it offered as if the policy had stopped it.
+        match (self.seen)(host) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Outcome::failed(format!(
+                    "sbx has no record of blocking {host} for this sandbox; nothing was allowed"
+                ));
+            }
+            Err(err) => {
+                return Outcome::failed(format!(
+                    "sand could not check that {host} was blocked ({err:#}); allow it on the host with `sand allow`"
+                ));
+            }
         }
         // A deny rule (an earlier refusal) wins over any allow, and sbx refuses an
         // allow beside a deny of the same scope, so allowing has to remove it.
@@ -595,7 +842,7 @@ impl Worker {
                 self.sandbox
             ),
         };
-        match (self.confirm)(&question) {
+        match if confirmed { Answer::Allow } else { (self.confirm)(&question) } {
             Answer::Allow => {}
             Answer::Deny => {
                 self.declined.insert(host.to_string(), Instant::now());
@@ -657,6 +904,26 @@ impl Worker {
             }
         }
     }
+}
+
+/// The text of `path` when it is a regular file, never what a link points to:
+/// the agent could swap the file for a link after it was listed.
+fn read_plain_file(path: &Path) -> Option<String> {
+    let before = fs::symlink_metadata(path).ok().filter(fs::Metadata::is_file)?;
+    let mut file = fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (&before, &opened);
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text).ok()?;
+    Some(text)
 }
 
 /// Text from the agent made fit for one line of a dialog.
@@ -777,10 +1044,12 @@ mod tests {
         let dirs = Dirs { home: root.join("home"), data: root.join("data"), config_file: root.join("config.toml") };
         let worker = Worker {
             sbx: Sbx::with_bin("/nonexistent/sbx"),
+            seen: Box::new(|host| Ok(host != "never.example")),
             dirs,
             mounter: Box::new(|mount| Ok(!mount.path.ends_with("already"))),
             sandbox: "claude-proj".into(),
-            dir: dir.to_path_buf(),
+            dir: dir.join("policy"),
+            inbox: dir.join("requests"),
             log: dir.join("log"),
             pending: Vec::new(),
             pending_at: None,
@@ -790,9 +1059,151 @@ mod tests {
                 seen.lock().unwrap().push(q.to_string());
                 answer.lock().unwrap().take().unwrap_or(Answer::Deny)
             }),
+            watch: None,
+            answers: None,
+            told: None,
         };
         worker.reset();
         (worker, asked)
+    }
+
+    #[test]
+    fn approvals_answered_in_the_native_ui_are_not_asked_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let watched = seen.clone();
+        worker.watch = Some(Box::new(move |pending: &[Approval]| {
+            watched.lock().unwrap().push(pending.iter().map(|a| a.id.clone()).collect::<Vec<_>>());
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.answers = Some(rx);
+        let choice = |id: &str, label: &str| Choice { id: id.into(), label: label.into() };
+        worker.pending = vec![
+            Approval { id: "a1".into(), host: "api.github.com".into(), options: vec![choice("allow", "Allow")] },
+            Approval { id: "a2".into(), host: "pypi.org".into(), options: vec![choice("allow", "Allow")] },
+        ];
+        worker.pending_at = Some(Instant::now());
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let heard = told.clone();
+        worker.told = Some(Box::new(move |asked: &Asked, outcome: &Outcome| {
+            heard.lock().unwrap().push((asked.clone(), outcome.ok));
+        }));
+        tx.send(Answered::Approval("a1".into(), "allow".into())).unwrap();
+        tx.send(Answered::Allow("example.com".into())).unwrap();
+        worker.round(&AtomicBool::new(false));
+        assert!(asked.lock().unwrap().is_empty(), "the person chose in the pane; no host dialog");
+        assert_eq!(seen.lock().unwrap().last().unwrap(), &vec!["a2".to_string()], "a1 is no longer pending");
+        let log = fs::read_to_string(tmp.path().join("log")).unwrap();
+        assert!(log.contains("\"approval\":\"a1\""), "{log}");
+        assert!(log.contains("\"host\":\"example.com\""), "{log}");
+        // sbx is not there to answer: both fail, and the pane hears so for each host.
+        assert_eq!(
+            *told.lock().unwrap(),
+            [(Asked::Host("api.github.com".into()), false), (Asked::Host("example.com".into()), false)]
+        );
+    }
+
+    #[test]
+    fn the_mcp_server_files_mount_requests_for_the_bridge() {
+        use std::io::{BufRead, BufReader};
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("requests")).unwrap();
+        let script = tmp.path().join("sand.mjs");
+        fs::write(&script, mod_files().iter().find(|(rel, _)| rel == MCP_SERVER).unwrap().1).unwrap();
+        let Ok(mut node) = Command::new("node")
+            .arg(&script)
+            .env("SAND_REQUESTS_DIR", tmp.path().join("requests"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("node is not installed; skipped");
+            return;
+        };
+        let mut stdin = node.stdin.take().unwrap();
+        for message in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "request_mount", "arguments": {"path": "~/notes:ro", "reason": "the docs"}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "request_mount", "arguments": {}}}),
+        ] {
+            writeln!(stdin, "{message}").unwrap();
+        }
+        drop(stdin);
+        let answers: Vec<Value> = BufReader::new(node.stdout.take().unwrap())
+            .lines()
+            .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+            .collect();
+        node.wait().unwrap();
+        assert_eq!(answers.len(), 4, "the notification gets no answer");
+        assert_eq!(answers[0]["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(answers[1]["result"]["tools"][0]["name"], "request_mount");
+        assert!(
+            answers[2]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Asked the user to mount ~/notes (ro)")
+        );
+        assert_eq!(answers[3]["result"]["isError"], true);
+        let filed: Vec<_> = fs::read_dir(tmp.path().join("requests")).unwrap().flatten().collect();
+        assert_eq!(filed.len(), 1);
+        let request: Request = serde_json::from_str(&fs::read_to_string(filed[0].path()).unwrap()).unwrap();
+        assert_eq!(
+            (request.kind.as_deref(), request.path.as_deref(), request.mode.as_deref(), request.reason.as_deref()),
+            (Some("mount"), Some("~/notes"), Some("ro"), Some("the docs"))
+        );
+        assert!(valid_id(filed[0].path().file_stem().unwrap().to_str().unwrap()), "the bridge takes its name");
+    }
+
+    #[test]
+    fn mount_requests_are_told_to_a_session_that_draws_its_own_ui() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, _) = worker(tmp.path(), Answer::Deny);
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let heard = told.clone();
+        worker.told = Some(Box::new(move |asked: &Asked, outcome: &Outcome| {
+            heard.lock().unwrap().push((asked.clone(), outcome.allowed));
+        }));
+        let request = json!({"kind": "mount", "path": tmp.path().to_string_lossy(), "mode": "ro"});
+        fs::write(tmp.path().join("requests/r1.json"), request.to_string()).unwrap();
+        worker.round(&AtomicBool::new(false));
+        assert_eq!(*told.lock().unwrap(), [(Asked::Mount(tmp.path().to_string_lossy().into_owned()), false)]);
+        assert!(tmp.path().join("policy/results/r1.json").exists(), "the result is written as for the mod");
+    }
+
+    #[test]
+    fn a_mount_the_person_asked_for_needs_no_second_question() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, asked) = worker(tmp.path(), Answer::Deny);
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let heard = told.clone();
+        worker.told = Some(Box::new(move |asked: &Asked, outcome: &Outcome| {
+            heard.lock().unwrap().push((asked.clone(), outcome.allowed));
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.answers = Some(rx);
+        fs::create_dir_all(tmp.path().join("notes")).unwrap();
+        let dir = format!("{}:ro", tmp.path().join("notes").display());
+        tx.send(Answered::Mount(dir.clone())).unwrap();
+        worker.round(&AtomicBool::new(false));
+        assert!(asked.lock().unwrap().is_empty(), "/mount is the person's own ask");
+        assert_eq!(*told.lock().unwrap(), [(Asked::Mount(dir), true)]);
+    }
+
+    #[test]
+    fn blocks_are_read_from_the_proxys_403_bodies() {
+        let text = "curl: (22) 403\nBlocked by network policy: domain PyPI.org\n  rule: x\n\
+                    Approval required for api.github.com.\nBlocked by local rule for evil.test:8443\n\
+                    Blocked by network policy: domain pypi.org\nBlocked by local rule for api.github.com";
+        let blocks = blocks_in(text);
+        assert_eq!(blocks.hosts, ["pypi.org"]);
+        assert_eq!(blocks.ruled, ["evil.test:8443", "api.github.com"]);
+        assert!(!blocks.org);
+        assert!(blocks_in("Blocked by org policy").org);
+        assert_eq!(blocks_in("Blocked by network policy: domain *.x"), Blocks::default());
     }
 
     #[test]
@@ -803,7 +1214,7 @@ mod tests {
         fs::create_dir_all(&notes).unwrap();
         let notes = dunce::canonicalize(&notes).unwrap();
 
-        let outcome = worker.answer_mount("~/notes", Some("ro"), Some("the user asked\nfor their notes"));
+        let outcome = worker.answer_mount("~/notes", Some("ro"), Some("the user asked\nfor their notes"), false);
         let (shown, at) = (notes.display().to_string(), container_path(&notes.display().to_string()));
         assert_eq!(outcome, Outcome::allowed(format!("mounted {shown} (ro) at {at}")));
         let question = asked.lock().unwrap()[0].clone();
@@ -813,23 +1224,25 @@ mod tests {
 
         // Declined just now: not asked again. Refused outright, unasked:
         worker.confirm = Box::new(|_| Answer::Deny);
-        assert!(!worker.answer_mount("~/notes", None, None).allowed);
-        assert!(worker.answer_mount("~/notes", None, None).message.ends_with("declined on the host a moment ago"));
-        assert!(!worker.answer_mount("~/missing", None, None).ok);
+        assert!(!worker.answer_mount("~/notes", None, None, false).allowed);
+        assert!(
+            worker.answer_mount("~/notes", None, None, false).message.ends_with("declined on the host a moment ago")
+        );
+        assert!(!worker.answer_mount("~/missing", None, None, false).ok);
         // The command line's suffix names the mode, and wins over `mode`.
         worker.declined.clear();
         worker.confirm = Box::new(|q| if q.contains("read-only") { Answer::Allow } else { Answer::Deny });
         assert_eq!(
-            worker.answer_mount("~/notes:ro", Some("rw"), None).message,
+            worker.answer_mount("~/notes:ro", Some("rw"), None, false).message,
             format!("mounted {shown} (ro) at {at}")
         );
-        assert!(!worker.answer_mount("~/notes:rw", None, None).allowed);
+        assert!(!worker.answer_mount("~/notes:rw", None, None, false).allowed);
         worker.confirm = Box::new(|_| Answer::Deny);
-        assert!(!worker.answer_mount("~/notes", Some("rwx"), None).ok);
-        assert!(!worker.answer_mount("", None, None).ok);
+        assert!(!worker.answer_mount("~/notes", Some("rwx"), None, false).ok);
+        assert!(!worker.answer_mount("", None, None, false).ok);
         fs::create_dir_all(worker.dirs.sandboxes_dir()).unwrap();
         let data = worker.dirs.data.display().to_string();
-        assert!(worker.answer_mount(&data, Some("ro"), None).message.contains("never mounted on request"));
+        assert!(worker.answer_mount(&data, Some("ro"), None, false).message.contains("never mounted on request"));
         assert_eq!(asked.lock().unwrap().len(), 1);
     }
 
@@ -854,9 +1267,9 @@ mod tests {
     fn a_declined_host_is_not_asked_about_again_right_away() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut worker, asked) = worker(tmp.path(), Answer::Deny);
-        let declined = worker.answer_allow("example.com:443");
+        let declined = worker.answer_allow("example.com:443", false);
         assert_eq!(declined, Outcome::done("example.com:443: declined on the host".into()));
-        let again = worker.answer_allow("example.com:443");
+        let again = worker.answer_allow("example.com:443", false);
         assert_eq!(again.message, "example.com:443: declined on the host a moment ago");
         assert_eq!(asked.lock().unwrap().len(), 1);
         assert!(asked.lock().unwrap()[0].contains("Sandbox 'claude-proj' asks for network access to example.com:443"));
@@ -866,9 +1279,9 @@ mod tests {
     fn requests_that_widen_or_name_unknown_approvals_are_refused_unasked() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
-        assert!(!worker.answer_allow("*.example.com").ok);
-        assert!(!worker.answer_allow("a.com,b.com").ok);
-        assert!(!worker.answer_approval("made-up", Some("once")).ok);
+        assert!(!worker.answer_allow("*.example.com", false).ok);
+        assert!(!worker.answer_allow("a.com,b.com", false).ok);
+        assert!(!worker.answer_approval("made-up", Some("once"), false).ok);
         assert!(asked.lock().unwrap().is_empty());
     }
 
@@ -890,5 +1303,72 @@ mod tests {
         assert_eq!(outcome.message, "a.com: declined on the host");
         assert!(!requests.join("one.json").exists());
         assert!(fs::read_to_string(tmp.path().join("log")).unwrap().contains(r#""host":"a.com""#));
+    }
+
+    #[test]
+    fn only_hosts_sbx_logged_blocked_can_be_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
+        // As if from the native UI, already confirmed there: still checked.
+        let outcome = worker.answer_allow("never.example", true);
+        assert!(!outcome.ok && outcome.message.contains("no record of blocking"), "{outcome:?}");
+        assert!(!worker.answer_allow("never.example", false).ok);
+        assert!(asked.lock().unwrap().is_empty(), "nothing to ask about");
+        assert!(worker.summary.lock().unwrap().allowed.is_empty());
+    }
+
+    #[test]
+    fn mounts_below_a_writable_mount_are_refused_unless_the_person_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
+        let proj = worker.dirs.home.join("proj");
+        fs::create_dir_all(proj.join("docs")).unwrap();
+        let proj = dunce::canonicalize(&proj).unwrap();
+        let state = crate::state::SandboxState {
+            name: "claude-proj".into(),
+            harness: "claude".into(),
+            agent: "claude".into(),
+            kind: crate::state::Kind::Project,
+            mounts: MountSet { primary: Some(Mount::rw(&proj)), extras: vec![] },
+            mcp: vec![],
+            template: None,
+            image_digest: None,
+            declined_digest: None,
+            internal_mounts: vec![],
+            vertex_secret: None,
+            created_at: 0,
+        };
+        crate::state::save(&worker.dirs, &state).unwrap();
+
+        let outcome = worker.answer_mount("docs", Some("rw"), None, false);
+        assert!(!outcome.ok && outcome.message.contains("can already change"), "{outcome:?}");
+        assert!(asked.lock().unwrap().is_empty(), "refused before the dialog");
+        // The person's own `/mount` is not the agent's.
+        assert!(worker.answer_mount("docs:ro", None, None, true).ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_the_agent_files_are_removed_never_followed() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let precious = tmp.path().join("precious");
+        fs::create_dir_all(precious.join("docs")).unwrap();
+        fs::write(precious.join("notes.txt"), "keep").unwrap();
+        fs::write(precious.join("secret.json"), r#"{"host": "leaked.example"}"#).unwrap();
+
+        let (mut worker, _) = worker(tmp.path(), Answer::Deny);
+        let requests = tmp.path().join("requests");
+        symlink(&precious, requests.join("dir")).unwrap();
+        symlink(precious.join("secret.json"), requests.join("swapped.json")).unwrap();
+        fs::write(requests.join("r1.json"), r#"{"host": "bad host"}"#).unwrap();
+        worker.round(&AtomicBool::new(false));
+
+        assert!(precious.join("docs").is_dir() && precious.join("secret.json").exists());
+        assert_eq!(fs::read_to_string(precious.join("notes.txt")).unwrap(), "keep");
+        assert!(fs::read_dir(&requests).unwrap().next().is_none(), "links and answered requests are gone");
+        assert_eq!(read_plain_file(&precious.join("notes.txt")).as_deref(), Some("keep"));
+        symlink(precious.join("secret.json"), requests.join("late.json")).unwrap();
+        assert_eq!(read_plain_file(&requests.join("late.json")), None);
     }
 }

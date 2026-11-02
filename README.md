@@ -36,7 +36,7 @@ Set `SAND_VERSION` (for example `v0.1.0`) to install a specific release instead
 of the latest, and `SAND_INSTALL_DIR` to install somewhere else. Run the script
 again to upgrade.
 
-To build from source instead, with Rust 1.89 or later:
+To build from source instead, with a recent stable Rust:
 
 ```console
 $ cargo install --locked --path .
@@ -60,8 +60,8 @@ the same.
 | `--mcp a,b` | Expose these MCP servers (names from `sbx mcp ls`). |
 | `--resume` | Attach to the existing sandbox without the "different setup" question: mounts and MCP servers on the command line are added, nothing is removed. Fails if there is none. |
 | `--no-attach` | Create or update the sandbox and start it, then exit without opening the agent. `sand [HARNESS] --resume` attaches later. |
-| `--recreate` | Remove the sandbox and create it again. Conversation history is kept. |
-| `--no-preserve-history` | With `--recreate`: discard the history too. |
+| `--recreate` | Remove the sandbox and create it again, asking what to keep of its conversation history, mounts and MCP servers (see [Recreating a sandbox](#recreating-a-sandbox)). |
+| `--force-recreate` | Remove the sandbox and create it again from the command line alone, without asking: its history, and mounts and MCP servers the command line does not name, are dropped. |
 | `--scratch` | No project: use the shared scratch directory, which persists and is shared by all harnesses. |
 | `--dedicated-scratch` | No project: a throwaway mountless sandbox, removed when the agent exits. |
 | `--name NAME` | Sandbox name. The default is `<harness>-<directory>`. |
@@ -101,6 +101,27 @@ Adding MCP servers is never a conflict; they are attached live with
 `sbx mcp load`. Without a terminal, pass `--on-conflict`. In `--acp` mode,
 `sand` merges.
 
+### Recreating a sandbox
+
+`--recreate` removes the sandbox and creates it again from the command line.
+Before it does, it lists what the command line would lose and asks what to keep,
+everything ticked:
+
+- the conversation history, when there is any;
+- mounts the sandbox has and the command line does not name;
+- MCP servers the sandbox has and the command line does not name.
+
+So `sand claude --recreate` rebuilds the sandbox with its history, mounts and
+MCP servers, and unticking an item leaves it out. When there is nothing to keep, it does not ask. It needs a
+terminal (or Tern's native surface, which asks one item at a time); without one
+it fails before removing anything. `--force-recreate` asks nothing and keeps
+nothing the command line does not name, history included:
+
+```console
+$ sand claude --recreate            # rebuild, choosing what to keep
+$ sand claude --force-recreate      # rebuild from the command line alone
+```
+
 ### Adding mounts later
 
 To add a directory to the sandbox of the current directory, also while an agent
@@ -130,9 +151,11 @@ prompt with **Mount read-write**, **Mount read-only** and **Dismiss**, and
 choosing a mount has `sand` confirm it in a dialog on the host (see
 [Prompts in Claude Code](#prompts-in-claude-code)), naming the resolved
 directory and mode, before it mounts it as `sand mount` would. `~` is your home
-on the host and relative paths start at the primary workspace. The directory
-appears at the same path inside the sandbox, the agent is told once it is
-there, and it stays mounted like one `sand mount` added. On the next
+on the host and relative paths start at the primary workspace. The agent cannot
+ask for a directory inside a read-write mount of its sandbox (it could swap it
+for a link while you read the dialog); use `sand mount` or `/mount` for that.
+The directory appears at the same path inside the sandbox, the agent is told
+once it is there, and it stays mounted like one `sand mount` added. On the next
 launch it is also a working directory of Claude Code, as every extra mount is
 (`permissions.additionalDirectories` in the sandbox's settings). sand's own data
 directory is never mounted this way.
@@ -174,7 +197,8 @@ configuration (use `--mcp`).
 
 **History.** Conversation history directories are backed by host directories
 under sand's data directory and bind-mounted into the sandbox, so they survive
-`--recreate` and even a manual `sbx rm`.
+`--recreate` (unless you choose not to keep them) and even a manual `sbx rm`;
+`--force-recreate` discards them.
 
 **Status.** For Claude Code, `sand` installs a status line with the sandbox,
 the git branch, agent API and MCP server status, and below it the model, the
@@ -341,12 +365,19 @@ which wins over any allow. The mod offers to lift it, the dialog says so, and
 that applies to every sandbox is not removed: the request fails with the
 `sbx policy rm` command to remove it yourself.
 
-Requests and answers go through a directory of each sandbox's own, mounted
-read-write at `~/.sand-policy` in that sandbox alone. Since a request names its
-sandbox by where it appears, keep sand's data directory out of your mounts:
-`sand` warns about a mount that contains it. The mod is loaded through
-`CLAUDE_CODE_PLUGIN_DIRS` in the sandbox's Claude Code settings. Set
-`network_prompts = false` under `[harness.claude]` to leave it out.
+Requests go through a directory of each sandbox's own, mounted read-write at
+`~/.sand-requests` in that sandbox alone, and `sand` answers in another,
+`~/.sand-policy`, which the sandbox can only read. `sand` never follows a link
+the agent puts in the first. Since a request names its sandbox by where it
+appears, keep sand's data directory out of your mounts: `sand` warns about a
+mount that contains it. The mod is loaded through `CLAUDE_CODE_PLUGIN_DIRS` in
+the sandbox's Claude Code settings. Set `network_prompts = false` under
+`[harness.claude]` to leave it out.
+
+A host is only allowed, from the mod or from sand's own UI, when `sbx policy
+log` shows the sandbox was really blocked from reaching it, so the agent cannot
+get a row for a host by printing a block message. It can still try to reach any
+host to get one, so read the host before you allow it.
 
 ## MCP servers
 
@@ -439,13 +470,90 @@ The first start of a new sandbox takes a while. If the editor times out, run
 
 ### Tern
 
+In a [Tern](https://docs.stencil.so/tern/) pane, `sand <harness>` draws the
+whole session natively, in the look of Tern's own agent chat. Right after the
+sbx sign-in check, sand asks the terminal whether it speaks the Tern Surface
+Protocol. If it does, setup shows as a live list of steps, and its questions
+(a sandbox with a different setup, a newer image) come up as cards with a
+button per answer (1–9 picks, Enter takes the first, Esc aborts). Once the
+sandbox is ready, the steps fold into one line, and sand starts the harness's
+ACP server in the sandbox and becomes its client:
+
+- your messages are cards; each agent turn groups its replies (streamed
+  Markdown), folded thoughts and tool cards (commands with their output and
+  how they ended, edits as diffs with a +/− count), and ends with its time,
+  tokens and cost;
+- a call that needs permission asks in its card: Enter allows, Esc denies;
+- above the composer: the plan, and a working line with what the agent is
+  doing and for how long;
+- the composer stays at the bottom of the pane and shows what the status line
+  shows: a context bar (used and window size), the model and its reasoning
+  effort, the permission mode and the session's cost, and on a line under
+  them the sandbox with its git branch, whether the agent's API is reachable,
+  and the MCP servers: green when all are connected, a warning or failed mark
+  when one needs attention or failed, and each server's state in a dropdown. The
+  model, effort and mode chips are pickers of the choices the agent offers
+  (Shift+Tab also steps through the modes, and a mode other than the default
+  shows in the warning color); until it says, they show what your harness settings pick.
+  Branch, API and MCP are checked again while the session runs.
+
+Typing `/` completes commands under the caret (↑↓ choose, Tab completes,
+Enter runs, Esc hides): the agent's own (`/init`, `/review`, …), sent to it
+as a prompt, and sand's, which ACP offers as methods rather than commands:
+`/sessions` (or `/resume` without an id) lists the agent's sessions for this
+project in a picker, and resumes the one you choose, replaying its
+conversation when the agent can; `/resume <id>` resumes one directly; `/new`
+starts a new session; and `/help` lists them all. Resuming needs an agent that
+supports ACP's session listing and loading.
+
+The composer edits like a native text field (select with the mouse or
+Shift+arrows, ⌘A, ⌘Z to undo, even a sent draft) and shows the rest of a
+command being typed faintly after the caret. Messages written while the agent
+works (or starts) wait above the composer, up to eight, each with a ✕ to take
+it back, and go in order as each turn ends; after a stop or a failure the
+queue pauses until you continue or discard it. A queued message's **Send
+now** button, or Ctrl+Enter on the draft, sends it at once instead: ACP has
+no way into a running turn, so the turn is stopped and the message goes as
+soon as the agent confirms, with the rest of the queue after it. A new session's welcome offers
+to continue the last conversation, and a few prompts to start with. While the
+pane is hidden, what happens (a finished turn, a permission request, the agent
+exiting) is noted above the composer for when you come back. Each turn ends
+with its time, tokens and cost.
+
+Pasting an image (or Ctrl+V) attaches the clipboard's image to the next
+message, shown as a thumbnail above the composer with a × to remove it; up to
+four images go with a message, even without text, to an agent that takes
+images over ACP. Tern does not hand a program a pasted image's bytes, so sand
+reads the clipboard of the machine it runs on (osascript on macOS, wl-paste or
+xclip on Linux, PowerShell on Windows), which over ssh is not yours.
+
+Network access the sandbox was blocked from shows above the composer as a
+card with sbx's own options (allow once, always, deny…), answered with a
+click, for any harness; requests from sand's Claude Code mod to mount a
+directory or allow a host ask there too, instead of in a host dialog. Both are
+noted when they come in while the pane is hidden.
+
+You can type during setup; the first message is sent once the agent is ready.
+Enter sends, Shift+Enter starts a new line and Esc stops a turn. As in
+Claude Code, Ctrl+C stops a turn or clears the draft first, and otherwise
+quits (or stops setup) only when pressed twice in a row; a toast asks for the
+second press. Ctrl+D twice quits too. This needs no setup in Tern and works for
+every kind of sandbox, but not with agent arguments, which open the terminal
+UI. The subscription limits (5h, 7d) the terminal status line shows are not
+reported over ACP, so the native composer leaves them out. If setup fails or is
+aborted, its log is printed in the terminal as usual. The agent's stderr goes
+to `acp-agent.log` in the sandbox's runtime directory. To keep the terminal
+UI, set `tern_native = false` in the config, or `SAND_TERN_NATIVE=0` (or
+`TERN_TSP=0`) for one run; `SAND_TERN_NATIVE=1` turns it back on over the
+config.
+
 `--install-acp tern` adds a custom agent `sand-<harness>` to Tern's
 `settings.json` (`$TERN_CONFIG_DIR` if set) and lists it in `own_tools`, so
 the agent uses its own file and terminal tools, which run inside the sandbox,
 rather than Tern's, which would run on the host.
 
-Run in a Tern pane that opens agent commands as ACP chats (Settings › Agents),
-`sand <harness>` then sets the sandbox up as usual and opens the session in
+With native drawing turned off, in a Tern pane that opens agent commands as
+ACP chats (Settings › Agents), `sand <harness>` then sets the sandbox up as usual and opens the session in
 Tern's chat (`tern acp sand-<harness>`) instead of the agent's terminal UI.
 Tern starts `sand <harness> --acp` in the current directory, which keeps the
 sandbox's mounts and MCP servers; while the chat is open, the first `sand`
@@ -467,6 +575,7 @@ commented examples if there is none) and checks it when the editor closes.
 ```toml
 default_harness = "codex"
 nightly = true                       # use nightly harness images (see Templates)
+tern_native = false                  # keep the agent's terminal UI in Tern
 
 # Change a built-in harness…
 [harness.claude]

@@ -388,11 +388,17 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     wait_for(&PathBuf::from(format!("{}.started", gate.display())), "session never started");
 
     let dir = env.sandbox_dir("claude-proj").join("policy");
-    let mount =
-        env.state("claude-proj")["internal_mounts"].as_array().unwrap().iter().any(|m| {
-            m["target"] == "/home/agent/.sand-policy" && m["mode"] == "rw" && m["host"] == env.p(&dir).as_str()
-        });
-    assert!(mount, "{:#?}", env.state("claude-proj"));
+    let inbox = env.sandbox_dir("claude-proj").join("requests");
+    // The agent writes only the requests; what sand writes back is read-only to it.
+    let mounted = |target: &str, mode: &str, host: &Path| {
+        env.state("claude-proj")["internal_mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["target"] == target && m["mode"] == mode && m["host"] == env.p(host).as_str())
+    };
+    assert!(mounted("/home/agent/.sand-policy", "ro", &dir), "{:#?}", env.state("claude-proj"));
+    assert!(mounted("/home/agent/.sand-requests", "rw", &inbox), "{:#?}", env.state("claude-proj"));
     let staged = env.sandbox_dir("claude-proj").join("runtime/sync/home/.local/share/sand/mods/sand");
     assert!(staged.join("hooks/register.tsx").is_file() && staged.join(".claude-plugin/plugin.json").is_file());
 
@@ -401,22 +407,30 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     let pending = fs::read_to_string(dir.join("pending.json")).unwrap();
     assert!(pending.contains("ap-1") && !pending.contains("ap-2"), "{pending}");
 
-    fs::write(dir.join("requests/r1.json"), r#"{"host": "example.com:443"}"#).unwrap();
-    fs::write(dir.join("requests/r2.json"), r#"{"host": "evil.com", "approval": "ap-2", "option": "once"}"#).unwrap();
-    fs::write(dir.join("requests/r3.json"), r#"{"host": "*", "approval": null}"#).unwrap();
+    // Hosts are allowed only when sbx logged them blocked for this sandbox.
+    let blocked = |host: &str, sandbox: &str| format!(r#"{{"host": "{host}", "sandbox_id": "{sandbox}", "count": 1}}"#);
+    let log = ["example.com:443", "refused.com:443", "global.com:443"].map(|h| blocked(h, "claude-proj"));
+    let log =
+        format!(r#"{{"blocked": [{}, {}], "allowed": []}}"#, log.join(", "), blocked("elsewhere.com:443", "codex-x"));
+    fs::write(env.fake.join("policy.json"), log).unwrap();
+
+    fs::write(inbox.join("r1.json"), r#"{"host": "example.com:443"}"#).unwrap();
+    fs::write(inbox.join("r2.json"), r#"{"host": "evil.com", "approval": "ap-2", "option": "once"}"#).unwrap();
+    fs::write(inbox.join("r3.json"), r#"{"host": "*", "approval": null}"#).unwrap();
+    fs::write(inbox.join("r7.json"), r#"{"host": "elsewhere.com:443"}"#).unwrap();
     // A host refused before is blocked by a deny rule: allowing lifts this sandbox's own,
     // but not one that applies to every sandbox.
     for (scope, host, id) in [("claude-proj", "refused.com:443", "rule-1"), ("global", "global.com:443", "rule-2")] {
         fs::create_dir_all(env.fake.join("deny").join(scope)).unwrap();
         fs::write(env.fake.join("deny").join(scope).join(host), id).unwrap();
     }
-    fs::write(dir.join("requests/r5.json"), r#"{"host": "refused.com:443"}"#).unwrap();
-    fs::write(dir.join("requests/r6.json"), r#"{"host": "global.com:443"}"#).unwrap();
+    fs::write(inbox.join("r5.json"), r#"{"host": "refused.com:443"}"#).unwrap();
+    fs::write(inbox.join("r6.json"), r#"{"host": "global.com:443"}"#).unwrap();
     // A mount the agent asked for; relative paths are taken from the primary workspace.
-    fs::write(dir.join("requests/m1.json"), r#"{"kind": "mount", "path": "../other:ro", "reason": "docs"}"#).unwrap();
+    fs::write(inbox.join("m1.json"), r#"{"kind": "mount", "path": "../other:ro", "reason": "docs"}"#).unwrap();
     // The host and options of an approval come from sbx, whatever the request says.
-    fs::write(dir.join("requests/r4.json"), r#"{"host": "other.com", "approval": "ap-1", "option": "once"}"#).unwrap();
-    for id in ["r1", "r2", "r3", "r4", "r5", "r6", "m1"] {
+    fs::write(inbox.join("r4.json"), r#"{"host": "other.com", "approval": "ap-1", "option": "once"}"#).unwrap();
+    for id in ["r1", "r2", "r3", "r4", "r5", "r6", "r7", "m1"] {
         wait_for(&dir.join(format!("results/{id}.json")), "no result");
     }
     let result = |id: &str| -> serde_json::Value {
@@ -426,6 +440,8 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     // Another sandbox's approval is not this sandbox's to answer, and wildcards are refused.
     assert_eq!(result("r2")["ok"], false, "{}", result("r2"));
     assert_eq!(result("r3")["ok"], false, "{}", result("r3"));
+    // Another sandbox's block is not this one's.
+    assert!(result("r7")["message"].as_str().unwrap().contains("no record of blocking"), "{}", result("r7"));
     let questions = fs::read_to_string(&asked).unwrap();
     assert!(questions.contains("Sandbox 'claude-proj' asks for network access to example.com:443"), "{questions}");
     assert!(questions.contains("network access to pypi.org:443.\n\nAnswer: Allow once"), "{questions}");
@@ -469,7 +485,7 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     // The agent raises desktop notifications through the host's terminal, so it is told which one that is.
     assert!(has(&log, "run --name claude-proj -e TERM_PROGRAM=iTerm.app"), "{log:#?}");
     let record = fs::read_to_string(env.sandbox_dir("claude-proj").join("network-prompts.log")).unwrap();
-    assert_eq!(record.lines().count(), 7, "{record}");
+    assert_eq!(record.lines().count(), 8, "{record}");
     assert!(log.contains(&format!("mount claude-proj {other}:{other}:ro")), "{log:#?}");
 
     // Turned off, the mod and the bridge are gone.
@@ -524,25 +540,39 @@ fn no_attach_sets_the_sandbox_up_without_running_the_agent() {
 }
 
 #[test]
-fn recreate_preserves_history_unless_told_otherwise() {
+fn recreate_asks_what_to_keep_and_force_recreate_keeps_nothing() {
     let env = Env::new();
-    env.ok(&["codex"]);
+    env.register_mcp(&["atlassian"]);
+    env.ok(&["codex", ".", "../other:ro", "--mcp", "atlassian"]);
     let history = env.sandbox_dir("codex-proj").join("history/.codex_sessions");
-    fs::write(history.join("rollout.jsonl"), "conversation").unwrap();
     env.take_log();
 
-    let out = env.ok(&["codex", "--recreate"]);
+    // Nothing beyond the command line to keep: nothing to ask.
+    env.ok(&["codex", ".", "../other:ro", "--mcp", "atlassian", "--recreate"]);
     let log = env.take_log();
     assert_eq!(starting(&log, "rm"), vec!["rm --force codex-proj"]);
     assert_eq!(starting(&log, "create").len(), 1);
-    assert_eq!(fs::read_to_string(history.join("rollout.jsonl")).unwrap(), "conversation");
-    // The history mount is re-established on the new sandbox.
-    assert!(has(&log, &format!("mount codex-proj {}:/home/agent/.codex/sessions:rw", env.p(&history))));
-    assert!(stderr(&out).contains("history is preserved"));
 
-    env.ok(&["codex", "--recreate", "--no-preserve-history"]);
+    // History, a mount and a server the command line leaves out: --recreate asks, and
+    // without a terminal it stops before removing anything.
+    fs::write(history.join("rollout.jsonl"), "conversation").unwrap();
+    let err = env.fails(&["codex", "--recreate"]);
+    let other = env.p(&env.other);
+    assert!(err.contains("--recreate asks what to keep"), "{err}");
+    assert!(err.contains(&format!("conversation history; mounts: {other} (ro); MCP servers: atlassian")), "{err}");
+    assert!(err.contains("--force-recreate"), "{err}");
+    assert!(starting(&env.take_log(), "rm").is_empty());
+
+    // --force-recreate asks nothing and keeps only the command line.
+    let out = env.ok(&["codex", "--force-recreate"]);
+    let log = env.take_log();
+    assert_eq!(starting(&log, "rm"), vec!["rm --force codex-proj"]);
+    assert_eq!(starting(&log, "create"), vec![format!("create --name codex-proj codex {}", env.p(&env.proj))]);
+    assert!(stderr(&out).contains("including its conversation history"));
     assert!(!history.join("rollout.jsonl").exists());
     assert!(history.is_dir(), "a fresh history directory is mounted");
+    // The history mount is re-established on the new sandbox.
+    assert!(has(&log, &format!("mount codex-proj {}:/home/agent/.codex/sessions:rw", env.p(&history))));
 }
 
 #[test]
@@ -941,6 +971,7 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
             "DEBUG": "1",
             "CLAUDE_CODE_PLUGIN_DIRS": "/home/agent/.local/share/sand/mods/sand",
             "SAND_POLICY_DIR": "/home/agent/.sand-policy",
+            "SAND_REQUESTS_DIR": "/home/agent/.sand-requests",
             "CLAUDE_CODE_USE_VERTEX": "1",
             "CLAUDE_CODE_SKIP_VERTEX_AUTH": "1",
             "ANTHROPIC_VERTEX_PROJECT_ID": "acme",
@@ -989,6 +1020,7 @@ fn vertex_auth_registers_a_refreshing_token_secret_and_points_claude_at_vertex()
             "DEBUG": "1",
             "CLAUDE_CODE_PLUGIN_DIRS": "/home/agent/.local/share/sand/mods/sand",
             "SAND_POLICY_DIR": "/home/agent/.sand-policy",
+            "SAND_REQUESTS_DIR": "/home/agent/.sand-requests",
         })
     );
 }

@@ -18,6 +18,7 @@ const STARTER: &str = r#"# sand configuration. Everything is optional; the READM
 
 # default_harness = "claude"
 # nightly = true                       # create sandboxes from nightly harness images
+# tern_native = false                  # keep the agent's terminal UI in Tern
 
 # [harness.claude]
 # template = "rust"
@@ -123,6 +124,9 @@ pub struct Config {
     /// Create sandboxes from the harness's nightly image (default: false).
     /// `[harness.<name>] nightly` overrides it for one harness.
     pub nightly: Option<bool>,
+    /// Draw sessions natively in Tern when it can (default: true); false keeps
+    /// the agent's terminal UI. `SAND_TERN_NATIVE` overrides it when set.
+    pub tern_native: Option<bool>,
     /// Overrides for built-in harnesses and definitions of additional ones.
     #[serde(default)]
     pub harness: BTreeMap<String, HarnessOverride>,
@@ -277,6 +281,7 @@ mod tests {
             r#"
             default_harness = "codex"
             nightly = true
+            tern_native = false
 
             [harness.claude]
             template = "rust"
@@ -316,6 +321,7 @@ mod tests {
         assert_eq!(config.sandbox_home(), "/home/agent");
         assert_eq!(config.harness["claude"].template.as_deref(), Some("rust"));
         assert_eq!((config.nightly, config.harness["claude"].nightly), (Some(true), Some(false)));
+        assert_eq!(config.tern_native, Some(false));
         assert_eq!(config.harness["aider"].statusline, Some(StatuslineKind::None));
         assert_eq!(config.templates["rust"].build_args["RUST"], "1.90");
         assert_eq!(config.mcp["pw"].args, vec!["@playwright/mcp@latest"]);

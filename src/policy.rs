@@ -148,6 +148,17 @@ fn read_blocked(sbx: &Sbx, sandbox: &str) -> Result<Vec<Blocked>> {
     Ok(blocked_hosts(parse_log(&text)?, sandbox))
 }
 
+/// Whether sbx logged `host` blocked for `sandbox`: as logged, or by name when
+/// `host` has no port (a proxy message may leave it out).
+pub fn was_blocked(sbx: &Sbx, sandbox: &str, host: &str) -> Result<bool> {
+    Ok(read_blocked(sbx, sandbox)?.iter().any(|b| logged_as(&b.host, host)))
+}
+
+fn logged_as(logged: &str, host: &str) -> bool {
+    let logged = logged.to_ascii_lowercase();
+    logged == host || (!host.contains(':') && logged.split_once(':').is_some_and(|(name, _)| name == host))
+}
+
 /// Refuses output in a shape sand does not know rather than reading it as an
 /// empty log, which would report that nothing is blocked.
 fn parse_log(text: &str) -> Result<PolicyLog> {
@@ -350,6 +361,15 @@ mod tests {
     fn an_empty_log_has_nothing_blocked() {
         assert!(parse("{}").is_empty());
         assert!(parse(r#"{"blocked_hosts": [], "allowed_hosts": []}"#).is_empty());
+    }
+
+    #[test]
+    fn a_host_is_matched_with_or_without_its_port() {
+        assert!(logged_as("PyPI.org:443", "pypi.org"));
+        assert!(logged_as("pypi.org:443", "pypi.org:443"));
+        assert!(!logged_as("pypi.org:443", "pypi.org:80"));
+        assert!(!logged_as("evil.pypi.org:443", "pypi.org"));
+        assert!(!logged_as("pypi.org.evil:443", "pypi.org"));
     }
 
     #[test]
