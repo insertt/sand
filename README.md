@@ -36,7 +36,7 @@ Set `SAND_VERSION` (for example `v0.1.0`) to install a specific release instead
 of the latest, and `SAND_INSTALL_DIR` to install somewhere else. Run the script
 again to upgrade.
 
-To build from source instead, with Rust 1.89 or later:
+To build from source instead, with a recent stable Rust:
 
 ```console
 $ cargo install --locked --path .
