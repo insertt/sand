@@ -68,6 +68,16 @@ pub const STYLE: &str = r#"
 	background: color-mix(in srgb, var(--t1) 6%, transparent);
 }
 [data-role='sand.composer.bar'] .sf-select-label { display: none; }
+/* The effort pill holds Tern's ring and a borderless picker. */
+.sf-row[data-role='sand.composer.effort'] { padding: 0 6px 0 12px !important; gap: 2px !important; }
+.sf-row[data-role='sand.composer.effort'] .sf-select-btn {
+	height: 32px;
+	padding: 0 8px 0 6px !important;
+	box-shadow: none !important;
+	background: transparent !important;
+	font: 14.5px/1 var(--sans) !important;
+}
+[data-role='sand.composer.effort'] .sf-effort { width: 16px; height: 16px; }
 /* A mode other than the default: a pill tinted in its tone. */
 [data-role='sand.composer.mode'][data-tone] .sf-select-btn,
 [data-role='sand.composer.mode'][data-tone].sf-row {
@@ -1138,31 +1148,61 @@ fn chip(t: &Transcript, key: &str, role: &str, icon: &str, text: &str, label: &s
         (Setting::Mode, Some(mode)) if mode != "default" => "warning",
         _ => "accent",
     };
-    if choices.len() > 1 {
+    // The effort leads with Tern's effort ring, as its own chat draws it.
+    let effort = setting == Setting::Effort;
+    let (inner_key, inner_role) = if effort { ("v", None) } else { (key, Some(role)) };
+    let inner: Node<Msg> = if choices.len() > 1 {
         let options: Vec<ui::SelectOption> = choices
             .into_iter()
-            .map(|(value, name)| ui::SelectOption { icon: Some(icon.into()), ..ui::SelectOption::new(value, name) })
+            .map(|(value, name)| ui::SelectOption {
+                icon: (!effort && setting != Setting::Mode).then(|| icon.into()),
+                ..ui::SelectOption::new(value, name)
+            })
             .collect();
         let hint = if setting == Setting::Mode { " · Shift+Tab cycles" } else { "" };
-        let select = ui::select()
-            .key(key)
-            .role(role)
+        let mut select = ui::select()
+            .key(inner_key)
             .variant("quiet")
             .options(options)
             .value(current.unwrap_or_default())
             .title(format!("{label} · click to change{hint}"))
             .on_change(move |change| Msg::Pick(setting, change.value.as_str().unwrap_or_default().to_string()));
-        return if tone == "warning" { select.tone(tone).into() } else { select.into() };
+        if let Some(role) = inner_role {
+            select = select.role(role);
+        }
+        if tone == "warning" { select.tone(tone).into() } else { select.into() }
+    } else {
+        let mut row = ui::row().key(inner_key).gap("xs").align("center").title(label.to_string());
+        if let Some(role) = inner_role {
+            row = row.role(role);
+        }
+        if !effort && setting != Setting::Mode {
+            row = row.child(ui::icon(icon).tone(tone).key("i"));
+        }
+        let row = row.child(ui::text(text.to_string()).key("t"));
+        if tone == "warning" { row.tone(tone).into() } else { row.into() }
+    };
+    if !effort {
+        return inner;
     }
     ui::row()
         .key(key)
         .role(role)
-        .gap("xs")
+        .gap("sm")
         .align("center")
-        .title(label.to_string())
-        .child(ui::icon(icon).tone(tone).key("i"))
-        .child(ui::text(text.to_string()).key("t"))
+        .child(ui::effort(text.to_lowercase().replace(['-', ' '], "").as_str()).key("ring"))
+        .child(inner)
         .into()
+}
+
+/// A path as Tern's chat shortens it: `~/w…/app` for `~/work/clients/app`.
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() <= 3 {
+        return path.to_string();
+    }
+    let first = parts[1].chars().next().map(String::from).unwrap_or_default();
+    format!("{}/{first}…/{}", parts[0], parts[parts.len() - 1])
 }
 
 /// One fact of the status line: an icon and its text, both in `tone`.
@@ -1196,9 +1236,12 @@ fn facts(t: &Transcript, info: &Info) -> Node<Msg> {
         "Sandbox".to_string(),
     ));
     if let Some(branch) = &info.branch {
-        place = place.child(fact("branch", "branch", branch.clone(), "", "Git branch".to_string()));
+        place = place.child(fact("branch", "branch", branch.clone(), "success", "Git branch".to_string()));
     }
     facts.push(place.into());
+    if let Some(workspace) = &info.workspace {
+        facts.push(fact("workspace", "folder", short_path(workspace), "", workspace.clone()));
+    }
     let api = match info.api {
         Some(ApiState::Ok) => Some(("API ✓", "success")),
         Some(ApiState::Blocked) => Some(("API blocked", "error")),
@@ -1437,9 +1480,11 @@ mod tests {
         let texts: Vec<&str> =
             place.child_nodes().iter().map(|f| f.child_nodes()[1].props()["text"].as_str().unwrap()).collect();
         assert_eq!(texts, ["claude-app", "main"], "the sandbox and its branch, on one line");
-        assert_eq!(facts.child_nodes()[1].child_nodes()[1].props()["tone"], "success");
-        let mcp = facts.child_nodes()[2].props();
-        assert_eq!(facts.child_nodes()[2].kind(), "menu");
+        assert_eq!(place.child_nodes()[1].child_nodes()[1].props()["tone"], "success");
+        assert_eq!(facts.child_nodes()[1].child_nodes()[1].props()["text"], "~/src/app");
+        assert_eq!(facts.child_nodes()[2].child_nodes()[1].props()["tone"], "success");
+        let mcp = facts.child_nodes()[3].props();
+        assert_eq!(facts.child_nodes()[3].kind(), "menu");
         assert_eq!(
             (mcp["text"].as_str(), mcp["icon"].as_str(), mcp["tone"].as_str()),
             (Some("MCP 1"), Some("warn"), Some("warning"))
@@ -1463,7 +1508,13 @@ mod tests {
             (chip.child_nodes()[1].props()["text"].as_str().unwrap().to_string(), chip.child_nodes().len())
         };
         assert_eq!(text("sand.composer.model", &v), ("opus".into(), 2));
-        assert_eq!(text("sand.composer.effort", &v), ("high".into(), 2));
+        // The effort: Tern's ring, then its level.
+        let effort = find(region(&v, 1), "sand.composer.effort").unwrap();
+        assert_eq!(
+            (effort.child_nodes()[0].kind(), effort.child_nodes()[0].props()["level"].as_str()),
+            ("effort", Some("high"))
+        );
+        assert_eq!(effort.child_nodes()[1].child_nodes()[0].props()["text"], "high");
 
         t.turn = Turn::Exited;
         t.set_options(&json!([
@@ -1476,7 +1527,9 @@ mod tests {
         let model = picker("sand.composer.model");
         assert_eq!((model["value"].as_str(), model["variant"].as_str()), (Some("sonnet"), Some("quiet")));
         assert_eq!(model["options"][1], json!({"value": "opus", "label": "Opus 5.5", "icon": "sparkle"}));
-        assert_eq!(picker("sand.composer.effort")["options"].as_array().map(Vec::len), Some(2));
+        let effort = find(region(&v, 1), "sand.composer.effort").unwrap();
+        assert_eq!(effort.child_nodes()[0].props()["level"], "low");
+        assert_eq!(effort.child_nodes()[1].props()["options"].as_array().map(Vec::len), Some(2));
         let composer = find(region(&v, 1), "sand.composer").unwrap();
         assert!(composer.child_nodes()[0].props().get("readonly").is_none());
 
@@ -1680,6 +1733,13 @@ mod tests {
         );
         assert_eq!(hunks(None, "x\ny"), json!([{"oldStart": 0, "newStart": 1, "lines": ["+x", "+y"]}]));
         assert_eq!(hunks(Some("same"), "same"), json!([{"oldStart": 1, "newStart": 1, "lines": [" same"]}]));
+    }
+
+    #[test]
+    fn paths_shorten_as_terns_chat_does() {
+        assert_eq!(short_path("~/work/clients/na000009"), "~/w…/na000009");
+        assert_eq!(short_path("~/src/app"), "~/src/app");
+        assert_eq!(short_path("/srv/a/b/c"), "/s…/c");
     }
 
     #[test]
