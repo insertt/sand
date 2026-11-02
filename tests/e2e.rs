@@ -407,9 +407,17 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     let pending = fs::read_to_string(dir.join("pending.json")).unwrap();
     assert!(pending.contains("ap-1") && !pending.contains("ap-2"), "{pending}");
 
+    // Hosts are allowed only when sbx logged them blocked for this sandbox.
+    let blocked = |host: &str, sandbox: &str| format!(r#"{{"host": "{host}", "sandbox_id": "{sandbox}", "count": 1}}"#);
+    let log = ["example.com:443", "refused.com:443", "global.com:443"].map(|h| blocked(h, "claude-proj"));
+    let log =
+        format!(r#"{{"blocked": [{}, {}], "allowed": []}}"#, log.join(", "), blocked("elsewhere.com:443", "codex-x"));
+    fs::write(env.fake.join("policy.json"), log).unwrap();
+
     fs::write(inbox.join("r1.json"), r#"{"host": "example.com:443"}"#).unwrap();
     fs::write(inbox.join("r2.json"), r#"{"host": "evil.com", "approval": "ap-2", "option": "once"}"#).unwrap();
     fs::write(inbox.join("r3.json"), r#"{"host": "*", "approval": null}"#).unwrap();
+    fs::write(inbox.join("r7.json"), r#"{"host": "elsewhere.com:443"}"#).unwrap();
     // A host refused before is blocked by a deny rule: allowing lifts this sandbox's own,
     // but not one that applies to every sandbox.
     for (scope, host, id) in [("claude-proj", "refused.com:443", "rule-1"), ("global", "global.com:443", "rule-2")] {
@@ -422,7 +430,7 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     fs::write(inbox.join("m1.json"), r#"{"kind": "mount", "path": "../other:ro", "reason": "docs"}"#).unwrap();
     // The host and options of an approval come from sbx, whatever the request says.
     fs::write(inbox.join("r4.json"), r#"{"host": "other.com", "approval": "ap-1", "option": "once"}"#).unwrap();
-    for id in ["r1", "r2", "r3", "r4", "r5", "r6", "m1"] {
+    for id in ["r1", "r2", "r3", "r4", "r5", "r6", "r7", "m1"] {
         wait_for(&dir.join(format!("results/{id}.json")), "no result");
     }
     let result = |id: &str| -> serde_json::Value {
@@ -432,6 +440,8 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     // Another sandbox's approval is not this sandbox's to answer, and wildcards are refused.
     assert_eq!(result("r2")["ok"], false, "{}", result("r2"));
     assert_eq!(result("r3")["ok"], false, "{}", result("r3"));
+    // Another sandbox's block is not this one's.
+    assert!(result("r7")["message"].as_str().unwrap().contains("no record of blocking"), "{}", result("r7"));
     let questions = fs::read_to_string(&asked).unwrap();
     assert!(questions.contains("Sandbox 'claude-proj' asks for network access to example.com:443"), "{questions}");
     assert!(questions.contains("network access to pypi.org:443.\n\nAnswer: Allow once"), "{questions}");
@@ -475,7 +485,7 @@ fn network_prompts_are_confirmed_on_the_host_and_applied_for_that_sandbox() {
     // The agent raises desktop notifications through the host's terminal, so it is told which one that is.
     assert!(has(&log, "run --name claude-proj -e TERM_PROGRAM=iTerm.app"), "{log:#?}");
     let record = fs::read_to_string(env.sandbox_dir("claude-proj").join("network-prompts.log")).unwrap();
-    assert_eq!(record.lines().count(), 7, "{record}");
+    assert_eq!(record.lines().count(), 8, "{record}");
     assert!(log.contains(&format!("mount claude-proj {other}:{other}:ro")), "{log:#?}");
 
     // Turned off, the mod and the bridge are gone.

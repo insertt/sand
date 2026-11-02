@@ -395,6 +395,9 @@ pub struct Summary {
 /// Mounts a directory into the running sandbox; answers whether anything changed.
 type Mounter = Box<dyn Fn(&Mount) -> anyhow::Result<bool> + Send>;
 
+/// Whether sbx logged a host blocked for the sandbox.
+type Seen = Box<dyn Fn(&str) -> anyhow::Result<bool> + Send>;
+
 /// Asks the person on the host whether to allow something.
 pub type Confirm = Box<dyn Fn(&str) -> Answer + Send>;
 
@@ -455,8 +458,13 @@ impl Bridge {
             let (sbx, dirs, sandbox) = (sbx.clone(), dirs.clone(), sandbox.clone());
             Box::new(move |mount| session::mount_in_session(&sbx, &dirs, &sandbox, mount))
         };
+        let seen: Seen = {
+            let (sbx, sandbox) = (sbx.clone(), sandbox.clone());
+            Box::new(move |host| crate::policy::was_blocked(&sbx, &sandbox, host))
+        };
         let mut worker = Worker {
             sbx,
+            seen,
             dir: dirs.policy_dir(&sandbox),
             inbox: dirs.requests_dir(&sandbox),
             log: dirs.sandbox_dir(&sandbox).join("network-prompts.log"),
@@ -499,6 +507,9 @@ impl Bridge {
 
 struct Worker {
     sbx: Sbx,
+    /// Hosts come from text the agent controls (the mod's request, a tool's
+    /// output); only one sbx really blocked is offered.
+    seen: Seen,
     dirs: Dirs,
     sandbox: String,
     /// What sand writes back; read-only in the sandbox.
@@ -803,6 +814,21 @@ impl Worker {
         if !confirmed && self.declined.get(host).is_some_and(|at| at.elapsed() < DECLINE_COOLDOWN) {
             return Outcome::done(format!("{host}: declined on the host a moment ago"));
         }
+        // Without this the agent could print a block message for any host and
+        // have it offered as if the policy had stopped it.
+        match (self.seen)(host) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Outcome::failed(format!(
+                    "sbx has no record of blocking {host} for this sandbox; nothing was allowed"
+                ));
+            }
+            Err(err) => {
+                return Outcome::failed(format!(
+                    "sand could not check that {host} was blocked ({err:#}); allow it on the host with `sand allow`"
+                ));
+            }
+        }
         // A deny rule (an earlier refusal) wins over any allow, and sbx refuses an
         // allow beside a deny of the same scope, so allowing has to remove it.
         let deny = self.deny_rule(host);
@@ -1018,6 +1044,7 @@ mod tests {
         let dirs = Dirs { home: root.join("home"), data: root.join("data"), config_file: root.join("config.toml") };
         let worker = Worker {
             sbx: Sbx::with_bin("/nonexistent/sbx"),
+            seen: Box::new(|host| Ok(host != "never.example")),
             dirs,
             mounter: Box::new(|mount| Ok(!mount.path.ends_with("already"))),
             sandbox: "claude-proj".into(),
@@ -1276,6 +1303,18 @@ mod tests {
         assert_eq!(outcome.message, "a.com: declined on the host");
         assert!(!requests.join("one.json").exists());
         assert!(fs::read_to_string(tmp.path().join("log")).unwrap().contains(r#""host":"a.com""#));
+    }
+
+    #[test]
+    fn only_hosts_sbx_logged_blocked_can_be_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
+        // As if from the native UI, already confirmed there: still checked.
+        let outcome = worker.answer_allow("never.example", true);
+        assert!(!outcome.ok && outcome.message.contains("no record of blocking"), "{outcome:?}");
+        assert!(!worker.answer_allow("never.example", false).ok);
+        assert!(asked.lock().unwrap().is_empty(), "nothing to ask about");
+        assert!(worker.summary.lock().unwrap().allowed.is_empty());
     }
 
     #[test]

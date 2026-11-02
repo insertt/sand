@@ -352,6 +352,11 @@ mount that contains it. The mod is loaded through `CLAUDE_CODE_PLUGIN_DIRS` in
 the sandbox's Claude Code settings. Set `network_prompts = false` under
 `[harness.claude]` to leave it out.
 
+A host is only allowed, from the mod or from sand's own UI, when `sbx policy
+log` shows the sandbox was really blocked from reaching it, so the agent cannot
+get a row for a host by printing a block message. It can still try to reach any
+host to get one, so read the host before you allow it.
+
 ## MCP servers
 
 `sbx` owns the MCP registry. Register a server once with `sbx mcp add`, or
