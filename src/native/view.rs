@@ -46,7 +46,13 @@ pub const STYLE: &str = r#"
 [data-role='sand.composer.context'] { margin: 0 4px; }
 [data-role='sand.composer.bar'] { gap: 8px; min-width: 0; font: 12.5px/1.3 var(--sans); }
 [data-role='sand.composer.bar'] > * { flex: none; }
-[data-role='sand.composer.bar'] > [data-role='sand.composer.extras'] { flex: 1 1 auto !important; min-width: 0; overflow: hidden; }
+[data-role='sand.composer.facts'] {
+	gap: 4px 14px;
+	padding: 4px 4px 0;
+	border-top: 1px solid color-mix(in srgb, var(--t1) 8%, transparent);
+	font: 12px/1.3 var(--sans);
+	color: var(--t3);
+}
 :is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']).sf-row {
 	padding: 2px 8px;
 	border-radius: 999px;
@@ -727,7 +733,7 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
                 .total(compact(size)),
         );
     }
-    col.child(editor).child(bar(t, info)).into()
+    col.child(editor).child(bar(t, info)).child(facts(t, info)).into()
 }
 
 /// The model or effort: a picker of the agent's choices once it offers
@@ -768,7 +774,54 @@ fn chip(t: &Transcript, key: &str, role: &str, icon: &str, text: &str, label: &s
         .into()
 }
 
-/// The status line's facts, in the composer's bar.
+/// One fact of the status line: an icon and its text, both in `tone`.
+fn fact(key: &str, icon: &str, text: String, tone: &str, title: String) -> Node<Msg> {
+    let icon = ui::icon(icon).key("i");
+    let text = ui::text(text).key("t");
+    let (icon, text) = if tone.is_empty() { (icon, text) } else { (icon.tone(tone), text.tone(tone)) };
+    ui::row().key(key).gap("xs").align("center").title(title).child(icon).child(text).into()
+}
+
+/// The status line's facts about where the session runs, on a line of their
+/// own under the bar: they wrap rather than give way, however long the chips.
+fn facts(t: &Transcript, info: &Info) -> Node<Msg> {
+    let mut facts = Vec::new();
+    let state = match t.turn {
+        Turn::Setup if t.setup.failed() => Some(("setup failed", "error", "x-circle")),
+        Turn::Setup => Some(("setting up", "pending", "box")),
+        Turn::Starting => Some(("starting", "pending", "play")),
+        Turn::Exited => Some(("exited", "error", "x-circle")),
+        _ => None,
+    };
+    if let Some((text, tone, icon)) = state {
+        facts.push(fact("state", icon, text.to_string(), tone, "Session".to_string()));
+    }
+    facts.push(fact("sandbox", "box", info.sandbox.clone(), "accent", "Sandbox".to_string()));
+    if let Some(branch) = &info.branch {
+        facts.push(fact("branch", "branch", branch.clone(), "", "Git branch".to_string()));
+    }
+    let api = match info.api {
+        Some(ApiState::Ok) => Some(("API ✓", "success")),
+        Some(ApiState::Blocked) => Some(("API blocked", "error")),
+        Some(ApiState::Unreachable) => Some(("API ✗", "error")),
+        _ => None,
+    };
+    if let Some((text, tone)) = api {
+        let title = info.api_host.clone().unwrap_or_else(|| "The agent's API".to_string());
+        facts.push(fact("api", "globe", text.to_string(), tone, title));
+    }
+    if info.mcp.is_empty() {
+        facts.push(fact("mcp", "plug", "MCP none".to_string(), "muted", "MCP servers".to_string()));
+    }
+    for (i, server) in info.mcp.iter().enumerate() {
+        let (mark, tone) = mcp_mark(server.state);
+        let title = format!("MCP server {}", server.name);
+        facts.push(fact(&format!("mcp{i}"), "plug", format!("{} {mark}", server.name), tone, title));
+    }
+    ui::row().key("facts").role("sand.composer.facts").align("center").wrap(true).children(facts).into()
+}
+
+/// The composer's bar: the model, effort and mode pickers, the cost and send.
 fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
     let mut row = ui::row().key("bar").role("sand.composer.bar").align("center");
     row = row.child(chip(t, "model", "sand.composer.model", "sparkle", info.model(t), "Model", Setting::Model));
@@ -779,47 +832,8 @@ fn bar(t: &Transcript, info: &Info) -> Node<Msg> {
         row = row.child(chip(t, "mode", "sand.composer.mode", "shield", mode, "Mode", Setting::Mode));
     }
 
-    let mut status = ui::status().key("extras").role("sand.composer.extras").transparent(true).grow(1.0);
-    let state = match t.turn {
-        Turn::Setup if t.setup.failed() => Some(("setup failed", "error", "x-circle")),
-        Turn::Setup => Some(("setting up", "pending", "box")),
-        Turn::Starting => Some(("starting", "pending", "play")),
-        Turn::Exited => Some(("exited", "error", "x-circle")),
-        _ => None,
-    };
-    if let Some((text, tone, icon)) = state {
-        status = status.child(ui::seg(text).key("state").icon(icon).tone(tone).priority(10.0));
-    }
-    status = status
-        .child(ui::seg(info.sandbox.clone()).key("sandbox").icon("box").tone("accent").priority(9.0).title("Sandbox"));
-    if let Some(branch) = &info.branch {
-        status = status.child(ui::seg(branch.clone()).key("branch").icon("branch").priority(3.0).title("Git branch"));
-    }
-    let api = match info.api {
-        Some(ApiState::Ok) => Some(("API ✓", "success")),
-        Some(ApiState::Blocked) => Some(("API blocked", "error")),
-        Some(ApiState::Unreachable) => Some(("API ✗", "error")),
-        _ => None,
-    };
-    if let Some((text, tone)) = api {
-        let title = info.api_host.clone().unwrap_or_else(|| "The agent's API".to_string());
-        status = status.child(ui::seg(text).key("api").icon("globe").tone(tone).priority(6.0).title(title));
-    }
-    if info.mcp.is_empty() {
-        status = status.child(ui::seg("MCP none").key("mcp").icon("plug").tone("muted").priority(2.0));
-    }
-    for (i, server) in info.mcp.iter().enumerate() {
-        let (mark, tone) = mcp_mark(server.state);
-        status = status.child(
-            ui::seg(format!("{} {mark}", server.name))
-                .key(format!("mcp{i}"))
-                .icon("plug")
-                .tone(tone)
-                .priority(4.0)
-                .title(format!("MCP server {}", server.name)),
-        );
-    }
-    row = row.child(status);
+    // The chips take what they need; cost and send sit at the right.
+    row = row.child(ui::row().key("fill").grow(1.0));
 
     if let Some(usd) = t.cost {
         row = row.child(
@@ -897,7 +911,8 @@ mod tests {
         assert_eq!(setup.props()["lines"][0]["status"], "running");
         let working = find(region(&v, 1), "omp.working").expect("a working line");
         assert_eq!(find(working.child_nodes(), "omp.working.label").unwrap().props()["text"], "Starting the sandbox");
-        assert_eq!(find(region(&v, 1), "sand.composer.extras").unwrap().child_nodes()[0].props()["text"], "setting up");
+        let facts = find(region(&v, 1), "sand.composer.facts").unwrap();
+        assert_eq!(facts.child_nodes()[0].child_nodes()[1].props()["text"], "setting up");
 
         t.setup.finish(now + Duration::from_secs(12));
         t.turn = Turn::Idle;
@@ -976,11 +991,15 @@ mod tests {
         let dock = region(&v, 1);
         let context = find(dock, "sand.composer.context").expect("a context bar");
         assert_eq!((context.props()["value"].as_f64(), context.props()["label"].as_str()), (Some(0.4), Some("40%")));
-        let extras = find(dock, "sand.composer.extras").unwrap();
-        let segs: Vec<(&str, &str)> = extras
+        let facts = find(dock, "sand.composer.facts").unwrap();
+        assert_eq!(facts.props()["wrap"], true);
+        let segs: Vec<(&str, &str)> = facts
             .child_nodes()
             .iter()
-            .map(|s| (s.props()["text"].as_str().unwrap(), s.props().get("tone").and_then(Value::as_str).unwrap_or("")))
+            .map(|f| {
+                let text = &f.child_nodes()[1];
+                (text.props()["text"].as_str().unwrap(), text.props().get("tone").and_then(Value::as_str).unwrap_or(""))
+            })
             .collect();
         assert_eq!(segs, [("claude-app", "accent"), ("main", ""), ("API ✓", "success"), ("github ⚠ auth", "warning")]);
         assert_eq!(find(dock, "sand.composer.usage").unwrap().props()["spans"][0]["t"], "$0.04");
