@@ -187,8 +187,9 @@ pub enum Msg {
         len: usize,
     },
     Undo,
-    /// A queued follow-up taken back, and the paused queue's two choices.
+    /// A queued follow-up taken back, or sent at once (stopping the turn).
     Unqueue(usize),
+    ForceQueued(usize),
     QueueContinue,
     QueueDiscard,
     DismissNotes,
@@ -916,6 +917,15 @@ fn queue(t: &Transcript) -> Node<Msg> {
                 .child(ui::text(spans(&[("queued · ", "muted"), (&line, "")])).key("t").grow(1.0))
                 .child(ui::text(spans(&[(&format!("{}/{total}", i + 1), "muted mono")])).key("n"))
                 .child(
+                    ui::button("Send now")
+                        .key("force")
+                        .variant("quiet")
+                        .size("sm")
+                        .icon("send")
+                        .title("Stop the current turn and send this now (Ctrl+Enter sends the draft now)")
+                        .on_click(Msg::ForceQueued(i)),
+                )
+                .child(
                     ui::button("✕")
                         .key("drop")
                         .variant("quiet")
@@ -1093,7 +1103,7 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
         _ if !t.queue.is_empty() && t.turn != Turn::Idle => "Another follow-up? It waits its turn".to_string(),
         Turn::Setup | Turn::Starting => format!("Ask {} anything — it is sent once the agent is ready", info.product),
         Turn::Working if t.permission.is_some() => "Enter allows · Esc denies".to_string(),
-        Turn::Working => format!("Esc stops {} · Enter queues a follow-up", info.product),
+        Turn::Working => format!("Esc stops {} · Enter queues · Ctrl+Enter sends now", info.product),
         Turn::Idle => format!("Ask {} anything — / for commands", info.product),
         Turn::Exited => "Enter closes".to_string(),
     };

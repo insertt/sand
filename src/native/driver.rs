@@ -73,6 +73,8 @@ pub struct Driver {
     can_image: bool,
     /// Images pasted so far, for their names.
     pasted_count: usize,
+    /// A message forced past the running turn: sent once its stop is confirmed.
+    forced: Option<Prompt>,
     can_resume: bool,
     /// The session to go back to if resuming another fails.
     previous: Option<String>,
@@ -115,6 +117,7 @@ impl Driver {
             can_load: false,
             can_image: false,
             pasted_count: 0,
+            forced: None,
             can_resume: false,
             previous: None,
             reply: None,
@@ -526,6 +529,12 @@ impl Driver {
             (Call::Prompt, Ok(result)) => {
                 let stop = result["stopReason"].as_str();
                 self.t.turn_ended(stop, &result["usage"], now);
+                if let Some(prompt) = self.forced.take() {
+                    // The stop was for this message: it goes now, and the queue runs on after it.
+                    self.t.queue_paused = false;
+                    self.prompt(prompt);
+                    return;
+                }
                 let product = self.info.product.clone();
                 match stop {
                     Some("end_turn") | None => {
@@ -542,6 +551,10 @@ impl Driver {
                 self.t.note(format!("{} failed: {err}", self.info.product), "error");
                 self.t.error(err, None);
                 self.t.turn_ended(None, &Value::Null, now);
+                // A forced message waits at the head of the paused queue.
+                if let Some(prompt) = self.forced.take() {
+                    self.t.queue.insert(0, prompt);
+                }
                 self.pause_queue();
             }
             (Call::SetMode, Ok(_)) => self.t.mode = self.asked_mode.take().or(self.t.mode.take()),
@@ -556,6 +569,54 @@ impl Driver {
                 self.t.error(format!("The mode could not be changed: {err}"), None);
             }
         }
+    }
+
+    /// Sends `prompt` now: at once when the agent is free, else by stopping
+    /// the running turn and sending it as soon as the stop is confirmed.
+    fn force(&mut self, prompt: Prompt) {
+        if prompt.is_empty() {
+            return;
+        }
+        match self.t.turn {
+            Turn::Idle => self.prompt(prompt),
+            Turn::Working => {
+                // A second force while the first waits: the first goes back to the queue's head.
+                if let Some(earlier) = self.forced.replace(prompt) {
+                    self.t.queue.insert(0, earlier);
+                }
+                if let Some(session) = self.session.clone() {
+                    if let Some(permission) = self.t.permission.take() {
+                        let sent = self.client().map(|c| c.permit(permission.request, None));
+                        self.check(sent);
+                    }
+                    let sent = self.client().map(|c| c.cancel(&session));
+                    self.check(sent);
+                }
+            }
+            // Nothing runs to stop: it waits at the head of the queue.
+            Turn::Setup | Turn::Starting => self.t.queue.insert(0, prompt),
+            Turn::Exited => {}
+        }
+    }
+
+    /// Ctrl+Enter: the draft forced past the running turn.
+    fn force_draft(&mut self) {
+        if (self.composer.is_empty() && self.composer.images.is_empty()) || self.t.turn == Turn::Exited {
+            return;
+        }
+        if !self.composer.images.is_empty() && !self.can_image && self.session.is_some() {
+            let product = &self.info.product;
+            self.t.error(format!("{product} does not take images over ACP; remove them to send"), None);
+            return;
+        }
+        let text = self.composer.take();
+        if commands::parse(&text).is_some() && self.composer.images.is_empty() {
+            // Commands run as Enter runs them.
+            self.composer.set(&text);
+            return self.submit();
+        }
+        let prompt = Prompt { text, images: std::mem::take(&mut self.composer.images) };
+        self.force(prompt);
     }
 
     /// A stop or a failure holds the follow-ups until the person says.
@@ -858,6 +919,12 @@ impl Driver {
                 }
                 self.t.queue_paused &= !self.t.queue.is_empty();
             }
+            Msg::ForceQueued(index) => {
+                if index < self.t.queue.len() {
+                    let prompt = self.t.queue.remove(index);
+                    self.force(prompt);
+                }
+            }
             Msg::QueueContinue => {
                 self.t.queue_paused = false;
                 self.flush_queue();
@@ -969,6 +1036,8 @@ impl Driver {
             }
         } else if key.is("shift+tab") {
             self.next_mode();
+        } else if key.is("ctrl+enter") || key.is("meta+enter") {
+            self.force_draft();
         } else if key.is("enter") {
             self.submit();
         } else if (key.name == "paste" && key.text.as_deref().is_none_or(str::is_empty)) || key.is("ctrl+v") {
@@ -1231,5 +1300,34 @@ mod tests {
         assert_eq!((d.composer.images.len(), d.composer.draft.as_str()), (1, "look"));
         d.msg(Msg::RemoveImage(0));
         assert!(d.composer.images.is_empty());
+    }
+
+    #[test]
+    fn force_send_stops_the_turn_and_goes_first() {
+        let mut d = working();
+        type_and_send(&mut d, "first");
+        type_and_send(&mut d, "later");
+        type_and_send(&mut d, "urgent");
+        // The queued "urgent" is sent now: the turn stops, and it goes once the stop is confirmed.
+        d.msg(Msg::ForceQueued(1));
+        assert_eq!(d.forced, Some(Prompt::text("urgent")));
+        assert_eq!(d.t.queue, [Prompt::text("later")]);
+        end_turn(&mut d, "cancelled");
+        assert!(matches!(d.t.entries.last(), Some(Entry::User(text, _)) if text == "urgent"));
+        assert!(!d.t.queue_paused, "the queue runs on after it");
+        end_turn(&mut d, "end_turn");
+        assert!(matches!(d.t.entries.last(), Some(Entry::User(text, _)) if text == "later"));
+
+        // Ctrl+Enter forces the draft; while idle it simply sends.
+        end_turn(&mut d, "end_turn");
+        d.composer.set("now");
+        d.key(&Key { ctrl: true, ..Key::named("enter") });
+        assert!(matches!(d.t.entries.last(), Some(Entry::User(text, _)) if text == "now"));
+        d.composer.set("now again");
+        d.key(&Key { ctrl: true, ..Key::named("enter") });
+        assert_eq!(d.forced, Some(Prompt::text("now again")));
+        // A failed turn keeps a forced message at the head of the paused queue.
+        d.response(Call::Prompt, Err("overloaded".into()), Instant::now());
+        assert_eq!((d.t.queue.first(), d.t.queue_paused), (Some(&Prompt::text("now again")), true));
     }
 }

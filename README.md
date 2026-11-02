@@ -480,7 +480,10 @@ Shift+arrows, ⌘A, ⌘Z to undo, even a sent draft) and shows the rest of a
 command being typed faintly after the caret. Messages written while the agent
 works (or starts) wait above the composer, up to eight, each with a ✕ to take
 it back, and go in order as each turn ends; after a stop or a failure the
-queue pauses until you continue or discard it. A new session's welcome offers
+queue pauses until you continue or discard it. A queued message's **Send
+now** button, or Ctrl+Enter on the draft, sends it at once instead: ACP has
+no way into a running turn, so the turn is stopped and the message goes as
+soon as the agent confirms, with the rest of the queue after it. A new session's welcome offers
 to continue the last conversation, and a few prompts to start with. While the
 pane is hidden, what happens (a finished turn, a permission request, the agent
 exiting) is noted above the composer for when you come back. Each turn ends
