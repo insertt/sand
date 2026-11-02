@@ -76,8 +76,15 @@ pub const STYLE: &str = r#"
 	background: var(--l2);
 	font: 12.5px/1.4 var(--sans);
 }
-/* Room under the last turn: its footer and tooltips clear the floating composer. */
-.sf-spacer[data-role='sand.tail'] { height: calc(5 * var(--sf-lh, 18px)) !important; }
+/* Room under the last turn, so that its footer clears the floating composer. */
+.sf-spacer[data-role='sand.tail'] { height: calc(2 * var(--sf-lh, 18px)) !important; }
+/* The composer sits at the pane's bottom: its menus open upward, over the chip. */
+[data-role='sand.composer'] .sf-menu > .sf-menu-pop {
+	top: auto !important;
+	bottom: calc(100% + 4px) !important;
+	max-height: 60vh;
+	overflow-y: auto;
+}
 /* A tool's head: its label centered on its icon, however many lines it takes. */
 .sf-tool > .sf-tool-head { align-items: center; }
 .sf-tool > .sf-tool-head > :is(.sf-tool-ic, .sf-tool-line, .sf-tool-time, .sf-tool-st, .sf-chev) { align-self: center; }
