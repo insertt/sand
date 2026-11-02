@@ -796,8 +796,9 @@ fn tool_node(key: String, tool: &ToolCall, permission: Option<&Permission>) -> N
         ToolStatus::Failed => "error",
         ToolStatus::Cancelled => "cancelled",
     };
-    // As omp: a line of its own, framed only when it failed or asks.
-    node = node.status(status).frame(if failed || permission.is_some() { "card" } else { "inline" });
+    // Framed as Tern's own tool steps: a ring, a status bar and a tint while
+    // it runs, waits or fails.
+    node = node.status(status).frame("card");
     node = match tool.finished {
         // Tern counts on from the first `age` it gets; an unchanged one sends nothing.
         None => node.age(0i64),
@@ -1322,9 +1323,9 @@ fn facts(t: &Transcript, info: &Info) -> Node<Msg> {
     ui::row().key("facts").role("sand.composer.facts").align("center").wrap(true).children(facts).into()
 }
 
-/// The MCP servers: their worst state on the trigger (green when all are
-/// fine, a warning when one needs attention, failed when one failed), and
-/// each server's state in its menu.
+/// The MCP servers: a plug, then their worst state as a mark after the count,
+/// as API shows its own (green when all are fine, a warning when one needs
+/// attention, failed when one failed), and each server's state in its menu.
 fn mcp_menu(mcp: &[McpStatus]) -> Node<Msg> {
     if mcp.is_empty() {
         return fact("mcp", "plug", "MCP none".to_string(), "muted", "No MCP servers".to_string());
@@ -1336,11 +1337,11 @@ fn mcp_menu(mcp: &[McpStatus]) -> Node<Msg> {
         McpState::Error => 3,
     };
     let state = mcp.iter().map(|s| s.state).max_by_key(|s| worst(*s)).unwrap_or(McpState::Unknown);
-    let (icon, tone, summary) = match state {
-        McpState::Ok => ("check", "success", "all connected"),
-        McpState::Unknown => ("help", "muted", "not checked yet"),
-        McpState::NeedsAuth => ("warn", "warning", "one needs attention"),
-        McpState::Error => ("x-circle", "error", "one failed"),
+    let (mark, tone, summary) = match state {
+        McpState::Ok => ("✓", "success", "all connected"),
+        McpState::Unknown => ("?", "muted", "not checked yet"),
+        McpState::NeedsAuth => ("⚠", "warning", "one needs attention"),
+        McpState::Error => ("✗", "error", "one failed"),
     };
     let mut items = vec![json!({"header": "MCP servers"})];
     items.extend(mcp.iter().map(|server| {
@@ -1362,8 +1363,8 @@ fn mcp_menu(mcp: &[McpStatus]) -> Node<Msg> {
         .role("sand.composer.mcp")
         .tone(tone)
         .title(format!("MCP servers: {summary}"))
-        .prop("text", format!("MCP {}", mcp.len()))
-        .prop("icon", icon)
+        .prop("text", format!("MCP {} {mark}", mcp.len()))
+        .prop("icon", "plug")
         .prop("trigger", "quiet")
         .prop("size", "sm")
         .prop("caret", true)
@@ -1526,7 +1527,7 @@ mod tests {
         let kinds: Vec<&str> = turn.child_nodes().iter().map(Node::kind).collect();
         assert_eq!(kinds, ["tool", "tool", "md", "row"]);
         let bash = &turn.child_nodes()[0];
-        assert_eq!((bash.props()["title"].as_str(), bash.props()["frame"].as_str()), (Some("Bash"), Some("inline")));
+        assert_eq!((bash.props()["title"].as_str(), bash.props()["frame"].as_str()), (Some("Bash"), Some("card")));
         assert_eq!(bash.child_nodes()[0].props()["text"], "ok");
         assert_eq!(bash.child_nodes()[1].props()["role"], "omp.run.status");
         let edit = &turn.child_nodes()[1];
@@ -1553,7 +1554,7 @@ mod tests {
         assert_eq!(facts.child_nodes()[3].kind(), "menu");
         assert_eq!(
             (mcp["text"].as_str(), mcp["icon"].as_str(), mcp["tone"].as_str()),
-            (Some("MCP 1"), Some("warn"), Some("warning"))
+            (Some("MCP 1 ⚠"), Some("plug"), Some("warning"))
         );
         assert_eq!(mcp["items"][1]["label"], "github");
         assert_eq!(mcp["items"][1]["detail"], "needs authorization: sbx mcp auth github");
@@ -1782,11 +1783,12 @@ mod tests {
     fn the_mcp_menu_shows_the_worst_state() {
         let server = |name: &str, state| McpStatus { name: name.into(), state };
         let ok = mcp_menu(&[server("a", McpState::Ok), server("b", McpState::Ok)]);
-        assert_eq!((ok.props()["icon"].as_str(), ok.props()["tone"].as_str()), (Some("check"), Some("success")));
+        assert_eq!((ok.props()["text"].as_str(), ok.props()["tone"].as_str()), (Some("MCP 2 ✓"), Some("success")));
+        assert_eq!(ok.props()["icon"], "plug");
         let failed = mcp_menu(&[server("a", McpState::NeedsAuth), server("b", McpState::Error)]);
         assert_eq!(
-            (failed.props()["icon"].as_str(), failed.props()["tone"].as_str()),
-            (Some("x-circle"), Some("error"))
+            (failed.props()["text"].as_str(), failed.props()["tone"].as_str()),
+            (Some("MCP 2 ✗"), Some("error"))
         );
         assert_eq!(failed.props()["items"][2]["danger"], true);
         assert_eq!(mcp_menu(&[]).kind(), "row");
