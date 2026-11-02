@@ -28,9 +28,8 @@ What it gives you on top of `sbx run`:
 
 ## Project status
 
-`sand` is pre-1.0 (the version in `Cargo.toml` is 0.1.0) and under active
-development; flags, config keys and on-disk state can still change between
-releases.
+`sand` is pre-1.0 and under active development;
+flags, config keys and on-disk state can still change between releases.
 
 | Area | State |
 | --- | --- |
