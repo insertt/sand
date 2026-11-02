@@ -513,7 +513,6 @@ mod tests {
         })
     }
 
-
     #[test]
     fn the_command_line_forces_native_sessions_on_or_off() {
         let profile = Profile::resolve("claude", &crate::config::Config::default()).unwrap();

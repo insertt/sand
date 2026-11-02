@@ -6,10 +6,43 @@ servers, copies your harness configuration in, keeps conversation history
 across rebuilds, and logs every step and every `sbx` command it runs.
 
 ```console
-$ sand codex . ../shared-lib:ro ../docs:rw
+$ sand claude . ../shared-lib:ro ../docs:rw
 ```
 
 ![sand starting an agent in a sandbox](demo.webp)
+
+What it gives you on top of `sbx run`:
+
+- one command per project: the sandbox is found or created, and extra mounts
+  and MCP servers are reconciled with what you ask for;
+- your harness configuration (settings, instructions, commands, agents,
+  plugins, hooks, skills) follows you into the sandbox on every launch;
+- conversation history survives rebuilds and `sbx rm`;
+- a status line with the sandbox, git branch, API and MCP state, and your
+  subscription limits;
+- blocked network access and mounts can be granted while the agent works,
+  from a second terminal, from a prompt inside Claude Code, or from
+  [Tern](#tern);
+- ACP for [editors](#editors) (Zed, JetBrains, Tern), with Google Vertex AI as
+  an [authentication](#authentication) option.
+
+## Project status
+
+`sand` is pre-1.0 (the version in `Cargo.toml` is 0.1.0) and under active
+development; flags, config keys and on-disk state can still change between
+releases.
+
+| Area | State |
+| --- | --- |
+| Platforms | Linux (x86-64, arm64), macOS (Intel, Apple silicon) and Windows (x86-64). CI builds and tests on all three. |
+| Harnesses | `claude`, `codex` and `opencode` are built in, with config copy, history and status. Every other `sbx` agent (`copilot`, `cursor`, `devin`, `docker-agent`, `droid`, `gemini`, `kiro`, `shell`) runs without those, and you can [define your own](#configuration). |
+| Terminal UI | The default: `sand <harness>` opens the agent's own UI in your terminal. |
+| Vertex AI | Built-in wiring for Claude Code; other harnesses describe theirs with `vertex_overlay`. |
+| ACP for editors | `--install-acp` registers Zed, JetBrains and Tern. The first start of a new sandbox can be slow enough for an editor to time out. |
+| Tern native surface | The whole session drawn in a [Tern](#tern) pane. It is the newest part and changes the most; `--no-native` opts out per run. |
+
+`sand` needs `sbx` installed and signed in; it does not install or update `sbx`
+itself.
 
 ## Install
 
@@ -67,24 +100,29 @@ the same.
 | `--name NAME` | Sandbox name. The default is `<harness>-<directory>`. |
 | `--template T` | Create the sandbox from a template (see [Templates](#templates)). |
 | `--acp` | Speak ACP on stdio instead of opening the terminal UI (see [Editors](#editors)). |
+| `--native`, `--no-native` | Draw the session natively in [Tern](#tern), or open the agent's terminal UI, for this run. Both win over `tern_native` and `SAND_TERN_NATIVE`. |
 | `--install-acp zed\|jetbrains\|tern` | Register `sand [HARNESS] --acp` in the editor or terminal, then exit. |
 | `--open-config` | Open the [config file](#configuration) in your editor, then exit. |
 | `--on-conflict replace\|merge\|abort` | Answer the "sandbox exists with a different setup" question up front. |
 | `-v`, `--verbose` | Echo every `sbx` command sand runs and show its output (otherwise shown only when a command fails). Works with the subcommands too. |
 
-Other commands: `sand status [HARNESS] [DIR]` prints everything sand recorded
-about a sandbox (harness, kind, creation time, template, nightly image, mounts
-including sand's own, MCP servers, data directory), whether sbx reports it
-running and whether a `sand` session is attached, and checks whether the agent
-API is reachable from inside it and how the MCP servers are doing. The API
-check runs only while the sandbox is running, so `sand status` never starts
-one; `--no-probe` skips both checks and runs nothing inside the sandbox, and
-`--json` prints the same on stdout for scripts. `sand describe` is an alias.
-`sand allow [HARNESS] [DIR]` opens the network for hosts the sandbox was blocked from reaching (see
-[Blocked network access](#blocked-network-access)). `sand mount [HARNESS]
-DIR[:ro|:rw]...` and `sand umount [HARNESS] DIR...` add and remove extra mounts
-of an existing sandbox (see [Adding mounts later](#adding-mounts-later)).
-`sand template build|save|ls|rm` manages templates.
+Other commands:
+
+| Command | Effect |
+| --- | --- |
+| `sand status [HARNESS] [DIR]` | Everything sand recorded about a sandbox, and live checks (below). `sand describe` is an alias. |
+| `sand allow [HARNESS] [DIR]` | Allow hosts the sandbox was blocked from reaching (see [Blocked network access](#blocked-network-access)). |
+| `sand mount [HARNESS] DIR[:ro\|:rw]...` | Add extra mounts to an existing sandbox, also while an agent runs (see [Adding mounts later](#adding-mounts-later)). |
+| `sand umount [HARNESS] DIR...` | Remove them again. |
+| `sand template build\|save\|ls\|rm` | Manage [templates](#templates). |
+
+`sand status` prints the harness, kind, creation time, template, nightly image,
+mounts (sand's own included), MCP servers and data directory, whether `sbx`
+reports the sandbox running and whether a `sand` session is attached, and checks
+whether the agent API is reachable from inside it and how the MCP servers are
+doing. The live checks run only while the sandbox is running, so `sand status`
+never starts one; `--no-probe` skips them and runs nothing inside the sandbox,
+and `--json` prints the same on stdout for scripts.
 
 ### When the sandbox already exists
 
@@ -113,9 +151,9 @@ everything ticked:
 - MCP servers the sandbox has and the command line does not name.
 
 So `sand claude --recreate` rebuilds the sandbox with its history, mounts and
-MCP servers, and unticking an item leaves it out. When there is nothing to keep, it does not ask. It needs a
-terminal (or Tern's native surface, which asks one item at a time); without one
-it fails before removing anything. `--force-recreate` asks nothing and keeps
+MCP servers, and unticking an item leaves it out. When there is nothing to keep,
+it does not ask. It needs a terminal (or Tern's native surface, which asks one
+item at a time); without one it fails before removing anything. `--force-recreate` asks nothing and keeps
 nothing the command line does not name, history included:
 
 ```console
@@ -154,7 +192,8 @@ choosing a mount has `sand` confirm it in a dialog on the host (see
 directory and mode, before it mounts it as `sand mount` would. `~` is your home
 on the host and relative paths start at the primary workspace. The agent cannot
 ask for a directory inside a read-write mount of its sandbox (it could swap it
-for a link while you read the dialog); use `sand mount` or `/mount` for that.
+for a link while you read the dialog); use `sand mount`, or `/mount` in
+[Tern](#tern), for that.
 The directory appears at the same path inside the sandbox, the agent is told
 once it is there, and it stays mounted like one `sand mount` added. On the next
 launch it is also a working directory of Claude Code, as every extra mount is
@@ -406,6 +445,7 @@ A template is an image with your tooling already installed. Three ways to get on
 # config.toml
 [templates.rust]
 dockerfile = "~/sand/rust.Dockerfile"   # built with `sand template build rust`
+context = "~/sand"                      # build context (default: the Dockerfile's directory)
 build_args = { RUST_VERSION = "1.90" }
 
 [templates.corp]
@@ -506,8 +546,14 @@ as a prompt, and sand's, which ACP offers as methods rather than commands:
 `/sessions` (or `/resume` without an id) lists the agent's sessions for this
 project in a picker, and resumes the one you choose, replaying its
 conversation when the agent can; `/resume <id>` resumes one directly; `/new`
-starts a new session; and `/help` lists them all. Resuming needs an agent that
-supports ACP's session listing and loading.
+(or `/clear`) starts a new session; `/fork` goes on in a copy of the current
+session; `/mount <dir>[:ro|:rw]` mounts a directory of your computer into the
+sandbox, like `sand mount`, with no further question since you typed it; and
+`/help` lists them all. Resuming and forking need an agent that supports ACP's
+session listing, loading and forking.
+
+Typing `@` completes file names from the workspace, and `@../` reaches into the
+other directories the sandbox has mounted.
 
 The composer edits like a native text field (select with the mouse or
 Shift+arrows, ⌘A, ⌘Z to undo, even a sent draft) and shows the rest of a
@@ -532,9 +578,12 @@ xclip on Linux, PowerShell on Windows), which over ssh is not yours.
 
 Network access the sandbox was blocked from shows above the composer as a
 card with sbx's own options (allow once, always, deny…), answered with a
-click, for any harness; requests from sand's Claude Code mod to mount a
-directory or allow a host ask there too, instead of in a host dialog. Both are
-noted when they come in while the pane is hidden.
+click, for any harness. Claude Code's requests to mount a directory or allow a
+host ask there too, instead of in a host dialog: the mod cannot run, since
+Claude Code's own UI is not on screen, so `sand` gives the agent the same
+`request_mount` tool through a small MCP server of its own (`sand-acp`, in the
+session's MCP list; `network_prompts = false` leaves it out). Both are noted
+when they come in while the pane is hidden.
 
 You can type during setup; the first message is sent once the agent is ready.
 Enter sends, Shift+Enter starts a new line and Esc stops a turn. As in
@@ -589,6 +638,8 @@ commented examples if there is none) and checks it when the editor closes.
 default_harness = "codex"
 nightly = true                       # use nightly harness images (see Templates)
 tern_native = false                  # keep the agent's terminal UI in Tern
+usage_limits = false                 # do not ask Anthropic for subscription limits (see Tern)
+sandbox_home = "/home/agent"         # the agent user's home in sandboxes (the default)
 
 # Change a built-in harness…
 [harness.claude]
@@ -609,6 +660,10 @@ api_check_url = "https://api.openai.com/v1/models"
 
 [mcp.linear]
 url = "https://mcp.linear.app/mcp"
+
+[mcp.local]                          # `url` or `command`, not both; registered with `sbx mcp add`
+command = "npx"
+args = ["-y", "some-mcp-server"]
 ```
 
 All harness keys: `agent`, `host_config_dir`, `sandbox_config_dir`, `copy`,
@@ -620,5 +675,35 @@ All harness keys: `agent`, `host_config_dir`, `sandbox_config_dir`, `copy`,
 State lives in the platform data directory (`~/.local/share/sand`,
 `~/Library/Application Support/sand`, `%LOCALAPPDATA%\sand`), or
 `$SAND_DATA_DIR`: per-sandbox state and history, the shared scratch directory,
-and session locks. `$SAND_SBX` overrides the `sbx` binary, and `$SAND_REGISTRY`
-the registry asked about nightly images (a mirror's base URL).
+and session locks.
+
+Environment variables:
+
+| Variable | Effect |
+| --- | --- |
+| `SAND_CONFIG` | Path of the config file. |
+| `SAND_DATA_DIR` | Where sand keeps its state. |
+| `SAND_SBX` | The `sbx` binary to run. |
+| `SAND_REGISTRY` | Base URL of the registry asked about nightly images (a mirror). |
+| `SAND_TERN_NATIVE` | `0` or `1`: draw sessions natively in Tern or not, over `tern_native`; `--native` and `--no-native` win. `TERN_TSP=0` turns it off too. |
+| `SAND_CONFIRM` | A command that replaces the native dialog that confirms a mount or an allowed host: it is run with the question as its last argument, and exit status 0 approves. |
+| `SAND_VERSION`, `SAND_INSTALL_DIR` | Read by the install scripts only. |
+
+## Development
+
+```console
+$ cargo build
+$ cargo test                  # unit tests, and end-to-end tests against tests/fake_sbx.sh
+$ cargo clippy --all-targets
+$ cargo fmt --all
+```
+
+The end-to-end tests (`tests/e2e.rs`, Unix only) run the real `sand` binary
+against a fake `sbx` that records every command, and check the sequence of `sbx`
+calls. They need neither Docker nor a signed-in `sbx`. CI (`.github/workflows`)
+runs format, clippy with warnings denied, build and test on Linux, macOS and
+Windows; a published release builds and attaches the executables.
+
+The Claude Code mod that `sand` ships into sandboxes lives in
+`assets/claude-mod/sand`, and the MCP server that gives ACP agents
+`request_mount` in `assets/mcp/sand.mjs`; both are compiled into the binary.
