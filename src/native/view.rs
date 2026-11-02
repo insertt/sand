@@ -66,6 +66,8 @@ pub const STYLE: &str = r#"
 	border-radius: 8px;
 	background: var(--l2);
 }
+/* Room under the last turn: its footer and tooltips clear the floating composer. */
+.sf-spacer[data-role='sand.tail'] { height: calc(5 * var(--sf-lh, 18px)) !important; }
 /* A tool's head: its label centered on its icon, however many lines it takes. */
 .sf-tool > .sf-tool-head { align-items: center; }
 .sf-tool > .sf-tool-head > :is(.sf-tool-ic, .sf-tool-line, .sf-tool-time, .sf-tool-st, .sf-chev) { align-self: center; }
@@ -326,7 +328,8 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
         nodes.push(user("queued".to_string(), text, true));
     }
     // Room under the last turn, so that its end and its tooltips clear the floating composer.
-    nodes.push(ui::row().key("tail").role("sand.tail").min(Bound::h(Extent::Lines(9.0))).into());
+    // (A spacer: Tern hides an empty row, whatever its size.)
+    nodes.push(ui::node("spacer").key("tail").role("sand.tail").prop("size", "lg"));
     nodes
 }
 
@@ -1165,7 +1168,7 @@ mod tests {
         assert_eq!(mcp["items"][1]["detail"], "needs authorization: sbx mcp auth github");
         assert_eq!(find(dock, "sand.composer.usage").unwrap().props()["spans"][0]["t"], "$0.04");
         assert_eq!(main.last().unwrap().props()["role"], "sand.tail");
-        assert_eq!(main.last().unwrap().props()["min"], json!({"h": "9lines"}));
+        assert_eq!(main.last().unwrap().kind(), "spacer");
     }
 
     #[test]
