@@ -129,6 +129,25 @@ impl Composer {
         self.cursor = self.char_at(cursor);
     }
 
+    /// The `@` mention being typed at the caret: where its `@` is and what follows it.
+    pub fn mention(&self) -> Option<(usize, String)> {
+        super::files::at_caret(&self.draft, self.cursor)
+    }
+
+    /// Replaces the draft from char `start` to the caret with `text`; a space
+    /// `text` ends with takes the place of one after the caret.
+    pub fn replace_to_caret(&mut self, start: usize, text: &str) {
+        if start > self.cursor {
+            return;
+        }
+        self.remember(false);
+        let spaced = text.ends_with(' ') && self.draft.chars().nth(self.cursor) == Some(' ');
+        let (from, to) = (self.byte(start), self.byte(self.cursor + usize::from(spaced)));
+        self.draft.replace_range(from..to, text);
+        self.cursor = start + text.chars().count();
+        self.edited();
+    }
+
     /// Takes the last change back.
     pub fn undo(&mut self) {
         if let Some((draft, cursor)) = self.history.pop() {
@@ -241,6 +260,19 @@ mod tests {
         assert_eq!(c.draft, "hi you there");
         c.undo();
         assert_eq!(c.draft, "hi 😀 there");
+    }
+
+    #[test]
+    fn a_mention_is_completed_in_place() {
+        let mut c = Composer::default();
+        c.insert("see @ma please");
+        c.edit(0, 0, "", 7, 14);
+        assert_eq!(c.mention(), Some((4, "ma".into())));
+        c.replace_to_caret(4, "@src/main.rs ");
+        assert_eq!((c.draft.as_str(), c.cursor_utf16()), ("see @src/main.rs please", 17));
+        assert_eq!(c.mention(), None);
+        c.undo();
+        assert_eq!(c.draft, "see @ma please");
     }
 
     #[test]

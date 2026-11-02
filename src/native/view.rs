@@ -15,8 +15,9 @@ use tern_sdk::ui::{
     TraceLine, View,
 };
 
-use super::commands;
+use super::commands::{self, SlashCommand};
 use super::composer::Composer;
+use super::files;
 use super::model::{
     Approval, Entry, Image, Permission, Question, SessionPicker, Setting, Setup, StepStatus, TargetKind, ToolCall,
     ToolContent, ToolStatus, Transcript, Turn, TurnUsage,
@@ -273,8 +274,31 @@ fn item_index(item: &str) -> usize {
     item.rsplit('.').next().and_then(|key| key.get(1..)).and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
-/// What floats over the session: the completions of a `/command` being
-/// typed, under the caret, and the session picker.
+/// What the composer offers to complete the draft with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Completion {
+    Command(SlashCommand),
+    /// A file or directory (ending in `/`) for the `@` mention at the caret,
+    /// which starts at that char.
+    File(String, usize),
+}
+
+/// The completions of the draft, unless Esc put them away: a `/command`
+/// being typed, or the `@` mention at the caret.
+pub fn completions(t: &Transcript, composer: &Composer) -> Vec<Completion> {
+    if composer.dismissed {
+        return Vec::new();
+    }
+    let commands = commands::complete(&composer.draft, &t.commands);
+    if !commands.is_empty() {
+        return commands.into_iter().map(Completion::Command).collect();
+    }
+    let Some((start, query)) = composer.mention() else { return Vec::new() };
+    files::complete(&t.files, &query).into_iter().map(|path| Completion::File(path, start)).collect()
+}
+
+/// What floats over the session: the completions of a `/command` or an
+/// `@` mention being typed, under the caret, and the session picker.
 fn layer(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
     if let Some((_, key)) = &t.exit_armed {
         let what = if t.turn == Turn::Setup { "stop setting up" } else { "exit" };
@@ -284,20 +308,26 @@ fn layer(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
     if let Some(picker) = &t.picker {
         return vec![session_picker(picker, info)];
     }
-    let completions = if composer.dismissed { Vec::new() } else { commands::complete(&composer.draft, &t.commands) };
+    let completions = completions(t, composer);
     if completions.is_empty() {
         return Vec::new();
     }
     let selected = composer.pick.min(completions.len() - 1);
-    let items = completions.iter().enumerate().map(|(i, command)| {
-        let mut item = ui::item(format!("/{}", command.name)).key(format!("c{i}")).detail(command.description.clone());
-        if let Some(hint) = &command.hint {
-            item = item.value(hint.clone());
+    let items = completions.iter().enumerate().map(|(i, completion)| match completion {
+        Completion::Command(command) => {
+            let mut item =
+                ui::item(format!("/{}", command.name)).key(format!("c{i}")).detail(command.description.clone());
+            if let Some(hint) = &command.hint {
+                item = item.value(hint.clone());
+            }
+            if command.builtin {
+                item = item.icon("box");
+            }
+            item
         }
-        if command.builtin {
-            item = item.icon("box");
+        Completion::File(path, _) => {
+            ui::item(path.clone()).key(format!("c{i}")).icon(if path.ends_with('/') { "folder" } else { "file" })
         }
-        item
     });
     let list = ui::list()
         .key("list")
@@ -1738,7 +1768,10 @@ mod tests {
             (tile["blob"].as_str(), tile["meta"].as_str(), tile["removable"].as_bool()),
             (Some("ab12"), Some("640×480"), Some(true))
         );
-        t.prompt(&super::super::model::Prompt { text: "what is this?".into(), images: vec![image] }, Instant::now());
+        t.prompt(
+            &super::super::model::Prompt { text: "what is this?".into(), images: vec![image], links: Vec::new() },
+            Instant::now(),
+        );
         let v = view(&t, &Composer::default(), &info());
         let card = &region(&v, 0)[0];
         assert_eq!(card.child_nodes()[0].props()["role"], "sand.attachments");

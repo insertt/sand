@@ -19,10 +19,11 @@ use tern_sdk::{Event, Input, Key, Session, Surface, SurfaceOptions, Waker};
 use super::client::{self, Call, Client, Incoming};
 use super::commands::{self, Builtin};
 use super::composer::Composer;
+use super::files;
 use super::model::{
     Approval, Entry, Image, Mode, Prompt, Question, SessionEntry, SessionPicker, Setting, Transcript, Turn,
 };
-use super::view::{EDITOR, Info, Msg, STYLE, view};
+use super::view::{Completion, EDITOR, Info, Msg, STYLE, completions, view};
 use super::{ChatSpec, Command, Update};
 use crate::log::Line;
 
@@ -50,6 +51,9 @@ const LOG_TAIL: usize = 12;
 const BRANCH_EVERY: Duration = Duration::from_secs(5);
 const PROBE_EVERY: Duration = Duration::from_secs(30);
 
+/// How old the workspace's file list may get while an `@` mention is typed.
+const FILES_EVERY: Duration = Duration::from_secs(10);
+
 /// The agent, once setup is done.
 struct Agent {
     client: Client,
@@ -71,6 +75,12 @@ pub struct Driver {
     /// What the agent said it can do with sessions and prompts (`initialize`).
     can_load: bool,
     can_image: bool,
+    /// The agent takes files' contents in a prompt, not only links to them.
+    can_embed: bool,
+    /// The primary workspace on the host, where `@` mentions point, and when
+    /// its files were last listed.
+    workspace: Option<PathBuf>,
+    files_listed: Option<Instant>,
     /// Images pasted so far, for their names.
     pasted_count: usize,
     /// A message forced past the running turn: sent once its stop is confirmed.
@@ -116,6 +126,9 @@ impl Driver {
             asked_model: None,
             can_load: false,
             can_image: false,
+            can_embed: false,
+            workspace: None,
+            files_listed: None,
             pasted_count: 0,
             forced: None,
             can_resume: false,
@@ -218,6 +231,7 @@ impl Driver {
                 }
                 Some(Input::Clipboard(_)) => continue,
             }
+            self.refresh_files();
             session.render(sf, view(&self.t, &self.composer, &self.info))?;
         }
         Ok(())
@@ -300,6 +314,7 @@ impl Driver {
             }
             Command::Approvals(answers) => self.approvals = Some(answers),
             Command::Pasted(image) => self.pasted(image),
+            Command::Files(files) => self.t.files = files,
             #[cfg(test)]
             Command::Agent(client, rx) => self.attach(client, rx, None, None, "/w".to_string()),
         }
@@ -330,6 +345,8 @@ impl Driver {
         self.t.setup.finish(now);
         self.t.turn = Turn::Starting;
         let ChatSpec { sbx, launch, log, paths, cwd, profile, sandbox, mcp, workspace } = spec;
+        self.workspace = workspace.clone();
+        self.list_files();
         self.probe(sbx.clone(), profile, sandbox, mcp, workspace);
         let spawned = (|| -> Result<Child> {
             if let Some(parent) = log.parent() {
@@ -473,6 +490,7 @@ impl Driver {
                 let caps = &result["agentCapabilities"];
                 self.can_load = caps["loadSession"].as_bool().unwrap_or(false);
                 self.can_image = caps["promptCapabilities"]["image"].as_bool().unwrap_or(false);
+                self.can_embed = caps["promptCapabilities"]["embeddedContext"].as_bool().unwrap_or(false);
                 self.can_resume = !caps["sessionCapabilities"]["resume"].is_null();
                 let cwd = self.agent.as_ref().map(|a| a.cwd.clone()).unwrap_or_default();
                 let sent = self.client().map(|c| c.new_session(&cwd));
@@ -615,7 +633,8 @@ impl Driver {
             self.composer.set(&text);
             return self.submit();
         }
-        let prompt = Prompt { text, images: std::mem::take(&mut self.composer.images) };
+        let links = self.links(&text);
+        let prompt = Prompt { text, images: std::mem::take(&mut self.composer.images), links };
         self.force(prompt);
     }
 
@@ -735,8 +754,14 @@ impl Driver {
         }
     }
 
-    fn prompt(&mut self, prompt: Prompt) {
+    fn prompt(&mut self, mut prompt: Prompt) {
         let Some(session) = self.session.clone() else { return };
+        // The files as they are now, for a prompt that waited in the queue.
+        if let Some(root) = self.workspace.as_deref().filter(|_| self.can_embed) {
+            for link in &mut prompt.links {
+                link.text = files::contents(root, link);
+            }
+        }
         self.t.notes.clear();
         self.t.prompt(&prompt, Instant::now());
         let sent = self.client().map(|c| c.prompt(&session, &prompt));
@@ -758,7 +783,8 @@ impl Driver {
             // sand's commands wait for the session; the agent's go as a prompt.
             Some(_) => self.composer.set(&text),
             None => {
-                let prompt = Prompt { text: text.clone(), images: std::mem::take(&mut self.composer.images) };
+                let links = self.links(&text);
+                let prompt = Prompt { text: text.clone(), images: std::mem::take(&mut self.composer.images), links };
                 if !self.send(prompt.clone()) {
                     self.composer.set(&text);
                     self.composer.images = prompt.images;
@@ -804,23 +830,51 @@ impl Driver {
         }
     }
 
-    /// The commands completing the draft, unless dismissed.
-    fn completions(&self) -> Vec<commands::SlashCommand> {
-        if self.composer.dismissed {
-            return Vec::new();
-        }
-        commands::complete(&self.composer.draft, &self.t.commands)
+    /// The files `text` mentions.
+    fn links(&self, text: &str) -> Vec<files::Link> {
+        self.workspace.as_deref().map(|root| files::links(text, root)).unwrap_or_default()
     }
 
-    /// Takes the completion `index`: a command that takes nothing runs, the
-    /// rest wait for what follows its name.
+    /// Lists the workspace's files, off this thread.
+    fn list_files(&mut self) {
+        let Some(dir) = self.workspace.clone() else { return };
+        self.files_listed = Some(Instant::now());
+        let (tx, waker) = (self.commands.clone(), self.waker.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Command::Files(files::list(&dir)));
+            if let Some(waker) = &waker {
+                waker.wake();
+            }
+        });
+    }
+
+    /// Lists them again while an `@` mention is typed, once the list is old.
+    fn refresh_files(&mut self) {
+        let stale = self.files_listed.is_none_or(|listed| listed.elapsed() >= FILES_EVERY);
+        if stale && self.composer.mention().is_some() {
+            self.list_files();
+        }
+    }
+
+    fn completions(&self) -> Vec<Completion> {
+        completions(&self.t, &self.composer)
+    }
+
+    /// Takes the completion `index`. A command that takes nothing runs, the
+    /// rest wait for what follows its name; a file takes the mention's place,
+    /// and a directory stays open for what is in it.
     fn accept(&mut self, index: usize, run: bool) {
-        let Some(command) = self.completions().into_iter().nth(index) else { return };
-        if run && command.hint.is_none() {
-            self.composer.set(&format!("/{}", command.name));
-            self.submit();
-        } else {
-            self.composer.set(&format!("/{} ", command.name));
+        match self.completions().into_iter().nth(index) {
+            Some(Completion::Command(command)) if run && command.hint.is_none() => {
+                self.composer.set(&format!("/{}", command.name));
+                self.submit();
+            }
+            Some(Completion::Command(command)) => self.composer.set(&format!("/{} ", command.name)),
+            Some(Completion::File(path, start)) => {
+                let space = if path.ends_with('/') { "" } else { " " };
+                self.composer.replace_to_caret(start, &format!("{}{space}", files::mention(&path)));
+            }
+            None => {}
         }
     }
 
@@ -1131,6 +1185,31 @@ mod tests {
 
     fn ctrl(name: &str) -> Key {
         Key { ctrl: true, ..Key::named(name) }
+    }
+
+    #[test]
+    fn mentions_complete_from_the_workspace_and_go_as_links() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        let mut d = idle();
+        d.workspace = Some(dir.path().to_path_buf());
+        d.files_listed = Some(Instant::now());
+        d.t.files = files::list(dir.path());
+        for ch in ["f", "i", "x", " ", "@", "s"] {
+            d.key(&Key { text: Some(ch.into()), ..Key::named(ch) });
+        }
+        assert!(matches!(&d.completions()[..], [Completion::File(dir, 4), _] if dir == "src/"));
+        d.key(&Key::named("enter"));
+        assert_eq!(d.composer.draft, "fix @src/", "a directory stays open");
+        d.key(&Key::named("tab"));
+        assert_eq!(d.composer.draft, "fix @src/main.rs ");
+        assert!(d.completions().is_empty());
+        let links = d.links(&d.composer.draft);
+        assert_eq!((links[0].range.clone(), links[0].path.as_str()), (4..16, "src/main.rs"));
+        d.key(&Key { text: Some("@".into()), ..Key::named("@") });
+        d.key(&Key::named("escape"));
+        assert!(d.completions().is_empty(), "Esc puts them away");
     }
 
     #[test]

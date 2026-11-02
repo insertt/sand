@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::commands::SlashCommand;
+use super::files::Link;
 use crate::log::Line;
 
 /// An image pasted into the composer, sent with a prompt.
@@ -23,17 +24,18 @@ pub struct Image {
     pub blob: Option<String>,
 }
 
-/// What the person sends: text, and images.
+/// What the person sends: text, the files it mentions, and images.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prompt {
     pub text: String,
     pub images: Vec<Image>,
+    pub links: Vec<Link>,
 }
 
 impl Prompt {
     #[cfg(test)]
     pub fn text(text: impl Into<String>) -> Self {
-        Self { text: text.into(), images: Vec::new() }
+        Self { text: text.into(), ..Self::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -410,6 +412,8 @@ pub struct Transcript {
     pub modes: Vec<Mode>,
     pub mode: Option<String>,
     pub commands: Vec<SlashCommand>,
+    /// The workspace's files and directories, for `@` mentions.
+    pub files: Vec<String>,
     pub picker: Option<SessionPicker>,
     /// A session being resumed: the working line says so until the agent answers.
     pub resuming: Option<String>,
@@ -447,6 +451,7 @@ impl Default for Transcript {
             modes: Vec::new(),
             mode: None,
             commands: Vec::new(),
+            files: Vec::new(),
             picker: None,
             resuming: None,
             exit_armed: None,

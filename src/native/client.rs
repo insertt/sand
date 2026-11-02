@@ -183,8 +183,20 @@ impl Client {
                 json!({"type": "image", "mimeType": image.mime, "data": data})
             })
             .collect();
-        if !prompt.text.is_empty() || blocks.is_empty() {
-            blocks.push(json!({"type": "text", "text": prompt.text}));
+        // Each mention in its place, as an editor's links sit in its text.
+        let mut at = 0;
+        for link in &prompt.links {
+            if link.range.start > at {
+                blocks.push(json!({"type": "text", "text": prompt.text[at..link.range.start]}));
+            }
+            blocks.push(match &link.text {
+                Some(text) => json!({"type": "resource", "resource": {"uri": link.uri, "text": text}}),
+                None => json!({"type": "resource_link", "uri": link.uri, "name": link.path}),
+            });
+            at = link.range.end;
+        }
+        if at < prompt.text.len() || blocks.is_empty() {
+            blocks.push(json!({"type": "text", "text": prompt.text[at..]}));
         }
         self.request(Call::Prompt, json!({"sessionId": session, "prompt": blocks}))
     }
@@ -298,9 +310,9 @@ mod tests {
             dims: None,
             blob: None,
         };
-        let prompt = Prompt { text: "what is this?".into(), images: vec![image.clone()] };
+        let prompt = Prompt { text: "what is this?".into(), images: vec![image.clone()], links: Vec::new() };
         client.prompt("S", &prompt).unwrap();
-        client.prompt("S", &Prompt { text: String::new(), images: vec![image] }).unwrap();
+        client.prompt("S", &Prompt { images: vec![image], ..Prompt::default() }).unwrap();
         let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(
@@ -309,5 +321,29 @@ mod tests {
                    {"type": "text", "text": "what is this?"}])
         );
         assert_eq!(lines[1]["params"]["prompt"].as_array().map(Vec::len), Some(1), "an image alone needs no text");
+    }
+
+    #[test]
+    fn mentions_go_in_their_place_as_resources() {
+        let out = Shared::default();
+        let mut client = Client::new(Box::new(out.clone()), None);
+        let link = |range, path: &str, text: Option<&str>| super::super::files::Link {
+            range,
+            path: path.into(),
+            uri: format!("file:///w/{path}"),
+            text: text.map(str::to_string),
+        };
+        let text = "fix @a.rs and @src/";
+        let links = vec![link(4..9, "a.rs", Some("fn a() {}")), link(14..19, "src/", None)];
+        client.prompt("S", &Prompt { text: text.into(), links, ..Prompt::default() }).unwrap();
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            line["params"]["prompt"],
+            json!([{"type": "text", "text": "fix "},
+                   {"type": "resource", "resource": {"uri": "file:///w/a.rs", "text": "fn a() {}"}},
+                   {"type": "text", "text": " and "},
+                   {"type": "resource_link", "uri": "file:///w/src/", "name": "src/"}])
+        );
     }
 }
