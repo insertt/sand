@@ -65,6 +65,11 @@ pub const STYLE: &str = r#"
 	border-radius: 8px;
 	background: var(--l2);
 }
+/* A tool's head: its label centered on its icon, however many lines it takes. */
+.sf-tool > .sf-tool-head { align-items: center; }
+.sf-tool > .sf-tool-head > :is(.sf-tool-ic, .sf-tool-line, .sf-tool-time, .sf-tool-st, .sf-chev) { align-self: center; }
+.sf-tool > .sf-tool-head > .sf-tool-ic { display: inline-flex; align-items: center; }
+[data-role='omp.run.status'] { align-items: center; }
 .sf-row[data-role='omp.working'] {
 	width: calc(100% - 24px);
 	max-width: 736px;
@@ -222,7 +227,7 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
         nodes.push(user("queued".to_string(), text, true));
     }
     // Room under the last turn, so that its end and its tooltips clear the floating composer.
-    nodes.push(ui::row().key("tail").role("sand.tail").min(Bound::h(Extent::Lines(3.0))).into());
+    nodes.push(ui::row().key("tail").role("sand.tail").min(Bound::h(Extent::Lines(6.0))).into());
     nodes
 }
 
@@ -1058,7 +1063,7 @@ mod tests {
         assert_eq!(mcp["items"][1]["detail"], "needs authorization: sbx mcp auth github");
         assert_eq!(find(dock, "sand.composer.usage").unwrap().props()["spans"][0]["t"], "$0.04");
         assert_eq!(main.last().unwrap().props()["role"], "sand.tail");
-        assert_eq!(main.last().unwrap().props()["min"], json!({"h": "3lines"}));
+        assert_eq!(main.last().unwrap().props()["min"], json!({"h": "6lines"}));
     }
 
     #[test]
