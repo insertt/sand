@@ -130,9 +130,11 @@ prompt with **Mount read-write**, **Mount read-only** and **Dismiss**, and
 choosing a mount has `sand` confirm it in a dialog on the host (see
 [Prompts in Claude Code](#prompts-in-claude-code)), naming the resolved
 directory and mode, before it mounts it as `sand mount` would. `~` is your home
-on the host and relative paths start at the primary workspace. The directory
-appears at the same path inside the sandbox, the agent is told once it is
-there, and it stays mounted like one `sand mount` added. On the next
+on the host and relative paths start at the primary workspace. The agent cannot
+ask for a directory inside a read-write mount of its sandbox (it could swap it
+for a link while you read the dialog); use `sand mount` or `/mount` for that.
+The directory appears at the same path inside the sandbox, the agent is told
+once it is there, and it stays mounted like one `sand mount` added. On the next
 launch it is also a working directory of Claude Code, as every extra mount is
 (`permissions.additionalDirectories` in the sandbox's settings). sand's own data
 directory is never mounted this way.

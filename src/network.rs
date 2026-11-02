@@ -681,7 +681,8 @@ impl Worker {
         }
         // Relative paths are taken from the primary workspace, as `sand mount` takes them from where it runs.
         let state = crate::state::load(&self.dirs, &self.sandbox).ok().flatten();
-        let cwd = state.and_then(|s| s.mounts.primary).map(|m| m.path).unwrap_or_else(|| self.dirs.home.clone());
+        let cwd = state.as_ref().and_then(|s| s.mounts.primary.as_ref()).map(|m| m.path.clone());
+        let cwd = cwd.unwrap_or_else(|| self.dirs.home.clone());
         let mount = match Mount::parse(&format!("{path}:{mode}"), &cwd, &self.dirs.home) {
             Ok(mount) if mount.path.is_dir() => mount,
             Ok(mount) => return Outcome::failed(format!("{} is not a directory", mount.path.display())),
@@ -691,6 +692,21 @@ impl Worker {
         if mounts::exposes(&mount.path, &self.dirs.sandboxes_dir()) {
             return Outcome::failed(format!(
                 "{shown} holds sand's data for every sandbox; it is never mounted on request"
+            ));
+        }
+        // Below a read-write mount the agent can swap the directory for a link
+        // while the dialog is open, and have another one mounted than was shown.
+        // It sees what is there already; only the person can ask for it (`/mount`).
+        let writable = state.iter().flat_map(|s| {
+            let user = s.mounts.all().filter(|m| m.mode == Mode::Rw).map(|m| m.path.clone());
+            let own = s.internal_mounts.iter().filter(|m| m.mode == Mode::Rw).map(|m| PathBuf::from(&m.host));
+            user.chain(own).collect::<Vec<_>>()
+        });
+        if !confirmed && let Some(within) = writable.into_iter().find(|w| mount.path.starts_with(w) && mount.path != *w)
+        {
+            return Outcome::failed(format!(
+                "{shown} is inside {}, which the sandbox can already change; sand does not mount it on the agent's request",
+                within.display()
             ));
         }
         let key = format!("mount:{shown}");
@@ -718,6 +734,10 @@ impl Worker {
                     "sand could not ask on the host ({why}); mount it there with `sand mount {shown}`"
                 ));
             }
+        }
+        // Still the directory the question named, not a link put there since.
+        if dunce::canonicalize(&mount.path).ok().as_deref() != Some(mount.path.as_path()) {
+            return Outcome::failed(format!("{shown} changed while sand was asking; it was not mounted"));
         }
         let target = container_path(&shown);
         match (self.mounter)(&mount) {
@@ -1256,6 +1276,36 @@ mod tests {
         assert_eq!(outcome.message, "a.com: declined on the host");
         assert!(!requests.join("one.json").exists());
         assert!(fs::read_to_string(tmp.path().join("log")).unwrap().contains(r#""host":"a.com""#));
+    }
+
+    #[test]
+    fn mounts_below_a_writable_mount_are_refused_unless_the_person_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut worker, asked) = worker(tmp.path(), Answer::Allow);
+        let proj = worker.dirs.home.join("proj");
+        fs::create_dir_all(proj.join("docs")).unwrap();
+        let proj = dunce::canonicalize(&proj).unwrap();
+        let state = crate::state::SandboxState {
+            name: "claude-proj".into(),
+            harness: "claude".into(),
+            agent: "claude".into(),
+            kind: crate::state::Kind::Project,
+            mounts: MountSet { primary: Some(Mount::rw(&proj)), extras: vec![] },
+            mcp: vec![],
+            template: None,
+            image_digest: None,
+            declined_digest: None,
+            internal_mounts: vec![],
+            vertex_secret: None,
+            created_at: 0,
+        };
+        crate::state::save(&worker.dirs, &state).unwrap();
+
+        let outcome = worker.answer_mount("docs", Some("rw"), None, false);
+        assert!(!outcome.ok && outcome.message.contains("can already change"), "{outcome:?}");
+        assert!(asked.lock().unwrap().is_empty(), "refused before the dialog");
+        // The person's own `/mount` is not the agent's.
+        assert!(worker.answer_mount("docs:ro", None, None, true).ok);
     }
 
     #[cfg(unix)]
