@@ -13,6 +13,7 @@
 //! through a log sink.
 
 mod client;
+mod clipboard;
 mod commands;
 mod composer;
 mod driver;
@@ -64,6 +65,8 @@ pub enum Command {
     },
     /// Where answers to sbx's pending network approvals go.
     Approvals(Sender<(String, String)>),
+    /// What a paste found on the clipboard: an image and its type, or why not.
+    Pasted(std::result::Result<(Vec<u8>, &'static str), String>),
     /// Talk to this agent (tests stand one in for `sbx exec`).
     #[cfg(test)]
     Agent(client::Client, Receiver<client::Incoming>),

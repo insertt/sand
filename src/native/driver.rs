@@ -19,13 +19,18 @@ use tern_sdk::{Event, Input, Key, Session, Surface, SurfaceOptions, Waker};
 use super::client::{self, Call, Client, Incoming};
 use super::commands::{self, Builtin};
 use super::composer::Composer;
-use super::model::{Approval, Entry, Mode, Question, SessionEntry, SessionPicker, Setting, Transcript, Turn};
+use super::model::{
+    Approval, Entry, Image, Mode, Prompt, Question, SessionEntry, SessionPicker, Setting, Transcript, Turn,
+};
 use super::view::{EDITOR, Info, Msg, STYLE, view};
 use super::{ChatSpec, Command, Update};
 use crate::log::Line;
 
 /// Follow-ups that can wait for the agent at once.
 const QUEUE: usize = 8;
+
+/// Images one message takes.
+const MAX_IMAGES: usize = 4;
 
 /// How long a first Ctrl+C (or Ctrl+D) waits for the second that quits.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -63,8 +68,11 @@ pub struct Driver {
     session: Option<String>,
     asked_mode: Option<String>,
     asked_model: Option<String>,
-    /// What the agent said it can do with sessions (`initialize`).
+    /// What the agent said it can do with sessions and prompts (`initialize`).
     can_load: bool,
+    can_image: bool,
+    /// Images pasted so far, for their names.
+    pasted_count: usize,
     can_resume: bool,
     /// The session to go back to if resuming another fails.
     previous: Option<String>,
@@ -105,6 +113,8 @@ impl Driver {
             asked_mode: None,
             asked_model: None,
             can_load: false,
+            can_image: false,
+            pasted_count: 0,
             can_resume: false,
             previous: None,
             reply: None,
@@ -169,6 +179,7 @@ impl Driver {
                 return Ok(());
             }
             changed |= self.drain_agent();
+            changed |= self.upload_thumbnails(session);
             if changed {
                 session.render(sf, view(&self.t, &self.composer, &self.info))?;
             }
@@ -207,6 +218,21 @@ impl Driver {
             session.render(sf, view(&self.t, &self.composer, &self.info))?;
         }
         Ok(())
+    }
+
+    /// Sends Tern the pasted images it has not got yet, for their thumbnails.
+    fn upload_thumbnails(&mut self, session: &mut Session<Msg>) -> bool {
+        if !session.caps().has_feature("blobs") {
+            return false;
+        }
+        let mut sent = false;
+        for image in self.composer.images.iter_mut().filter(|i| i.blob.is_none()) {
+            if let Ok(id) = session.blob(image.data.to_vec(), Some(&image.mime)) {
+                image.blob = Some(id);
+                sent = true;
+            }
+        }
+        sent
     }
 
     fn drain_agent(&mut self) -> bool {
@@ -270,6 +296,7 @@ impl Driver {
                 self.confirm_replies.push(reply);
             }
             Command::Approvals(answers) => self.approvals = Some(answers),
+            Command::Pasted(image) => self.pasted(image),
             #[cfg(test)]
             Command::Agent(client, rx) => self.attach(client, rx, None, None, "/w".to_string()),
         }
@@ -442,6 +469,7 @@ impl Driver {
             (Call::Initialize, Ok(result)) => {
                 let caps = &result["agentCapabilities"];
                 self.can_load = caps["loadSession"].as_bool().unwrap_or(false);
+                self.can_image = caps["promptCapabilities"]["image"].as_bool().unwrap_or(false);
                 self.can_resume = !caps["sessionCapabilities"]["resume"].is_null();
                 let cwd = self.agent.as_ref().map(|a| a.cwd.clone()).unwrap_or_default();
                 let sent = self.client().map(|c| c.new_session(&cwd));
@@ -569,8 +597,8 @@ impl Driver {
         if self.t.turn != Turn::Idle || self.t.queue_paused || self.t.queue.is_empty() {
             return;
         }
-        let text = self.t.queue.remove(0);
-        self.prompt(text);
+        let prompt = self.t.queue.remove(0);
+        self.prompt(prompt);
     }
 
     fn cwd(&self) -> String {
@@ -626,19 +654,19 @@ impl Driver {
         self.check(sent);
     }
 
-    /// Sends `text` now, or queues it while the agent works or starts.
+    /// Sends `prompt` now, or queues it while the agent works or starts.
     /// False when it can go nowhere (the queue is full).
-    fn send(&mut self, text: String) -> bool {
-        if text.trim().is_empty() {
+    fn send(&mut self, prompt: Prompt) -> bool {
+        if prompt.is_empty() {
             return true;
         }
         match self.t.turn {
             Turn::Idle if self.t.queue.is_empty() || self.t.queue_paused => {
-                self.prompt(text);
+                self.prompt(prompt);
                 true
             }
             Turn::Idle | Turn::Setup | Turn::Starting | Turn::Working if self.t.queue.len() < QUEUE => {
-                self.t.queue.push(text);
+                self.t.queue.push(prompt);
                 self.flush_queue();
                 true
             }
@@ -646,30 +674,72 @@ impl Driver {
         }
     }
 
-    fn prompt(&mut self, text: String) {
+    fn prompt(&mut self, prompt: Prompt) {
         let Some(session) = self.session.clone() else { return };
         self.t.notes.clear();
-        self.t.prompt(&text, Instant::now());
-        let sent = self.client().map(|c| c.prompt(&session, &text));
+        self.t.prompt(&prompt, Instant::now());
+        let sent = self.client().map(|c| c.prompt(&session, &prompt));
         self.check(sent);
     }
 
     fn submit(&mut self) {
-        if self.composer.is_empty() || self.t.turn == Turn::Exited {
+        if (self.composer.is_empty() && self.composer.images.is_empty()) || self.t.turn == Turn::Exited {
+            return;
+        }
+        if !self.composer.images.is_empty() && !self.can_image && self.session.is_some() {
+            let product = &self.info.product;
+            self.t.error(format!("{product} does not take images over ACP; remove them to send"), None);
             return;
         }
         let text = self.composer.take();
-        match commands::parse(&text) {
+        match commands::parse(&text).filter(|_| self.composer.images.is_empty()) {
             Some(command) if self.t.turn == Turn::Idle => self.builtin(command),
             // sand's commands wait for the session; the agent's go as a prompt.
             Some(_) => self.composer.set(&text),
             None => {
-                if !self.send(text.clone()) {
+                let prompt = Prompt { text: text.clone(), images: std::mem::take(&mut self.composer.images) };
+                if !self.send(prompt.clone()) {
                     self.composer.set(&text);
+                    self.composer.images = prompt.images;
                     self.t
                         .error(format!("{QUEUE} follow-ups are waiting already; this one stays in the composer"), None);
                 }
             }
+        }
+    }
+
+    /// Reads the clipboard for an image, off this thread: a paste with no
+    /// text is how Tern hands over a pasted image.
+    fn paste_image(&mut self) {
+        if self.composer.images.len() >= MAX_IMAGES {
+            self.t.error(format!("{MAX_IMAGES} images is as many as one message takes"), None);
+            return;
+        }
+        let (tx, waker) = (self.commands.clone(), self.waker.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Command::Pasted(super::clipboard::image()));
+            if let Some(waker) = &waker {
+                waker.wake();
+            }
+        });
+    }
+
+    fn pasted(&mut self, image: std::result::Result<(Vec<u8>, &'static str), String>) {
+        match image {
+            Ok((data, mime)) if self.composer.images.len() < MAX_IMAGES => {
+                let dims = super::clipboard::png_size(&data);
+                let name = format!("Image {}", self.pasted_count + 1);
+                self.pasted_count += 1;
+                self.composer.images.push(Image {
+                    data: std::sync::Arc::new(data),
+                    mime: mime.to_string(),
+                    name,
+                    dims,
+                    blob: None,
+                });
+            }
+            Ok(_) => {}
+            Err(why) => self.t.entries.push(Entry::Notice(format!("Nothing pasted: {why}"))),
         }
     }
 
@@ -815,6 +885,11 @@ impl Driver {
                     self.resume(session);
                 }
             }
+            Msg::RemoveImage(index) => {
+                if index < self.composer.images.len() {
+                    self.composer.images.remove(index);
+                }
+            }
             Msg::Suggest(prompt) => {
                 self.composer.set(&prompt);
                 self.submit();
@@ -896,6 +971,8 @@ impl Driver {
             self.next_mode();
         } else if key.is("enter") {
             self.submit();
+        } else if (key.name == "paste" && key.text.as_deref().is_none_or(str::is_empty)) || key.is("ctrl+v") {
+            self.paste_image();
         } else {
             self.composer.key(key);
         }
@@ -1053,11 +1130,11 @@ mod tests {
         assert_eq!(d.t.turn, Turn::Working);
         type_and_send(&mut d, "second");
         type_and_send(&mut d, "third");
-        assert_eq!(d.t.queue, ["second", "third"]);
+        assert_eq!(d.t.queue, [Prompt::text("second"), Prompt::text("third")]);
         assert!(d.composer.is_empty());
         end_turn(&mut d, "end_turn");
-        assert_eq!((d.t.queue.as_slice(), d.t.turn), (&["third".to_string()][..], Turn::Working));
-        assert!(matches!(d.t.entries.last(), Some(Entry::User(text)) if text == "second"));
+        assert_eq!((d.t.queue.as_slice(), d.t.turn), (&[Prompt::text("third")][..], Turn::Working));
+        assert!(matches!(d.t.entries.last(), Some(Entry::User(text, _)) if text == "second"));
 
         // A stop holds the rest until the person says.
         d.msg(Msg::Stop);
@@ -1073,7 +1150,7 @@ mod tests {
         type_and_send(&mut d, "one too many");
         assert_eq!((d.t.queue.len(), d.composer.draft.as_str()), (QUEUE, "one too many"));
         d.msg(Msg::Unqueue(0));
-        assert_eq!(d.t.queue[0], "q1");
+        assert_eq!(d.t.queue[0].text, "q1");
         d.msg(Msg::QueueDiscard);
         assert!(d.t.queue.is_empty());
     }
@@ -1129,5 +1206,30 @@ mod tests {
         d.msg(Msg::Network("a1".into(), "once".into()));
         assert_eq!(answered.recv().unwrap(), ("a1".to_string(), "once".to_string()));
         assert!(d.t.network.is_empty());
+    }
+
+    #[test]
+    fn a_pasted_image_goes_with_the_next_message() {
+        let mut d = working();
+        d.can_image = true;
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x02\x80\0\0\x01\xe0".to_vec();
+        d.command(Command::Pasted(Ok((png, "image/png"))));
+        assert_eq!(d.composer.images.len(), 1);
+        assert_eq!((d.composer.images[0].name.as_str(), d.composer.images[0].dims), ("Image 1", Some((640, 480))));
+        d.command(Command::Pasted(Err("there is no image on the clipboard".into())));
+        assert!(matches!(d.t.entries.last(), Some(Entry::Notice(t)) if t.contains("no image")));
+        // An image alone sends.
+        d.key(&Key::named("enter"));
+        assert!(d.composer.images.is_empty());
+        assert!(matches!(d.t.entries.last(), Some(Entry::User(text, images)) if text.is_empty() && images.len() == 1));
+
+        // An agent that takes no images keeps them in the composer.
+        let mut d = working();
+        d.command(Command::Pasted(Ok((b"\xff\xd8\xff\xe0".to_vec(), "image/jpeg"))));
+        d.composer.insert("look");
+        d.key(&Key::named("enter"));
+        assert_eq!((d.composer.images.len(), d.composer.draft.as_str()), (1, "look"));
+        d.msg(Msg::RemoveImage(0));
+        assert!(d.composer.images.is_empty());
     }
 }

@@ -11,9 +11,40 @@ use serde_json::Value;
 use super::commands::SlashCommand;
 use crate::log::Line;
 
+/// An image pasted into the composer, sent with a prompt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Image {
+    pub data: std::sync::Arc<Vec<u8>>,
+    pub mime: String,
+    pub name: String,
+    /// Width and height, when sand can tell.
+    pub dims: Option<(u32, u32)>,
+    /// Tern's blob for its thumbnail, once sent.
+    pub blob: Option<String>,
+}
+
+/// What the person sends: text, and images.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Prompt {
+    pub text: String,
+    pub images: Vec<Image>,
+}
+
+impl Prompt {
+    #[cfg(test)]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self { text: text.into(), images: Vec::new() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
-    User(String),
+    /// A message of the person's, with the images sent with it.
+    User(String, Vec<Image>),
     Agent(String),
     Thought(Thought),
     Tool(ToolCall),
@@ -358,7 +389,7 @@ pub struct Transcript {
     pub question: Option<Question>,
     /// Follow-ups written while the agent works (or starts), sent in order
     /// as each turn ends; paused after a stop or a failure.
-    pub queue: Vec<String>,
+    pub queue: Vec<Prompt>,
     pub queue_paused: bool,
     /// The pane is hidden (another tab): what happens meanwhile is noted.
     pub hidden: bool,
@@ -547,8 +578,8 @@ impl Transcript {
                 let Some(text) = block_text(&update["content"]) else { return };
                 self.settle_thought(now);
                 match self.entries.last_mut() {
-                    Some(Entry::User(message)) => message.push_str(&text),
-                    _ => self.entries.push(Entry::User(text)),
+                    Some(Entry::User(message, _)) => message.push_str(&text),
+                    _ => self.entries.push(Entry::User(text, Vec::new())),
                 }
             }
             "agent_thought_chunk" => {
@@ -652,9 +683,9 @@ impl Transcript {
     }
 
     /// The person sent a prompt; the turn starts.
-    pub fn prompt(&mut self, text: &str, now: Instant) {
+    pub fn prompt(&mut self, prompt: &Prompt, now: Instant) {
         self.settle_thought(now);
-        self.entries.push(Entry::User(text.to_string()));
+        self.entries.push(Entry::User(prompt.text.clone(), prompt.images.clone()));
         self.turn = Turn::Working;
         self.turn_start = Some((now, self.cost));
     }
@@ -874,7 +905,7 @@ mod tests {
     #[test]
     fn chunks_are_joined_into_messages_and_thoughts() {
         let (mut t, now) = (Transcript::default(), Instant::now());
-        t.prompt("hi", now);
+        t.prompt(&Prompt::text("hi"), now);
         t.apply(&chunk("agent_thought_chunk", "Let me "), now);
         t.apply(&chunk("agent_thought_chunk", "think"), now);
         t.apply(&chunk("agent_message_chunk", "Hello"), now + Duration::from_secs(2));
@@ -963,7 +994,7 @@ mod tests {
     #[test]
     fn a_turn_end_settles_open_tools_and_says_why() {
         let (mut t, now) = (Transcript::default(), Instant::now());
-        t.prompt("go", now);
+        t.prompt(&Prompt::text("go"), now);
         t.apply(&json!({"sessionUpdate": "tool_call", "toolCallId": "t", "status": "in_progress"}), now);
         t.apply(&json!({"sessionUpdate": "usage_update", "used": 64000, "size": 200000, "cost": {"amount": 0.25, "currency": "USD"}}), now);
         let later = now + Duration::from_secs(3);

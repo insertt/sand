@@ -6,6 +6,7 @@ description = "Run AI coding agents in Docker Sandboxes with one command"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.23"
 clap = { version = "4.6.7", features = ["derive"] }
 console = "0.16.6"
 ctrlc = "3.5.2"

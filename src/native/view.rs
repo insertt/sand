@@ -18,7 +18,7 @@ use tern_sdk::ui::{
 use super::commands;
 use super::composer::Composer;
 use super::model::{
-    Approval, Entry, Permission, Question, SessionPicker, Setting, Setup, StepStatus, TargetKind, ToolCall,
+    Approval, Entry, Image, Permission, Question, SessionPicker, Setting, Setup, StepStatus, TargetKind, ToolCall,
     ToolContent, ToolStatus, Transcript, Turn, TurnUsage,
 };
 use crate::mcp::{McpState, McpStatus};
@@ -141,6 +141,8 @@ pub enum Msg {
     QueueContinue,
     QueueDiscard,
     DismissNotes,
+    /// A pasted image taken out of the next message.
+    RemoveImage(usize),
     /// The welcome card's Continue, and its suggested prompts.
     ContinueLast,
     Suggest(String),
@@ -340,9 +342,9 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
     let last = t.entries.len().saturating_sub(1);
     for (i, entry) in t.entries.iter().enumerate() {
         let key = format!("e{i}");
-        if let Entry::User(text) = entry {
+        if let Entry::User(text, images) = entry {
             flush(&mut nodes, &mut turn, &mut turn_key);
-            nodes.push(user(key, text));
+            nodes.push(user(key, text, images));
             continue;
         }
         if let Entry::Resumed(title) = entry {
@@ -356,7 +358,7 @@ fn transcript(t: &Transcript, info: &Info) -> Vec<Node<Msg>> {
         }
         let streaming = i == last && t.turn == Turn::Working;
         turn.push(match entry {
-            Entry::User(_) | Entry::Resumed(_) => unreachable!("handled above"),
+            Entry::User(..) | Entry::Resumed(_) => unreachable!("handled above"),
             Entry::Agent(text) => ui::md(text.clone()).key(key).prop("stream", streaming).into(),
             Entry::Thought(thought) => {
                 let head = match thought.took {
@@ -551,9 +553,40 @@ fn mcp_mark(state: McpState) -> (&'static str, &'static str) {
     }
 }
 
-/// A sent message, as omp's user card.
-fn user(key: String, text: &str) -> Node<Msg> {
-    ui::card().key(key).role("omp.user").child(ui::md(text.to_string()).key("text")).into()
+/// A sent message, as omp's user card, with the images sent with it.
+fn user(key: String, text: &str, images: &[Image]) -> Node<Msg> {
+    let mut card = ui::card().key(key).role("omp.user");
+    if !images.is_empty() {
+        card = card.child(attachments("images", images, false));
+    }
+    if !text.is_empty() {
+        card = card.child(ui::md(text.to_string()).key("text"));
+    }
+    card.into()
+}
+
+/// Images as attachment tiles (their thumbnails once Tern has their blobs);
+/// `removable` ones send `RemoveImage`.
+fn attachments(key: &str, images: &[Image], removable: bool) -> Node<Msg> {
+    let tiles = images.iter().enumerate().map(|(i, image)| {
+        let mut tile = ui::attachment(image.name.clone())
+            .key(i)
+            .variant("tile")
+            .mime(image.mime.clone())
+            .size(image.data.len() as u64)
+            .removable(removable);
+        if let Some((w, h)) = image.dims {
+            tile = tile.meta(format!("{w}×{h}"));
+        }
+        if let Some(blob) = &image.blob {
+            tile = tile.blob(blob.clone());
+        }
+        if removable {
+            tile = tile.on_action("remove", Msg::RemoveImage(i));
+        }
+        tile
+    });
+    ui::row().key(key).role("sand.attachments").gap("sm").wrap(true).children(tiles).into()
 }
 
 fn error(key: String, text: &str, detail: Option<&str>) -> Node<Msg> {
@@ -813,8 +846,16 @@ fn notes(t: &Transcript) -> Node<Msg> {
 fn queue(t: &Transcript) -> Node<Msg> {
     let total = t.queue.len();
     let mut col = ui::col().key("queue").role("sand.queue").gap("xs");
-    for (i, text) in t.queue.iter().enumerate() {
-        let line: String = text.lines().next().unwrap_or_default().chars().take(120).collect();
+    for (i, prompt) in t.queue.iter().enumerate() {
+        let mut line: String = prompt.text.lines().next().unwrap_or_default().chars().take(120).collect();
+        if !prompt.images.is_empty() {
+            let n = prompt.images.len();
+            line.push_str(&format!(
+                "{}{n} image{}",
+                if line.is_empty() { "" } else { " · " },
+                if n == 1 { "" } else { "s" }
+            ));
+        }
         col = col.child(
             ui::row()
                 .key(i)
@@ -970,7 +1011,7 @@ fn working(t: &Transcript, info: &Info) -> Option<Node<Msg>> {
                 _ => "Thinking…".to_string(),
             };
             // A new elapsed clock per turn.
-            let turn = t.entries.iter().filter(|e| matches!(e, Entry::User(_))).count();
+            let turn = t.entries.iter().filter(|e| matches!(e, Entry::User(..))).count();
             (format!("turn{turn}"), label)
         }
         _ => return None,
@@ -1040,6 +1081,9 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
                 .label(format!("{:.0}%", fraction * 100.0))
                 .total(compact(size)),
         );
+    }
+    if !composer.images.is_empty() {
+        col = col.child(attachments("images", &composer.images, true));
     }
     col.child(editor).child(bar(t, info)).child(facts(t, info)).into()
 }
@@ -1307,7 +1351,7 @@ mod tests {
     fn a_turn_is_grouped_with_its_tools_and_usage() {
         let (mut t, now) = (Transcript::default(), Instant::now());
         t.turn = Turn::Idle;
-        t.prompt("fix it", now);
+        t.prompt(&super::super::model::Prompt::text("fix it"), now);
         t.apply(
             &json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "`cargo test`", "kind": "execute",
                 "status": "completed", "rawInput": {"command": "cargo test"},
@@ -1483,7 +1527,10 @@ mod tests {
         let editor = &find(region(&v, 1), "sand.composer").unwrap().child_nodes()[0];
         assert_eq!(editor.props()["ghost"], "sions");
 
-        t.queue = vec!["then the docs".into(), "and the changelog".into()];
+        t.queue = vec![
+            super::super::model::Prompt::text("then the docs"),
+            super::super::model::Prompt::text("and the changelog"),
+        ];
         t.queue_paused = true;
         t.hidden = true;
         t.note("Claude Code finished", "success");
@@ -1541,6 +1588,33 @@ mod tests {
             (answers[0].props()["variant"].as_str(), answers[1].props()["variant"].as_str()),
             (Some("quiet"), Some("primary"))
         );
+    }
+
+    #[test]
+    fn pasted_images_show_as_tiles_in_the_composer_and_the_message() {
+        let mut t = Transcript::default();
+        t.turn = Turn::Idle;
+        let image = Image {
+            data: std::sync::Arc::new(vec![0; 2048]),
+            mime: "image/png".into(),
+            name: "Image 1".into(),
+            dims: Some((640, 480)),
+            blob: Some("ab12".into()),
+        };
+        let mut composer = Composer::default();
+        composer.images.push(image.clone());
+        let v = view(&t, &composer, &info());
+        let tiles = find(region(&v, 1), "sand.attachments").expect("the composer's images");
+        let tile = tiles.child_nodes()[0].props();
+        assert_eq!(
+            (tile["blob"].as_str(), tile["meta"].as_str(), tile["removable"].as_bool()),
+            (Some("ab12"), Some("640×480"), Some(true))
+        );
+        t.prompt(&super::super::model::Prompt { text: "what is this?".into(), images: vec![image] }, Instant::now());
+        let v = view(&t, &Composer::default(), &info());
+        let card = &region(&v, 0)[0];
+        assert_eq!(card.child_nodes()[0].props()["role"], "sand.attachments");
+        assert_eq!(card.child_nodes()[0].child_nodes()[0].props()["removable"], false);
     }
 
     #[test]

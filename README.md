@@ -486,6 +486,13 @@ pane is hidden, what happens (a finished turn, a permission request, the agent
 exiting) is noted above the composer for when you come back. Each turn ends
 with its time, tokens and cost.
 
+Pasting an image (or Ctrl+V) attaches the clipboard's image to the next
+message, shown as a thumbnail above the composer with a × to remove it; up to
+four images go with a message, even without text, to an agent that takes
+images over ACP. Tern does not hand a program a pasted image's bytes, so sand
+reads the clipboard of the machine it runs on (osascript on macOS, wl-paste or
+xclip on Linux, PowerShell on Windows), which over ssh is not yours.
+
 Network access the sandbox was blocked from shows above the composer as a
 card with sbx's own options (allow once, always, deny…), answered with a
 click, for any harness; requests from sand's Claude Code mod to mount a

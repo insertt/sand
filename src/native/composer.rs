@@ -5,6 +5,8 @@
 
 use tern_sdk::Key;
 
+use super::model::Image;
+
 /// Undo steps kept.
 const HISTORY: usize = 200;
 
@@ -20,6 +22,8 @@ pub struct Composer {
     history: Vec<(String, usize)>,
     /// The last change typed a word character, so the next one joins its undo step.
     typing: bool,
+    /// Images pasted for the next message.
+    pub images: Vec<Image>,
 }
 
 impl Composer {

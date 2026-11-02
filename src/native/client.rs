@@ -9,6 +9,7 @@ use std::thread;
 
 use serde_json::{Value, json};
 
+use super::model::Prompt;
 use crate::acp::PathMap;
 
 /// Requests sand sends, so that their responses can be told apart.
@@ -171,8 +172,21 @@ impl Client {
         self.request(Call::NewSession, json!({"cwd": cwd, "mcpServers": []}))
     }
 
-    pub fn prompt(&mut self, session: &str, text: &str) -> io::Result<()> {
-        self.request(Call::Prompt, json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}))
+    /// Sends a prompt: its images (as ACP image blocks), then its text.
+    pub fn prompt(&mut self, session: &str, prompt: &Prompt) -> io::Result<()> {
+        use base64::Engine as _;
+        let mut blocks: Vec<Value> = prompt
+            .images
+            .iter()
+            .map(|image| {
+                let data = base64::engine::general_purpose::STANDARD.encode(image.data.as_slice());
+                json!({"type": "image", "mimeType": image.mime, "data": data})
+            })
+            .collect();
+        if !prompt.text.is_empty() || blocks.is_empty() {
+            blocks.push(json!({"type": "text", "text": prompt.text}));
+        }
+        self.request(Call::Prompt, json!({"sessionId": session, "prompt": blocks}))
     }
 
     pub fn set_mode(&mut self, session: &str, mode: &str) -> io::Result<()> {
@@ -271,5 +285,29 @@ mod tests {
         assert_eq!(lines[3]["result"]["outcome"], json!({"outcome": "cancelled"}));
         assert_eq!(client.call(2), Some(Call::NewSession));
         assert_eq!(client.call(2), None);
+    }
+
+    #[test]
+    fn images_go_before_the_text_as_image_blocks() {
+        let out = Shared::default();
+        let mut client = Client::new(Box::new(out.clone()), None);
+        let image = super::super::model::Image {
+            data: std::sync::Arc::new(b"png!".to_vec()),
+            mime: "image/png".into(),
+            name: "Image 1".into(),
+            dims: None,
+            blob: None,
+        };
+        let prompt = Prompt { text: "what is this?".into(), images: vec![image.clone()] };
+        client.prompt("S", &prompt).unwrap();
+        client.prompt("S", &Prompt { text: String::new(), images: vec![image] }).unwrap();
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(
+            lines[0]["params"]["prompt"],
+            json!([{"type": "image", "mimeType": "image/png", "data": "cG5nIQ=="},
+                   {"type": "text", "text": "what is this?"}])
+        );
+        assert_eq!(lines[1]["params"]["prompt"].as_array().map(Vec::len), Some(1), "an image alone needs no text");
     }
 }
