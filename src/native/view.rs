@@ -41,38 +41,38 @@ pub const STYLE: &str = r#"
 }
 /* The input: a size up from the transcript's text, on the card itself. */
 [data-role='sand.composer'] > .sf-editor {
-	min-height: calc(2 * 22px);
+	min-height: calc(2 * 20px);
 	padding: 0 !important;
-	font-size: 15px !important;
-	line-height: 22px !important;
-	--sf-lh: 22px;
+	font-size: 13.5px !important;
+	line-height: 20px !important;
+	--sf-lh: 20px;
 	background: transparent !important;
 	box-shadow: none !important;
 }
 [data-role='sand.composer.context'] { margin: 0 4px; }
-[data-role='sand.composer.bar'] { gap: 10px; min-width: 0; align-items: center !important; font: 14px/1.3 var(--sans); }
+[data-role='sand.composer.bar'] { gap: 10px; min-width: 0; align-items: center !important; font: 12.5px/1.3 var(--sans); }
 /* Every chip on one centre line: a select keeps align-self: flex-start of its own. */
 [data-role='sand.composer.bar'] > * { flex: none; align-self: center !important; margin-top: 0 !important; margin-bottom: 0 !important; }
 [data-role='sand.composer.bar'] .sf-select {
 	display: inline-flex !important;
 	align-items: center;
 	align-self: center !important;
-	height: 34px;
+	height: 28px;
 	margin: 0 !important;
 }
 /* Model, effort and mode: pills with a hairline ring, as Tern's own chat draws them. */
 :is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']) :is(.sf-select-btn, .sf-menu-trigger),
 :is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']).sf-row {
-	height: 34px !important;
+	height: 28px !important;
 	box-sizing: border-box;
 	display: inline-flex;
 	align-items: center;
-	padding: 0 14px !important;
-	gap: 8px;
+	padding: 0 11px !important;
+	gap: 7px;
 	border-radius: 999px !important;
 	background: transparent;
 	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t1) 13%, transparent) !important;
-	font: 14.5px/1 var(--sans) !important;
+	font: 12.5px/1 var(--sans) !important;
 	color: var(--t1);
 }
 :is([data-role='sand.composer.model'], [data-role='sand.composer.effort'], [data-role='sand.composer.mode']) .sf-select-btn:hover {
@@ -81,20 +81,20 @@ pub const STYLE: &str = r#"
 [data-role='sand.composer.bar'] .sf-select-label { display: none; }
 /* The effort pill holds Tern's ring and a borderless picker. */
 .sf-row[data-role='sand.composer.effort'] {
-	height: 34px !important;
+	height: 28px !important;
 	min-height: 0 !important;
 	box-sizing: border-box;
 	align-items: center !important;
-	padding: 0 6px 0 12px !important;
+	padding: 0 4px 0 10px !important;
 	gap: 2px !important;
 }
-.sf-row[data-role='sand.composer.effort'] .sf-select { height: 32px; }
+.sf-row[data-role='sand.composer.effort'] .sf-select { height: 26px; }
 .sf-row[data-role='sand.composer.effort'] .sf-select-btn {
-	height: 32px !important;
+	height: 26px !important;
 	padding: 0 8px 0 6px !important;
 	box-shadow: none !important;
 	background: transparent !important;
-	font: 14.5px/1 var(--sans) !important;
+	font: 12.5px/1 var(--sans) !important;
 }
 [data-role='sand.composer.effort'] .sf-effort { width: 16px; height: 16px; }
 /* A mode other than the default: a pill tinted in its tone. */
@@ -109,14 +109,14 @@ pub const STYLE: &str = r#"
 	gap: 4px 16px;
 	padding: 6px 4px 0;
 	border-top: 1px solid color-mix(in srgb, var(--t1) 8%, transparent);
-	font: 13px/1.3 var(--mono);
+	font: 12px/1.3 var(--mono);
 	color: var(--t3);
 }
 [data-role='sand.composer.usage'] { font: 13.5px/1 var(--mono); color: var(--t3); }
 /* Send and stop: a round button at the bar's end. */
 :is([data-role='sand.composer.send'], [data-role='sand.composer.stop']) {
-	width: 40px;
-	height: 40px;
+	width: 34px;
+	height: 34px;
 	flex: none !important;
 	justify-content: center !important;
 	align-items: center !important;
@@ -133,7 +133,7 @@ pub const STYLE: &str = r#"
 	box-shadow: none !important;
 	border: 0 !important;
 	padding: 0 !important;
-	font-size: 17px;
+	font-size: 15px;
 }
 [data-role='sand.composer.stop'] { color: var(--sf-bad, var(--tc)); }
 [data-role='sand.notes'], [data-role='sand.queue'] {
@@ -154,6 +154,13 @@ pub const STYLE: &str = r#"
 	bottom: calc(100% + 4px) !important;
 	max-height: 60vh;
 	overflow-y: auto;
+}
+/* The welcome card's Continue and suggested prompts: roomier than a small button. */
+[data-role='agent.starters'] { gap: 10px !important; }
+[data-role='agent.starters'] > * {
+	padding: 7px 14px !important;
+	gap: 8px;
+	border-radius: 10px !important;
 }
 /* A tool's head: its label centered on its icon, however many lines it takes. */
 .sf-tool > .sf-tool-head { align-items: center; }
