@@ -20,6 +20,7 @@ const STARTER: &str = r#"# sand configuration. Everything is optional; the READM
 # nightly = true                       # create sandboxes from nightly harness images
 # tern_native = false                  # keep the agent's terminal UI in Tern
 # usage_limits = false                 # don't read the host's Claude login for the 5h/7d limits
+# attach = "shell"                     # open a shell in the sandbox instead of the agent
 
 # [harness.claude]
 # template = "rust"
@@ -132,6 +133,10 @@ pub struct Config {
     /// Anthropic from the host with the host's Claude login (default: true).
     /// The token never enters the sandbox.
     pub usage_limits: Option<bool>,
+    /// What a session opens once the sandbox is set up (default: harness).
+    /// `[harness.<name>] attach` overrides it for one harness; `--shell` and
+    /// `--no-shell` win over both.
+    pub attach: Option<Attach>,
     /// Overrides for built-in harnesses and definitions of additional ones.
     #[serde(default)]
     pub harness: BTreeMap<String, HarnessOverride>,
@@ -169,6 +174,8 @@ pub struct HarnessOverride {
     pub import_skills: Option<bool>,
     /// Ask in the agent's UI whether to allow hosts the network policy blocked.
     pub network_prompts: Option<bool>,
+    /// What a session opens once the sandbox is set up; overrides the top-level `attach`.
+    pub attach: Option<Attach>,
     /// How the agent authenticates to its model API (default: sbx).
     pub auth: Option<Auth>,
     /// Settings merged over the overlay when `auth = "vertex"`. In strings,
@@ -177,6 +184,16 @@ pub struct HarnessOverride {
     pub vertex_overlay: Option<toml::Table>,
     /// Environment variable that holds the token placeholder for the agent.
     pub vertex_token_env: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Attach {
+    /// The agent: its terminal UI, or the native surface in Tern.
+    #[default]
+    Harness,
+    /// An interactive login shell in the sandbox, in the primary workspace.
+    Shell,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -271,6 +288,12 @@ impl Config {
         self.default_harness.as_deref().unwrap_or("claude")
     }
 
+    /// What a session of `harness` opens: its `[harness.<name>] attach`, else
+    /// the top-level `attach`, else the agent.
+    pub fn attach(&self, harness: &str) -> Attach {
+        self.harness.get(harness).and_then(|h| h.attach).or(self.attach).unwrap_or_default()
+    }
+
     pub fn sandbox_home(&self) -> &str {
         self.sandbox_home.as_deref().unwrap_or(crate::paths::DEFAULT_SANDBOX_HOME).trim_end_matches('/')
     }
@@ -288,9 +311,11 @@ mod tests {
             nightly = true
             tern_native = false
             usage_limits = false
+            attach = "shell"
 
             [harness.claude]
             template = "rust"
+            attach = "harness"
             nightly = false
             history = [".claude/projects"]
             overlay = { model = "opus" }
@@ -333,6 +358,8 @@ mod tests {
         assert_eq!(config.mcp["pw"].args, vec!["@playwright/mcp@latest"]);
         assert_eq!((config.vertex.project.as_deref(), config.vertex.refresh.as_deref()), (Some("acme"), Some("30m")));
         assert_eq!(config.harness["claude"].auth, None);
+        assert_eq!((config.attach("claude"), config.attach("aider")), (Attach::Harness, Attach::Shell));
+        assert_eq!(Config::default().attach("claude"), Attach::Harness);
     }
 
     #[test]
@@ -361,5 +388,6 @@ mod tests {
         assert!(toml::from_str::<Config>("[harness.claude]\nhistroy = []").is_err());
         assert!(toml::from_str::<Config>("[harness.claude]\nauth = \"bedrock\"").is_err());
         assert!(toml::from_str::<Config>("[vertex]\nprojct = \"x\"").is_err());
+        assert!(toml::from_str::<Config>("attach = \"tui\"").is_err());
     }
 }
