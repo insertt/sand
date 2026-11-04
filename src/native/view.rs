@@ -315,8 +315,17 @@ pub fn completions(t: &Transcript, composer: &Composer) -> Vec<Completion> {
 }
 
 /// What floats over the session: the completions of a `/command` or an
-/// `@` mention being typed, under the caret, and the session picker.
+/// `@` mention being typed, under the caret, and the session picker; and
+/// for a while after a long paste, that pasting it again expands it.
 fn layer(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
+    let mut nodes = floating(t, composer, info);
+    if let Some(id) = composer.expand_hint().filter(|_| t.exit_armed.is_none()) {
+        nodes.push(ui::toast("Paste again to expand").key(format!("paste-{id}")).ttl(8000u64).into());
+    }
+    nodes
+}
+
+fn floating(t: &Transcript, composer: &Composer, info: &Info) -> Vec<Node<Msg>> {
     if let Some((_, key)) = &t.exit_armed {
         let what = if t.turn == Turn::Setup { "stop setting up" } else { "exit" };
         // As long as the second press is awaited.
@@ -1240,14 +1249,17 @@ fn composer_node(t: &Transcript, composer: &Composer, info: &Info) -> Node<Msg> 
         .on_undo(Msg::Undo)
         .on_focus(Msg::Focus);
     // A command typed whole, marked as one that runs: no completion says so.
-    let editor = match commands::recognized(&composer.draft, &t.commands) {
-        Some(range) => {
-            let utf16 = |at: usize| composer.draft[..at].encode_utf16().count();
-            let s = "accent strong".to_string();
-            editor.decor(vec![ui::Decor { from: utf16(range.start), to: utf16(range.end), s, fx: None }])
-        }
-        None => editor,
-    };
+    let mut decor = Vec::new();
+    if let Some(range) = commands::recognized(&composer.draft, &t.commands) {
+        let utf16 = |at: usize| composer.draft[..at].encode_utf16().count();
+        let s = "accent strong".to_string();
+        decor.push(ui::Decor { from: utf16(range.start), to: utf16(range.end), s, fx: None });
+    }
+    // Pastes' placeholders in bold, to tell them from typed text.
+    for (from, to) in composer.placeholders_utf16() {
+        decor.push(ui::Decor { from, to, s: "strong".to_string(), fx: None });
+    }
+    let editor = if decor.is_empty() { editor } else { editor.decor(decor) };
     // The rest of the highlighted command, faint after the caret.
     let completions = if composer.dismissed { Vec::new() } else { commands::complete(&composer.draft, &t.commands) };
     let editor = match completions.get(composer.pick.min(completions.len().saturating_sub(1))) {
@@ -1567,6 +1579,18 @@ mod tests {
         assert_eq!(main[0].props()["variant"], "summary");
         assert_eq!(main[0].props()["summary"], "Set up claude-app in 12.0s · 1 steps");
         assert_eq!(main[1].props()["role"], "omp.welcome");
+    }
+
+    #[test]
+    fn a_long_paste_says_pasting_again_expands_it() {
+        let mut composer = Composer::default();
+        composer.key(&tern_sdk::Key { text: Some("a\nb\nc\nd".into()), ..tern_sdk::Key::named("paste") });
+        let v = view(&Transcript::default(), &composer, &info());
+        let toast = &region(&v, 2)[0];
+        assert_eq!((toast.kind(), toast.props()["ttl"].as_u64()), ("toast", Some(8000)));
+        assert!(format!("{:?}", toast.props()).contains("Paste again to expand"));
+        let editor = find(region(&v, 1), "sand.composer").unwrap().child_nodes().iter().find(|n| n.kind() == "editor");
+        assert_eq!(editor.unwrap().props()["decor"], json!([{"from": 0, "to": 25, "s": "strong"}]), "in bold");
     }
 
     #[test]

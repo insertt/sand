@@ -711,10 +711,11 @@ impl Driver {
             self.t.error(format!("{product} does not take images over ACP; remove them to send"), None);
             return;
         }
-        let text = self.composer.take();
+        let draft = self.composer.take();
+        let text = self.composer.expand(&draft);
         if commands::parse(&text).is_some() && self.composer.images.is_empty() {
             // Commands run as Enter runs them.
-            self.composer.set(&text);
+            self.composer.set(&draft);
             return self.submit();
         }
         let links = self.links(&text);
@@ -920,11 +921,13 @@ impl Driver {
             self.t.error(format!("{product} does not take images over ACP; remove them to send"), None);
             return;
         }
-        let text = self.composer.take();
+        // Pastes' placeholders go as what was pasted; a draft kept keeps them.
+        let draft = self.composer.take();
+        let text = self.composer.expand(&draft);
         match commands::parse(&text).filter(|_| self.composer.images.is_empty()) {
             Some(command) if self.t.turn == Turn::Idle => self.builtin(command),
             // sand's commands wait for the session; the agent's go as a prompt.
-            Some(_) => self.composer.set(&text),
+            Some(_) => self.composer.set(&draft),
             None => {
                 let links = self.links(&text);
                 let prompt = Prompt {
@@ -934,7 +937,7 @@ impl Driver {
                     context: Vec::new(),
                 };
                 if !self.send(prompt.clone()) {
-                    self.composer.set(&text);
+                    self.composer.set(&draft);
                     self.composer.images = prompt.images;
                     self.t
                         .error(format!("{QUEUE} follow-ups are waiting already; this one stays in the composer"), None);
@@ -1487,6 +1490,28 @@ mod tests {
 
     fn end_turn(d: &mut Driver, stop: &str) {
         d.response(Call::Prompt, Ok(serde_json::json!({"stopReason": stop})), Instant::now());
+    }
+
+    #[test]
+    fn a_long_paste_goes_whole_and_a_kept_draft_keeps_its_placeholder() {
+        let mut d = working();
+        let paste = Key { text: Some("one\ntwo\nthree\nfour".into()), ..Key::named("paste") };
+        d.key(&Key { text: Some("x".into()), ..Key::named("x") });
+        d.key(&paste);
+        assert_eq!(d.composer.draft, "x[Pasted text #1 +3 lines]");
+        d.key(&Key::named("enter"));
+        assert!(matches!(d.t.entries.last(), Some(Entry::User(text, _)) if text == "xone\ntwo\nthree\nfour"));
+
+        // With the queue full, the draft stays, placeholder and all; it is queued whole later.
+        for i in 0..QUEUE {
+            type_and_send(&mut d, &format!("q{i}"));
+        }
+        d.key(&paste);
+        d.key(&Key::named("enter"));
+        assert_eq!(d.composer.draft, "[Pasted text #2 +3 lines]");
+        d.msg(Msg::Unqueue(0));
+        d.msg(Msg::Send(d.composer.draft.clone()));
+        assert_eq!(d.t.queue.last().map(|p| p.text.as_str()), Some("one\ntwo\nthree\nfour"));
     }
 
     #[test]
