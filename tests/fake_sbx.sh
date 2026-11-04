@@ -53,6 +53,11 @@ case "$cmd" in
     done
     sandbox="$1"; shift
     [ -e "$root/sandboxes/$sandbox" ] || { echo "fake sbx: no sandbox $sandbox" >&2; exit 1; }
+    if [ "$1" = env ]; then
+      shift
+      while [ $# -gt 0 ]; do case "$1" in *=*) shift ;; *) break ;; esac; done
+    fi
+    [ "$*" = "bash -l" ] && { echo "SHELL-STARTED"; exit "${FAKE_SBX_RUN_EXIT:-0}"; }
     case "$1" in
       true) exit 0 ;;
       cat)

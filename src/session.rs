@@ -18,7 +18,7 @@ use dialoguer::{MultiSelect, Select};
 use crate::acp;
 use crate::args;
 use crate::cli::{ConflictChoice, MountArgs, RunArgs};
-use crate::config::{Config, StatuslineKind};
+use crate::config::{Attach, Config, StatuslineKind};
 use crate::harness::{self, Profile};
 use crate::lock;
 use crate::log;
@@ -917,8 +917,9 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
 
     let mut req = build_request(&args, dirs, config, harness, specs)?;
     warn_exposing(dirs, req.mounts.all());
-    let native = native_eligible(&args, &req.profile, config);
-    let handoff = tern_handoff(&args, &req, dirs, config, &cwd, native);
+    let shell = opens_shell(&args, config, &req.profile.name);
+    let native = native_eligible(&args, &req.profile, config, shell);
+    let handoff = if shell { None } else { tern_handoff(&args, &req, dirs, config, &cwd, native) };
     let profile = &req.profile;
 
     // Before sbx lists the sandboxes, so that what it lists stays true.
@@ -1177,7 +1178,7 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
         log::ok(format!("sandbox '{}' is ready; `sand {} --resume` attaches to it", state.name, profile.name));
         return Ok(0);
     }
-    if profile.statusline != StatuslineKind::Claude && !args.acp && !native::active() {
+    if profile.statusline != StatuslineKind::Claude && !args.acp && !shell && !native::active() {
         let shows = match profile.statusline {
             StatuslineKind::Codex => "status line shows model, branch, context and limits, but not the sandbox",
             _ => "cannot run a custom status line",
@@ -1189,7 +1190,9 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
     }
 
     // --- hand over to the agent -------------------------------------------------
-    let code = if native::active() {
+    let code = if shell {
+        attach_shell(&sbx, profile, &state, keep_alive)?.code().unwrap_or(1)
+    } else if native::active() {
         attach_native(&sbx, dirs, config, profile, &state, keep_alive)?
     } else if let Some(handoff) = handoff {
         return open_in_tern(handoff, dirs, profile, &state, lock, keep_alive);
@@ -1206,11 +1209,12 @@ pub fn run(args: RunArgs, dirs: &Dirs, config: &Config) -> Result<i32> {
 
 /// Whether the session may be drawn natively in Tern, should the terminal
 /// turn out to speak the Tern Surface Protocol.
-fn native_eligible(args: &RunArgs, profile: &Profile, config: &Config) -> bool {
+fn native_eligible(args: &RunArgs, profile: &Profile, config: &Config, shell: bool) -> bool {
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let forced = args.forced_native();
     let configured = config.tern_native.unwrap_or(true);
-    let eligible = tty && native::eligible(args.acp, args.no_attach, profile, &args.agent_args, forced, configured);
+    let no_agent = args.no_attach || shell;
+    let eligible = tty && native::eligible(args.acp, no_agent, profile, &args.agent_args, forced, configured);
     if forced == Some(true) && !eligible {
         log::warn("--native: not drawing natively (it needs a terminal and an agent with an ACP command)");
     }
@@ -1218,6 +1222,20 @@ fn native_eligible(args: &RunArgs, profile: &Profile, config: &Config) -> bool {
         log::info("opening the terminal UI: Tern draws sessions natively only without agent arguments");
     }
     eligible
+}
+
+/// Whether the session opens a shell in the sandbox instead of the agent:
+/// `--shell`, else the `attach` config key. Anything on the command line that
+/// asks for the agent (`--no-shell`, `--native`, `--acp`, agent arguments)
+/// wins over the config; so does `--no-attach`, which opens nothing.
+fn opens_shell(args: &RunArgs, config: &Config, harness: &str) -> bool {
+    if args.shell {
+        return true;
+    }
+    if args.no_shell || args.native || args.acp || args.no_attach || !args.agent_args.is_empty() {
+        return false;
+    }
+    config.attach(harness) == Attach::Shell
 }
 
 /// The host's Claude login, for the native surface to ask how much of the
@@ -1334,6 +1352,41 @@ fn log_summary(summary: &network::Summary) {
     if !summary.mounted.is_empty() {
         log::info(format!("mounted during the session: {}", summary.mounted.join(", ")));
     }
+}
+
+/// `sbx exec` of an interactive login shell, in the primary workspace, with
+/// the environment the agent would get (`env` pairs).
+fn shell_launch(state: &SandboxState, env: Vec<String>) -> Vec<OsString> {
+    let mut cmd = args!["exec", "-it"];
+    if let Some(primary) = &state.mounts.primary {
+        cmd.extend(args!["--workdir", container_path(&primary.path.to_string_lossy())]);
+    }
+    cmd.push(OsString::from(&state.name));
+    if !env.is_empty() {
+        cmd.push(OsString::from("env"));
+        cmd.extend(env.into_iter().map(OsString::from));
+    }
+    cmd.extend(args!["bash", "-l"]);
+    cmd
+}
+
+/// Opens a shell in the sandbox instead of the agent and waits for it to
+/// exit. `keep_alive` is let go once it does.
+fn attach_shell(sbx: &Sbx, profile: &Profile, state: &SandboxState, keep_alive: KeepAlive) -> Result<ExitStatus> {
+    log::step(format!("Opening a shell in sandbox '{}'", state.name));
+    log::info(format!(
+        "the agent is not started; exit the shell to end the session, or `sand {} --resume --no-shell` to open the agent",
+        profile.name
+    ));
+    let mut env: Vec<String> = vertex_env(profile, &state.name).into_iter().collect();
+    env.extend(terminal_env(|name| env::var(name).ok()));
+    IN_SESSION.store(true, Ordering::SeqCst);
+    let status = sbx.attach(shell_launch(state, env));
+    IN_SESSION.store(false, Ordering::SeqCst);
+    drop(keep_alive);
+    let status = status?;
+    log::step(format!("Session ended ({status})"));
+    Ok(status)
 }
 
 /// Starts the agent (its terminal UI, or its ACP server in ACP mode) and

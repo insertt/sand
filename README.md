@@ -92,6 +92,7 @@ the same.
 | `--mcp a,b` | Expose these MCP servers (names from `sbx mcp ls`). |
 | `--resume` | Attach to the existing sandbox without the "different setup" question: mounts and MCP servers on the command line are added, nothing is removed. Fails if there is none. |
 | `--no-attach` | Create or update the sandbox and start it, then exit without opening the agent. `sand [HARNESS] --resume` attaches later. |
+| `--shell`, `--no-shell` | Set the sandbox up as usual, then open a login shell in it (in the primary workspace) instead of the agent; exiting the shell ends the session. `--no-shell` opens the agent even with `attach = "shell"` in the config. |
 | `--recreate` | Remove the sandbox and create it again, asking what to keep of its conversation history, mounts and MCP servers (see [Recreating a sandbox](#recreating-a-sandbox)). |
 | `--force-recreate` | Remove the sandbox and create it again from the command line alone, without asking: its history, and mounts and MCP servers the command line does not name, are dropped. |
 | `--scratch` | No project: use the shared scratch directory, which persists and is shared by all harnesses. |
@@ -638,6 +639,7 @@ default_harness = "codex"
 nightly = true                       # use nightly harness images (see Templates)
 tern_native = false                  # keep the agent's terminal UI in Tern
 usage_limits = false                 # do not ask Anthropic for subscription limits (see Tern)
+attach = "shell"                     # open a shell in the sandbox instead of the agent ("harness" is the default)
 sandbox_home = "/home/agent"         # the agent user's home in sandboxes (the default)
 
 # Change a built-in harness…
@@ -669,7 +671,7 @@ All harness keys: `agent`, `host_config_dir`, `sandbox_config_dir`, `copy`,
 `extra_copy`, `exclude`, `settings_files`, `settings_format`, `strip_keys`,
 `overlay`, `history`, `bypass_args`, `statusline`, `acp_command`,
 `api_check_url`, `template`, `nightly`, `import_skills`, `network_prompts`,
-`auth`, `vertex_overlay`, `vertex_token_env`.
+`attach` (overrides the top-level one for that harness), `auth`, `vertex_overlay`, `vertex_token_env`.
 
 State lives in the platform data directory (`~/.local/share/sand`,
 `~/Library/Application Support/sand`, `%LOCALAPPDATA%\sand`), or

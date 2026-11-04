@@ -540,6 +540,36 @@ fn no_attach_sets_the_sandbox_up_without_running_the_agent() {
 }
 
 #[test]
+fn shell_opens_a_shell_in_the_sandbox_instead_of_the_agent() {
+    let env = Env::new();
+    let shell = |log: &[String]| {
+        let line = log.last().unwrap().clone();
+        line.starts_with(&format!("exec -it --workdir {} codex-proj ", env.p(&env.proj))) && line.ends_with(" bash -l")
+    };
+    let out = env.ok(&["codex", "--shell"]);
+    let log = env.take_log();
+    assert_eq!(starting(&log, "create").len(), 1);
+    assert!(has(&log, "exec codex-proj sh /home/agent/.sand/apply.sh"));
+    assert!(starting(&log, "run").is_empty() && shell(&log), "{log:#?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("SHELL-STARTED") && !stdout.contains("AGENT-STARTED"));
+    assert!(stderr(&out).contains("Opening a shell in sandbox 'codex-proj'"));
+
+    // The config makes it the default, per harness or for all of them; --no-shell and agent arguments win.
+    env.config("attach = \"shell\"\n[harness.claude]\nattach = \"harness\"\n");
+    env.ok(&["codex"]);
+    assert!(shell(&env.take_log()));
+    env.ok(&["codex", "--no-shell"]);
+    assert_eq!(env.take_log().last().unwrap(), "run --name codex-proj");
+    env.ok(&["codex", "--", "--continue"]);
+    assert!(env.take_log().last().unwrap().starts_with("run --name codex-proj"));
+    env.ok(&["claude"]);
+    assert!(env.take_log().last().unwrap().starts_with("run --name claude-proj"));
+    env.ok(&["codex", "--no-attach"]);
+    assert!(!shell(&env.take_log()));
+}
+
+#[test]
 fn recreate_asks_what_to_keep_and_force_recreate_keeps_nothing() {
     let env = Env::new();
     env.register_mcp(&["atlassian"]);

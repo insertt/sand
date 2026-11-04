@@ -16,6 +16,7 @@ Examples:
   sand claude --recreate                     rebuild the sandbox, asking what to keep
   sand claude --force-recreate               rebuild it from the command line alone
   sand codex --no-attach                     set the sandbox up without opening the agent
+  sand claude --shell                        set the sandbox up and open a shell in it
   sand codex --scratch                       shared scratch space, no project
   sand --acp                                 ACP agent on stdio (for editors)
   sand codex --install-acp zed               register `sand codex --acp` in Zed
@@ -135,6 +136,14 @@ pub struct RunArgs {
     /// Create or update the sandbox and start it, but do not open the agent
     #[arg(long, conflicts_with_all = ["acp", "dedicated_scratch", "agent_args"])]
     pub no_attach: bool,
+
+    /// Open a login shell in the sandbox instead of the agent, whatever `attach` says
+    #[arg(long, conflicts_with_all = ["no_shell", "acp", "native", "no_attach", "agent_args"])]
+    pub shell: bool,
+
+    /// Open the agent, even with `attach = "shell"` in the config
+    #[arg(long)]
+    pub no_shell: bool,
 
     /// Sandbox name (default: <harness>-<directory>)
     #[arg(long, value_name = "NAME")]
@@ -272,6 +281,7 @@ mod tests {
         assert_eq!(run(&["claude", "--install-acp", "tern"]).install_acp, Some(AcpClient::Tern));
         assert!(run(&["--open-config"]).open_config && !run(&["codex"]).open_config);
         assert!(run(&["codex", "--native"]).native && run(&["codex", "--no-native"]).no_native);
+        assert!(run(&["codex", "--shell"]).shell && run(&["codex", "--no-shell"]).no_shell);
     }
 
     #[test]
@@ -298,6 +308,11 @@ mod tests {
             &["codex", "--native", "--no-native"],
             &["codex", "--native", "--acp"],
             &["codex", "--native", "--", "--continue"],
+            &["codex", "--shell", "--no-shell"],
+            &["codex", "--shell", "--acp"],
+            &["codex", "--shell", "--native"],
+            &["codex", "--shell", "--no-attach"],
+            &["codex", "--shell", "--", "--continue"],
         ];
         for args in bad {
             assert!(Cli::try_parse_from(std::iter::once("sand").chain(args.iter().copied())).is_err(), "{args:?}");
