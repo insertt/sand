@@ -3,9 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
-  # PRs are built only after a maintainer approves them (see `pr-approved`).
-  # Using pull_request_review (not pull_request) keeps unreviewed code from
-  # running CI, and fork PRs still get a read-only token and no secrets.
+  # PRs opened by a maintainer (owner, org member, or collaborator) build on
+  # every push. Everyone else's PRs build only after a maintainer approves
+  # them, so unreviewed code never runs CI; fork PRs still get a read-only
+  # token and no secrets either way.
+  pull_request:
+    types: [opened, synchronize, reopened]
   pull_request_review:
     types: [submitted]
   workflow_dispatch:
@@ -13,15 +16,19 @@ on:
 permissions:
   contents: read
 
-# Reviews that don't qualify for a build (comments, change requests, approvals
-# from non-maintainers) get a group of their own, so they can't cancel the
-# build that a maintainer's approval started.
+# Events that don't qualify for a build (PR pushes from non-maintainers,
+# comments, change requests, approvals from non-maintainers, approvals of PRs
+# that already build on push) get a group of their own, so they can't cancel a
+# real build.
 concurrency:
   group: >-
     ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{
-      github.event_name == 'pull_request_review' &&
-      !(github.event.review.state == 'approved' &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) &&
+      ((github.event_name == 'pull_request' &&
+        !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) ||
+       (github.event_name == 'pull_request_review' &&
+        !(github.event.review.state == 'approved' &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association) &&
+          !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)))) &&
       github.run_id || 'build' }}
   cancel-in-progress: true
 
@@ -31,13 +38,21 @@ env:
 
 jobs:
   ci:
-    # Push / manual runs always build. Review events build only when the review
-    # is an approval from a maintainer (owner, org member, or collaborator).
+    # Push / manual runs always build. PR pushes build when a maintainer
+    # (owner, org member, or collaborator) opened the PR. Reviews build when a
+    # maintainer approves a PR from anyone else (a maintainer's own PR has
+    # already built on push).
     if: >-
-      github.event_name != 'pull_request_review' ||
-      (github.event.review.state == 'approved' &&
+      (github.event_name != 'pull_request' && github.event_name != 'pull_request_review') ||
+      (github.event_name == 'pull_request' &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
-                github.event.review.author_association))
+                github.event.pull_request.author_association)) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved' &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                github.event.review.author_association) &&
+       !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                 github.event.pull_request.author_association))
     name: build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -74,11 +89,18 @@ jobs:
   # musl-only breakage (the TLS library has C and assembly parts) shows up
   # before a release does.
   musl:
+    # Same gate as `ci`.
     if: >-
-      github.event_name != 'pull_request_review' ||
-      (github.event.review.state == 'approved' &&
+      (github.event_name != 'pull_request' && github.event_name != 'pull_request_review') ||
+      (github.event_name == 'pull_request' &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
-                github.event.review.author_association))
+                github.event.pull_request.author_association)) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved' &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                github.event.review.author_association) &&
+       !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                 github.event.pull_request.author_association))
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
